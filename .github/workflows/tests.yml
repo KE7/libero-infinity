@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit Tests (Tier 1 — no LIBERO sim)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install MuJoCo system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev \
+            libegl1 \
+            libgles2 \
+            libosmesa6-dev
+
+      - name: Install project dependencies (dev only, no simulation stack)
+        run: uv sync --extra dev
+
+      - name: Run Tier 1 tests
+        env:
+          MUJOCO_GL: egl
+        run: |
+          MUJOCO_GL=egl PYTHONPATH=src .venv/bin/python -m pytest \
+            tests/test_scenic.py \
+            tests/test_perturbation_policy.py \
+            -v --tb=short
+
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dev dependencies
+        run: uv sync --extra dev
+
+      - name: Ruff lint
+        run: .venv/bin/ruff check src/ tests/
+
+      - name: Ruff format check
+        run: .venv/bin/ruff format --check src/ tests/
+
+      - name: Black format check
+        run: .venv/bin/black --check src/ tests/

@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Testing / linting
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.ruff_cache/
+.mypy_cache/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# MuJoCo / simulation
+MUJOCO_LOG.TXT
+mujoco_log.txt
+
+# Scenic auto-generated programs (transient)
+scenic/generated/_gen_*.scenic
+scenic/generated/libero_model.scenic
+
+# Environment / secrets
+.env
+.env.*
+
+# Logs
+*.log
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Claude Code (user-specific)
+.claude/
+
+# Data / large files
+datasets/
+data/reversed_bddls/
+*.hdf5
+*.h5
+*.ckpt
+*.pt
+*.pth
+
+# Jupyter
+.ipynb_checkpoints/
+
+# WandB experiment logs
+wandb/
+
+# External repos (vendored separately)
+libero-pro/
+
+# Internal dev docs (not for publication)
+docs/impl_plan_*.md
+docs/magic_number_audit_v2.md
+docs/convention_audit.md
+docs/gap_extension_plan.md
+docs/pipeline_readiness_review.md
+docs/user_review.md
+docs/vlm_validation.md
+docs/scenic_docs_review.md
+
+# Internal results / calibration data
+results/
+calibration_results.json
+cf_quality_ratings*.csv
+bddl_cf/
+
+# Auto-generated scenic files
+scenic/_gen_*.scenic
+
+# Internal audit scripts
+scripts/audit_position_perturbations.py
+
+# Test artifacts
+/tmp/
+
+# Vendor assets (large binary files, fetched at install time)
+vendor/libero/libero/libero/assets/

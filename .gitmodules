@@ -1,0 +1,3 @@
+[submodule "vendor/libero"]
+	path = vendor/libero
+	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git

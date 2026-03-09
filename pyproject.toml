@@ -1,0 +1,101 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "libero-infinity"
+version = "0.1.0"
+description = "Open-ended robotic manipulation evaluation via Scenic 3 distributions"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    # Scenic 3 — probabilistic scene generator + rejection sampler
+    "scenic>=3.0",
+    # Core scientific stack (scipy used by simulator.py for Rotation)
+    "numpy>=1.22",
+    "scipy>=1.9",
+    # Required by LIBERO at import time (libero/__init__.py)
+    "pyyaml>=6.0",
+    # python-fcl stub — Scenic imports fcl; ARM64 Linux has no wheel, so we vendor a stub
+    "python-fcl>=0.7",
+    # MuJoCo physics (2.3.7 ships an ARM64 Linux binary in its sdist)
+    "mujoco>=2.3,<3",
+    # LIBERO's simulation backend (must be exactly 1.4.0 for LIBERO API compat)
+    "robosuite==1.4.0",
+    # BDDL task format parser (1.0.1 required — newer versions changed the parser API)
+    "bddl==1.0.1",
+    # Gym env wrapper (0.25.2 required — robosuite 1.4.0 uses pre-0.26 step() signature)
+    "gym==0.25.2",
+    # BDDL runtime dependency
+    "future>=0.18",
+    # LIBERO utility dependencies
+    "easydict>=1.9",
+    "tqdm>=4.64",
+    # robosuite runtime dependency (not declared in robosuite's own setup.py)
+    "termcolor>=2.0",
+    # HF asset download (lerobot/libero-assets@0b3ea86 via libero_infinity.runtime)
+    "huggingface_hub>=0.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/KE7/libero-infinity"
+Repository = "https://github.com/KE7/libero-infinity"
+Documentation = "https://github.com/KE7/libero-infinity/tree/main/docs"
+"Bug Tracker" = "https://github.com/KE7/libero-infinity/issues"
+
+[project.optional-dependencies]
+# Optional adversarial falsification search (Bayesian optimisation over scenes)
+verifai = [
+    "verifai>=2.0",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+    "black>=23.0",
+    "ipython",
+    "rich",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/libero_infinity"]
+
+[tool.hatch.build.targets.wheel.shared-data]
+# bddl_files and init_files are package data, included in the wheel
+"src/libero_infinity/data/libero_runtime" = "libero_infinity/data/libero_runtime"
+
+[tool.uv.sources]
+# python-fcl 0.7.x has no ARM64 Linux wheel and no sdist on PyPI.
+# The vendor/ stub implements the full FCL symbol surface so Scenic can import;
+# it stubs all geometry operations (correct — we use explicit distance constraints).
+python-fcl = { path = "vendor/python_fcl-0.7.0.10-py2.py3-none-any.whl" }
+
+[project.scripts]
+libero-eval = "libero_infinity.eval:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["libero_infinity"]

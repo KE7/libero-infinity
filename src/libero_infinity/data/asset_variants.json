@@ -1,0 +1,254 @@
+{
+  "_meta": {
+    "description": "OOD asset variant registry for Libero-infinity. Maps each LIBERO canonical object class to a list of visual variants. First entry is always the canonical (training) object.",
+    "difficulty_levels": {
+      "EASY": "same shape, different color/texture",
+      "MEDIUM": "similar shape, visibly different",
+      "HARD": "same functional category, distinct geometry"
+    },
+    "sources": "google_scanned_objects, turbosquid_objects, hope_objects (LIBERO asset registry)",
+    "validation": "Every variant name MUST exist in LIBERO's OBJECTS_DICT (libero/envs/objects/)"
+  },
+  "variants": {
+    "akita_black_bowl": [
+      "akita_black_bowl",
+      "white_bowl",
+      "glazed_rim_porcelain_ramekin"
+    ],
+    "white_bowl": [
+      "white_bowl",
+      "akita_black_bowl",
+      "glazed_rim_porcelain_ramekin"
+    ],
+    "plate": [
+      "plate",
+      "chefmate_8_frypan"
+    ],
+    "glazed_rim_porcelain_ramekin": [
+      "glazed_rim_porcelain_ramekin",
+      "akita_black_bowl",
+      "white_bowl"
+    ],
+    "wine_bottle": [
+      "wine_bottle",
+      "ketchup",
+      "milk",
+      "orange_juice",
+      "tomato_sauce"
+    ],
+    "cream_cheese": [
+      "cream_cheese",
+      "butter",
+      "chocolate_pudding",
+      "macaroni_and_cheese"
+    ],
+    "butter": [
+      "butter",
+      "cream_cheese",
+      "chocolate_pudding",
+      "macaroni_and_cheese"
+    ],
+    "chocolate_pudding": [
+      "chocolate_pudding",
+      "cream_cheese",
+      "butter",
+      "macaroni_and_cheese"
+    ],
+    "red_coffee_mug": [
+      "red_coffee_mug",
+      "white_yellow_mug",
+      "porcelain_mug"
+    ],
+    "white_yellow_mug": [
+      "white_yellow_mug",
+      "red_coffee_mug",
+      "porcelain_mug"
+    ],
+    "porcelain_mug": [
+      "porcelain_mug",
+      "red_coffee_mug",
+      "white_yellow_mug"
+    ],
+    "alphabet_soup": [
+      "alphabet_soup",
+      "cream_cheese",
+      "butter",
+      "tomato_sauce",
+      "bbq_sauce"
+    ],
+    "ketchup": [
+      "ketchup",
+      "tomato_sauce",
+      "bbq_sauce",
+      "mayo",
+      "salad_dressing"
+    ],
+    "tomato_sauce": [
+      "tomato_sauce",
+      "ketchup",
+      "bbq_sauce",
+      "mayo",
+      "salad_dressing"
+    ],
+    "bbq_sauce": [
+      "bbq_sauce",
+      "ketchup",
+      "tomato_sauce",
+      "mayo",
+      "salad_dressing"
+    ],
+    "milk": [
+      "milk",
+      "orange_juice",
+      "wine_bottle",
+      "ketchup"
+    ],
+    "orange_juice": [
+      "orange_juice",
+      "milk",
+      "wine_bottle",
+      "ketchup"
+    ],
+    "basket": [
+      "basket",
+      "wooden_tray",
+      "white_storage_box"
+    ],
+    "salad_dressing": [
+      "salad_dressing",
+      "new_salad_dressing",
+      "ketchup",
+      "bbq_sauce",
+      "mayo"
+    ],
+    "new_salad_dressing": [
+      "new_salad_dressing",
+      "salad_dressing",
+      "ketchup",
+      "mayo"
+    ],
+    "mayo": [
+      "mayo",
+      "ketchup",
+      "salad_dressing",
+      "bbq_sauce"
+    ],
+    "moka_pot": [
+      "moka_pot",
+      "red_coffee_mug",
+      "porcelain_mug"
+    ],
+    "cookies": [
+      "cookies",
+      "cream_cheese",
+      "butter",
+      "chocolate_pudding"
+    ],
+    "corn": [
+      "corn",
+      "cherries",
+      "popcorn"
+    ],
+    "cherries": [
+      "cherries",
+      "corn",
+      "popcorn"
+    ],
+    "popcorn": [
+      "popcorn",
+      "corn",
+      "cherries"
+    ],
+    "macaroni_and_cheese": [
+      "macaroni_and_cheese",
+      "cream_cheese",
+      "butter",
+      "chocolate_pudding"
+    ],
+    "black_book": [
+      "black_book",
+      "yellow_book"
+    ],
+    "yellow_book": [
+      "yellow_book",
+      "black_book"
+    ],
+    "chefmate_8_frypan": [
+      "chefmate_8_frypan",
+      "plate",
+      "wooden_tray"
+    ],
+    "bowl_drainer": [
+      "bowl_drainer",
+      "basket",
+      "wooden_tray",
+      "white_storage_box"
+    ],
+    "desk_caddy": [
+      "desk_caddy",
+      "white_storage_box",
+      "basket"
+    ],
+    "white_storage_box": [
+      "white_storage_box",
+      "basket",
+      "wooden_tray",
+      "desk_caddy"
+    ],
+    "wooden_tray": [
+      "wooden_tray",
+      "basket",
+      "white_storage_box",
+      "chefmate_8_frypan"
+    ]
+  },
+  "dimensions": {
+    "_comment": "Approximate bounding box [width, length, height] in metres for clearance calculations",
+    "akita_black_bowl": [0.10, 0.10, 0.06],
+    "white_bowl": [0.10, 0.10, 0.06],
+    "plate": [0.20, 0.20, 0.02],
+    "glazed_rim_porcelain_ramekin": [0.08, 0.08, 0.05],
+    "wine_bottle": [0.06, 0.06, 0.30],
+    "ketchup": [0.05, 0.05, 0.22],
+    "tomato_sauce": [0.05, 0.05, 0.22],
+    "bbq_sauce": [0.05, 0.05, 0.22],
+    "mayo": [0.05, 0.05, 0.18],
+    "salad_dressing": [0.05, 0.05, 0.20],
+    "new_salad_dressing": [0.05, 0.05, 0.20],
+    "milk": [0.06, 0.06, 0.20],
+    "orange_juice": [0.06, 0.06, 0.20],
+    "cream_cheese": [0.08, 0.06, 0.04],
+    "butter": [0.08, 0.04, 0.04],
+    "chocolate_pudding": [0.08, 0.06, 0.04],
+    "macaroni_and_cheese": [0.08, 0.06, 0.06],
+    "cookies": [0.08, 0.06, 0.06],
+    "red_coffee_mug": [0.08, 0.08, 0.10],
+    "white_yellow_mug": [0.08, 0.08, 0.10],
+    "porcelain_mug": [0.08, 0.08, 0.10],
+    "alphabet_soup": [0.06, 0.06, 0.12],
+    "moka_pot": [0.10, 0.08, 0.18],
+    "basket": [0.18, 0.12, 0.08],
+    "wooden_tray": [0.20, 0.14, 0.04],
+    "white_storage_box": [0.16, 0.12, 0.10],
+    "corn": [0.06, 0.06, 0.12],
+    "cherries": [0.06, 0.06, 0.10],
+    "popcorn": [0.06, 0.06, 0.10],
+    "black_book": [0.12, 0.18, 0.03],
+    "yellow_book": [0.12, 0.18, 0.03],
+    "chefmate_8_frypan": [0.22, 0.22, 0.05],
+    "bowl_drainer": [0.16, 0.14, 0.06],
+    "desk_caddy": [0.14, 0.10, 0.06]
+  },
+  "distractor_pool": [
+    "cream_cheese",
+    "butter",
+    "chocolate_pudding",
+    "alphabet_soup",
+    "popcorn",
+    "cookies",
+    "ketchup",
+    "macaroni_and_cheese",
+    "desk_caddy",
+    "bowl_drainer"
+  ]
+}
