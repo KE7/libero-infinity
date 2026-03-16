@@ -33,6 +33,9 @@ echo "==> Installing dependencies..."
 uv sync --extra dev
 
 echo "==> Installing vendored LIBERO package..."
+# Upstream LIBERO is missing libero/__init__.py, so find_packages() finds nothing.
+# Create it if absent so the build can discover the package tree.
+touch vendor/libero/libero/__init__.py
 uv pip install --no-deps vendor/libero
 
 echo "==> Writing LIBERO config..."
