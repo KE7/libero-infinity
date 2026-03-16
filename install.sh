@@ -30,7 +30,7 @@ echo "==> Installing dependencies (simulation + dev extras)..."
 uv sync --extra simulation --extra dev
 
 echo "==> Bootstrapping HF assets and configuring LIBERO runtime..."
-uv run python scripts/setup_libero_config.py
+uv run python -c "from libero_infinity.runtime import ensure_runtime; ensure_runtime()"
 
 echo ""
 echo "Installation complete!"
