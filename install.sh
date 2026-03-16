@@ -35,8 +35,9 @@ uv sync --extra dev
 echo "==> Installing vendored LIBERO package..."
 # Upstream LIBERO is missing libero/__init__.py, so find_packages() finds nothing.
 # Create it if absent so the build can discover the package tree.
+# Editable install (-e) is required so LIBERO can find its bundled XML/STL assets.
 touch vendor/libero/libero/__init__.py
-uv pip install --no-deps vendor/libero
+uv pip install --no-deps -e vendor/libero
 
 echo "==> Writing LIBERO config..."
 uv run python -c "
