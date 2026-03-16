@@ -7,12 +7,9 @@ MUJOCO_GL ?= egl
 check-uv:
 	@command -v uv >/dev/null 2>&1 || 		{ echo "ERROR: uv not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"; exit 1; }
 
-# Create venv + install all deps (submodule init + Scenic + simulation + dev + vendor/libero)
+# Create venv + install all deps (submodule init + Scenic + dev + vendor/libero + LIBERO config)
 install: check-uv
-	git submodule update --init --recursive
-	uv venv --python $(PYTHON)
-	uv sync --extra dev
-	uv run pip install -e vendor/libero
+	PYTHON=$(PYTHON) ./install.sh
 
 # Full setup (alias for install)
 install-full: install

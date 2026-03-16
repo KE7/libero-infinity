@@ -56,7 +56,7 @@ try:
     from libero.libero.envs.env_wrapper import OffScreenRenderEnv  # noqa: F401
 
     LIBERO_AVAILABLE = True
-except ImportError:
+except (ImportError, AttributeError):
     pass
 
 BDDL_AVAILABLE = BOWL_BDDL is not None and BOWL_BDDL.exists()

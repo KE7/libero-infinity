@@ -199,7 +199,7 @@ def _download_hf_assets() -> pathlib.Path:
     except ImportError as exc:
         raise LiberoAssetsUnavailableError(
             "huggingface_hub is required to download LIBERO assets.\n"
-            "Install it with: uv sync --extra simulation"
+            "Install it with: uv sync --extra dev"
         ) from exc
 
     _CACHE_ROOT.mkdir(parents=True, exist_ok=True)
