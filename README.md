@@ -271,28 +271,51 @@ See [docs/installation.md](docs/installation.md) for detailed setup instructions
 
 ## Perturbation Axes
 
-LIBERO-Infinity provides **nine composable perturbation axes**, each defined as a [Scenic 3](https://github.com/BerkeleyLearnVerify/Scenic) distribution with constraint checking via rejection sampling.
+LIBERO-Infinity exposes **two complementary perturbation surfaces**:
+
+1. **Online Scenic axes (10)** — distributions over scene parameters that
+   Scenic samples at every `scenario.generate()` call. The
+   simulator reads the sampled params and applies them after env
+   construction. These are the axes you toggle via `--perturbation`.
+2. **Offline BDDL-rewrite generators (3)** — pre-generate alternative
+   BDDL files (different goals, languages, or arenas) by editing the
+   source BDDL text. These can't be Scenic-driven because LIBERO's
+   BDDL parser reads goal/language/fixtures *before* Scenic-sampled
+   params reach the simulator. They're invoked once per task to emit a
+   set of variant BDDLs which the gym wrapper or eval harness selects
+   from per reset.
+
+### Online Scenic axes
 
 | Axis | What Varies | Distribution | Constraints |
 |------|------------|-------------|-------------|
-| **Position** | Object (x, y) placement | Uniform over reachable workspace | Pairwise clearance > 0.10 m; soft OOD bias |
-| **Object** | Visual identity (mesh + texture) | Uniform over 34 asset variant pools | BDDL rewriting for asset substitution |
-| **Robot** | Panda arm start configuration | Joint-space radius 0.1-0.5 around canonical `init_qpos` | Applied to the 7 arm joints; base pose unchanged |
-| **Camera** | Viewpoint position and tilt | Position offsets +/- 0.10 m; tilt +/- 15 deg | Applied to agentview camera quaternion |
-| **Lighting** | Scene illumination | Intensity [0.4, 2.0]; ambient [0.05, 0.6] | Applied to all MuJoCo lights |
-| **Texture** | Table surface material | Named or random texture swap | MuJoCo material ID replacement |
-| **Distractor** | Scene clutter objects | 1-5 non-task objects from pool | Clearance constraints to task objects |
-| **Background** | Wall and floor texture | Uniform over 35 LIBERO texture assets | Applied via MuJoCo texture ID lookup with random fallback |
-| **Articulation** | Initial fixture state (doors, drawers, stoves) | Range-based per fixture family | Goal-reachability enforced; containers open when goal requires interior access |
+| **Position** | Object (x, y) placement | Uniform over reachable workspace | Pairwise clearance > 0.10 m; intersection-clip to BDDL-derived table bounds |
+| **Object** | Visual identity (mesh + texture) | Uniform over per-class asset variant pools | BDDL rewriting for asset substitution |
+| **Robot** | Panda arm start configuration | Marsaglia uniform-on-S^6 × radius `[0.1, 0.5]` around canonical `init_qpos` | Applied to the 7 arm joints; base pose unchanged |
+| **Camera** | Viewpoint pose | Orbit (azimuth/elevation/distance) + offsets + tilt | Applied to agentview camera pos & quat |
+| **Lighting** | Scene illumination | Intensity [0.4, 2.0]; ambient [0.05, 0.6] | Applied to per-light `light_diffuse` / `light_ambient` |
+| **Texture** | Table surface material | Random pick from curated subset that's loaded in the model | MuJoCo material ID replacement |
+| **Distractor** | Scene clutter objects | 1–5 non-task objects from a curated pool, budget = floor of free area / per-distractor area | Clearance constraints to task objects + diagonal pairwise clearance |
+| **Background** | Wall and floor texture | Uniform over the curated texture subset that's loaded | Applied via MuJoCo texture ID lookup with curated random fallback |
+| **Articulation** | Initial fixture state (doors, drawers, stoves) | Range-based per fixture family | Gated on `articulation` axis request; goal-reachability override forces Open at init when the goal places an object inside |
+| **Sensor noise** | Image-pipeline corruption | Uniform pick over 10 corruption families × discrete severity [1..5] | Applied to every `*_image` obs key on each step |
 
-All axes are **arbitrarily composable** -- specify any combination:
+### Offline BDDL-rewrite generators
+
+| Generator | What Varies | API |
+|-----------|------------|-----|
+| **Task perturbation** | Goal predicate (destination swaps, predicate negations Open↔Close & Turnon↔Turnoff, compositional do-also tasks, visible-attribute swaps like "red mug" → "yellow mug") | `bddl_preprocessor.generate_task_perturbed_bddls(bddl)` |
+| **Arena swap** | Workspace fixture class (table / kitchen_table / study_table / living_room_table / coffee_table) with geometric-compatibility check | `bddl_preprocessor.swap_arena(bddl, target_class)` |
+| **Language paraphrase** | (:language …) string via litellm-driven LLM paraphrase. Optional `paraphrase` extra brings in litellm; supports any provider via litellm's unified interface | `language_paraphrase.generate_paraphrased_bddls(bddl, n_variants=…)` |
+
+All Scenic axes are **arbitrarily composable** -- specify any combination:
 
 ```bash
 --perturbation position                    # single axis
 --perturbation position,camera             # two axes
 --perturbation object,lighting,distractor  # three axes
 --perturbation combined                    # preset: position + object + robot + camera + lighting + distractor + background
---perturbation full                        # all axes
+--perturbation full                        # all online axes (combined + texture + articulation + sensor_noise)
 ```
 
 See [docs/scenic_perturbations.md](docs/scenic_perturbations.md) for full parameter details, Scenic code examples, and more screenshots.
@@ -396,9 +419,9 @@ See [docs/evaluation_pipeline.md](docs/evaluation_pipeline.md) for the complete 
 
 | Layer | Component | Role |
 |-------|-----------|------|
-| **Layer 3** | `scenic/*.scenic` | Perturbation programs -- define what varies and what constraints hold |
-| **Layer 2** | `scenic/libero_model.scenic` | World vocabulary -- `LIBEROObject`, table geometry, asset registry |
-| **Layer 1** | `src/libero_infinity/simulator.py` | Scenic-MuJoCo bridge -- pose injection, perturbations, policy stepping |
+| **Layer 3** | `compiler.py` + `renderer/scenic_renderer.py` | Renderer-emitted Scenic programs -- task-general; one program per (BDDL, axis-set) combination, generated on the fly. Replaces the previous handwritten `scenic/*_perturbation.scenic` files (deleted). |
+| **Layer 2** | `scenic/libero_model.scenic` | World vocabulary -- `LIBEROObject`, table geometry, asset registry. Imported by every renderer-emitted program. |
+| **Layer 1** | `src/libero_infinity/simulator.py` | Scenic-MuJoCo bridge -- pose injection, perturbation application, policy stepping, sensor-noise transforms |
 
 See [docs/architecture.md](docs/architecture.md) for detailed diagrams and design decisions.
 
@@ -421,7 +444,7 @@ See [docs/observations-actions.md](docs/observations-actions.md) for the full sc
 | Document | Contents |
 |----------|----------|
 | [Installation](docs/installation.md) | Detailed setup guide, platform support, troubleshooting |
-| [Scenic Perturbations](docs/scenic_perturbations.md) | All 8 perturbation axes -- parameters, constraints, screenshots |
+| [Scenic Perturbations](docs/scenic_perturbations.md) | All 10 online Scenic axes + 3 offline BDDL-rewrite generators -- parameters, constraints, screenshots |
 | [Evaluation Pipeline](docs/evaluation_pipeline.md) | Eval harness, CLI flags, adversarial mode, technical details |
 | [Architecture](docs/architecture.md) | System diagrams, design decisions, file map |
 | [Gym Wrapper](docs/gym-wrapper.md) | Gym env for RL/VLA training, parallel rollouts |
