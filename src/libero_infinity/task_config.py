@@ -377,11 +377,11 @@ def _resolve_init_positions(content: str, cfg: TaskConfig) -> None:
             continue
 
         rinfo = cfg.region_refs.get(full_region)
-        if rinfo is not None and rinfo.has_bounds:
+        if rinfo is not None:
             obj.region_name = rinfo.name
             obj.placement_target = rinfo.target
             centre = rinfo.centre
-            if centre:
+            if centre and rinfo.has_bounds:
                 obj.init_x, obj.init_y = centre
                 obj.init_yaw = rinfo.yaw_centre
                 resolved[obj.instance_name] = centre
@@ -420,3 +420,27 @@ def _resolve_init_positions(content: str, cfg: TaskConfig) -> None:
             if centre:
                 fixture.init_x, fixture.init_y = centre
                 fixture.init_yaw = rinfo.yaw_centre
+
+    # If a movable object's init was unresolved because its region is unbounded
+    # (e.g. ..._cook_region), inherit the anchor position of the resolved support
+    # target when available.
+    movable_init = {
+        obj.instance_name: (obj.init_x, obj.init_y)
+        for obj in cfg.movable_objects
+        if obj.init_x is not None and obj.init_y is not None
+    }
+    fixture_init = {
+        fixture.instance_name: (fixture.init_x, fixture.init_y)
+        for fixture in cfg.fixtures
+        if fixture.init_x is not None and fixture.init_y is not None
+    }
+    for obj in cfg.movable_objects:
+        if obj.contained or (obj.init_x is not None and obj.init_y is not None):
+            continue
+        if not obj.placement_target:
+            continue
+        anchor = fixture_init.get(obj.placement_target) or movable_init.get(obj.placement_target)
+        if anchor is None:
+            continue
+        obj.init_x, obj.init_y = anchor
+        movable_init[obj.instance_name] = anchor

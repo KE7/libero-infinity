@@ -6,12 +6,13 @@ Each plan is independent — no cross-axis logic here.
 
 from __future__ import annotations
 
-from libero_infinity.asset_registry import get_dimensions
+from libero_infinity.asset_registry import OBJECT_DIMENSIONS, get_dimensions
 from libero_infinity.ir.nodes import (
     FixtureNode,
     MovableSupportNode,
     ObjectNode,
     PlanDiagnostics,
+    RegionNode,
     WorkspaceNode,
 )
 from libero_infinity.ir.scene_graph import SemanticSceneGraph
@@ -26,6 +27,13 @@ _WORKSPACE_Y_MARGIN = 0.11
 _DEFAULT_PERTURB_RADIUS = 0.15
 _FIXTURE_PERTURB_RADIUS = 0.08
 _GOAL_COVERAGE_THRESHOLD = 0.8  # switch to distance-based if >80% covered
+_TABLE_X_MIN = -0.40
+_TABLE_X_MAX = 0.40
+_TABLE_Y_MIN = -0.30
+_TABLE_Y_MAX = 0.30
+_TABLE_X_MARGIN = 0.04
+_TABLE_Y_MARGIN = 0.04
+_SUPPORT_UNBOUNDED_DEFAULT_RADIUS = 0.05
 
 # Interior (x, y) sampling extent for known container fixtures.
 # These are conservative estimates of the usable interior cavity;
@@ -95,11 +103,115 @@ def _plan_object_position(
     is_stacked = edge.label == "stacked_on"
     support_node = graph.get_node(edge.dst_id)
 
+    def _support_half_extents(parent_node: FixtureNode | MovableSupportNode | ObjectNode | None) -> tuple[float, float]:
+        """Return conservative half-width/half-length extents for a support.
+
+        For non-workspace supports, we derive this from registry dimensions so
+        relative sampling stays near the support footprint instead of drifting
+        toward the parent origin from absolute coordinates.
+        """
+        if parent_node is None:
+            return _SUPPORT_UNBOUNDED_DEFAULT_RADIUS, _SUPPORT_UNBOUNDED_DEFAULT_RADIUS
+        if isinstance(parent_node, RegionNode):
+            if (
+                parent_node.x_min is not None
+                and parent_node.x_max is not None
+                and parent_node.y_min is not None
+                and parent_node.y_max is not None
+            ):
+                return (
+                    (parent_node.x_max - parent_node.x_min) / 2.0,
+                    (parent_node.y_max - parent_node.y_min) / 2.0,
+                )
+            return _SUPPORT_UNBOUNDED_DEFAULT_RADIUS, _SUPPORT_UNBOUNDED_DEFAULT_RADIUS
+        parent_class = getattr(parent_node, "object_class", "") or ""
+        p_w, p_l, _ = get_dimensions(parent_class)
+        return p_w / 2.0, p_l / 2.0
+
+    def _clip_relative_to_table(
+        parent_node: FixtureNode | MovableSupportNode | ObjectNode,
+        rel_lo: float,
+        rel_hi: float,
+        axis: str,
+    ) -> tuple[float, float]:
+        """Clip relative offsets to a bounded table-safe absolute range."""
+        parent_x = float(getattr(parent_node, "init_x", 0.0) or 0.0)
+        parent_y = float(getattr(parent_node, "init_y", 0.0) or 0.0)
+
+        width = rel_hi - rel_lo
+        if width <= 0:
+            return rel_lo, rel_hi
+
+        if axis == "x":
+            target_min = _TABLE_X_MIN + _TABLE_X_MARGIN
+            target_max = _TABLE_X_MAX - _TABLE_X_MARGIN
+            centre = parent_x + (rel_lo + rel_hi) / 2.0
+        else:
+            target_min = _TABLE_Y_MIN + _TABLE_Y_MARGIN
+            target_max = _TABLE_Y_MAX - _TABLE_Y_MARGIN
+            centre = parent_y + (rel_lo + rel_hi) / 2.0
+
+        half_w = width / 2.0
+        clipped_centre = min(max(centre, target_min + half_w), target_max - half_w)
+        abs_lo = clipped_centre - half_w
+        abs_hi = clipped_centre + half_w
+
+        if abs_lo < target_min:
+            abs_lo = target_min
+            abs_hi = abs_lo + width
+        if abs_hi > target_max:
+            abs_hi = target_max
+            abs_lo = abs_hi - width
+
+        if axis == "x":
+            return abs_lo - parent_x, abs_hi - parent_x
+        return abs_lo - parent_y, abs_hi - parent_y
+
+    def _clamped_relative_envelope(
+        parent_node: FixtureNode | MovableSupportNode | ObjectNode,
+        child_node: ObjectNode | MovableSupportNode,
+    ) -> tuple[AxisEnvelope, AxisEnvelope]:
+        """Compute bounded relative offsets for non-workspace support links."""
+        support_hx, support_hy = _support_half_extents(parent_node)
+        parent_class = getattr(parent_node, "object_class", "")
+        has_known_support_dims = (
+            (isinstance(parent_node, RegionNode) and parent_node.x_min is not None)
+            or parent_class in OBJECT_DIMENSIONS
+            or (
+                isinstance(parent_node, FixtureNode)
+                and parent_class in _CONTAINER_FIXTURE_INTERIOR
+            )
+        )
+        child_class = child_node.object_class or ""
+        child_w, child_l, _ = get_dimensions(child_class)
+        child_hx = child_w / 2.0
+        child_hy = child_l / 2.0
+
+        # Keep objects on-top of the support footprint while staying bounded.
+        # For explicit support footprints, clip to the support-relative footprint.
+        # For unbounded regions, keep placement centered on the support with a
+        # small, bounded fallback around the support center.
+        if has_known_support_dims:
+            x_rad = support_hx - child_hx
+            y_rad = support_hy - child_hy
+        else:
+            x_rad = max(0.0, support_hx - child_hx)
+            y_rad = max(0.0, support_hy - child_hy)
+        x_rad = max(0.02, min(_FIXTURE_PERTURB_RADIUS, x_rad))
+        y_rad = max(0.02, min(_FIXTURE_PERTURB_RADIUS, y_rad))
+        rel_x_lo, rel_x_hi = -x_rad, x_rad
+        rel_y_lo, rel_y_hi = -y_rad, y_rad
+        if has_known_support_dims:
+            rel_x_lo, rel_x_hi = _clip_relative_to_table(parent_node, rel_x_lo, rel_x_hi, "x")
+            rel_y_lo, rel_y_hi = _clip_relative_to_table(parent_node, rel_y_lo, rel_y_hi, "y")
+        return AxisEnvelope(rel_x_lo, rel_x_hi, "x"), AxisEnvelope(rel_y_lo, rel_y_hi, "y")
+
     # Compute envelope based on support relationship
     if is_stacked:
-        # Relative to parent: small perturbation around parent origin
-        x_env = AxisEnvelope(-0.05, 0.05, "x")
-        y_env = AxisEnvelope(-0.05, 0.05, "y")
+        # Keep stacked objects on a bounded support footprint around the parent
+        # anchor. This avoids task-specific fallback constants and prevents
+        # stacked objects from drifting off small support surfaces.
+        x_env, y_env = _clamped_relative_envelope(support_node, node)
     elif isinstance(support_node, WorkspaceNode):
         # Workspace surface: center around init position with default radius
         cx = node.init_x or 0.0
@@ -109,11 +221,7 @@ def _plan_object_position(
         y_env = AxisEnvelope(cy - r, cy + r, "y")
     else:
         # Fixture or movable support: tighter perturbation around init position
-        cx = node.init_x or 0.0
-        cy = node.init_y or 0.0
-        r = _FIXTURE_PERTURB_RADIUS
-        x_env = AxisEnvelope(cx - r, cx + r, "x")
-        y_env = AxisEnvelope(cy - r, cy + r, "y")
+        x_env, y_env = _clamped_relative_envelope(support_node, node)
 
     # Range degeneracy guard
     try:
@@ -159,7 +267,7 @@ def _plan_object_position(
         x_envelope=x_env,
         y_envelope=y_env,
         support_name=edge.dst_id,
-        use_relative_positioning=is_stacked,
+        use_relative_positioning=is_stacked or not isinstance(support_node, WorkspaceNode),
         exclusion_zones=exclusion_zones,
         exclusion_min_distance=exclusion_min_distance,
     )

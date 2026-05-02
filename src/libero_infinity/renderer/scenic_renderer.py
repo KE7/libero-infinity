@@ -10,6 +10,7 @@ This renderer is a deterministic function of the plan IR alone.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from libero_infinity.asset_registry import get_dimensions
@@ -23,6 +24,162 @@ from libero_infinity.planner.types import PerturbationPlan
 
 if TYPE_CHECKING:
     pass
+
+
+# ---------------------------------------------------------------------------
+# Semantic support / containment relations
+# ---------------------------------------------------------------------------
+#
+# A "declared support relation" is a (child, support) pair where the BDDL
+# author asserted that ``child`` rests on / inside / stacked-on ``support``.
+# Such pairs are encoded in the SemanticSceneGraph as ``supported_by``,
+# ``contained_in``, or ``stacked_on`` edges with a matching ``spatial_kind``.
+#
+# When the position-axis planner emits ``use_relative_positioning=True`` for
+# such a child, the renderer expresses that relation in Scenic via the
+# specifier
+#
+#     at <support> offset by Vector(Range(<dx_lo>, <dx_hi>),
+#                                   Range(<dy_lo>, <dy_hi>), 0.0)
+#
+# where the offset envelope is already clipped (in
+# ``planner/position.py``) to ``support_half_extents - child_half_extents``.
+# That specifier therefore *is* the positive support / containment
+# constraint — the child's footprint is constructively pinned inside the
+# support region by the offset Range.
+#
+# What the renderer must NOT do, then, is emit any *contradictory* clearance
+# constraint between the same child and support — e.g.,
+# ``require (distance from child to support) > clearance`` — because that
+# would carve out a measure-zero feasible region and Scenic would reject
+# every sample.
+#
+# The helpers below make this explicit: ``_collect_support_relations``
+# materializes the declared (child, support, kind) tuples, and
+# ``_should_emit_fixture_clearance`` is the only place that decides whether
+# an object↔fixture distance constraint is safe to emit.
+
+
+@dataclass(frozen=True)
+class _SupportRelation:
+    """A renderer-visible declared support / containment relation.
+
+    Attributes:
+        child_var:        Scenic variable name for the child object.
+        support_var:      Scenic variable name for the support entity.
+        child_name:       Original instance name of the child.
+        support_name:     Original instance name of the support entity.
+        kind:             One of ``"on_surface"`` (resting on a fixture/movable
+                          surface), ``"inside"`` (contained within a fixture
+                          cavity such as a drawer), ``"stacked"`` (sitting on
+                          top of another movable object), or ``"unknown"`` if
+                          no matching IR edge was found (defensive fallback).
+        support_is_fixture: True iff the support is an immobile FixtureNode.
+                          Distinguishes fixture-anchored placements (cabinet,
+                          stove) from movable supports (cookies_box).
+    """
+
+    child_var: str
+    support_var: str
+    child_name: str
+    support_name: str
+    kind: str
+    support_is_fixture: bool
+
+
+def _collect_support_relations(
+    plan: PerturbationPlan, graph: SemanticSceneGraph
+) -> list[_SupportRelation]:
+    """Materialize declared support / containment relations.
+
+    A relation is recorded for every ``(child, support)`` pair where the
+    renderer will emit a relative-positioning specifier (i.e., the planner
+    produced a ``PositionPlan`` with ``use_relative_positioning=True`` and a
+    non-empty ``support_name``).  The semantic kind is read from the matching
+    SceneEdge label so downstream logic can distinguish drawer/containment
+    placements from open-top support placements.
+
+    The renderer is a pure function of plan + graph (purity invariant), so
+    no I/O or hidden side-state is involved — the result is fully determined
+    by the inputs.
+    """
+    relations: list[_SupportRelation] = []
+    edge_kind_by_label = {
+        "supported_by": "on_surface",
+        "contained_in": "inside",
+        "stacked_on": "stacked",
+    }
+    for child_name, pp in plan.position_plans.items():
+        if pp is None:
+            continue
+        if not (pp.use_relative_positioning and pp.support_name):
+            continue
+        kind = "unknown"
+        for edge in graph.edges_from(child_name):
+            if edge.dst_id != pp.support_name:
+                continue
+            if edge.label in edge_kind_by_label:
+                kind = edge_kind_by_label[edge.label]
+                break
+        support_node = graph.get_node(pp.support_name)
+        is_fixture = isinstance(support_node, FixtureNode)
+        relations.append(
+            _SupportRelation(
+                child_var=_to_var(child_name),
+                support_var=_to_var(pp.support_name),
+                child_name=child_name,
+                support_name=pp.support_name,
+                kind=kind,
+                support_is_fixture=is_fixture,
+            )
+        )
+    return relations
+
+
+def _is_declared_support_pair(
+    var_a: str, var_b: str, relations: list[_SupportRelation]
+) -> bool:
+    """Return True if ``{var_a, var_b}`` are a declared (child, support) pair.
+
+    Order-insensitive: works for both the object-fixture clearance loop
+    (where ``var_a`` is the child and ``var_b`` is the fixture) and the
+    object-object clearance loop (where ``var_a`` is the child and ``var_b``
+    is its movable support — e.g., a bowl stacked on a cookies box).
+    """
+    for rel in relations:
+        if (rel.child_var == var_a and rel.support_var == var_b) or (
+            rel.child_var == var_b and rel.support_var == var_a
+        ):
+            return True
+    return False
+
+
+def _should_emit_fixture_clearance(
+    obj_var: str,
+    obj_sampled: bool,
+    fixture_var: str,
+    relations: list[_SupportRelation],
+) -> bool:
+    """Decide whether to emit ``distance(obj, fixture) > clearance``.
+
+    Semantics:
+    1. If ``obj`` is not Scenic-sampled — i.e. it carries the BDDL author's
+       canonical (x, y) position verbatim — trust the author and emit
+       nothing.  The renderer's clearance threshold is a conservative AABB
+       diagonal that frequently overlaps an author's hand-placed bowl/plate.
+    2. If ``obj`` has a declared support relation against ``fixture`` (any
+       kind: on_surface / inside / stacked-via-fixture-anchored-support),
+       the relative-position specifier already pins ``obj`` *inside* the
+       fixture footprint.  Emitting ``distance > clearance`` in that case
+       is unsatisfiable — every Scenic sample would be rejected.
+    3. Otherwise the pair is unrelated and we emit the standard footprint
+       clearance constraint to prevent geometric overlap.
+    """
+    if not obj_sampled:
+        return False
+    if _is_declared_support_pair(obj_var, fixture_var, relations):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +394,10 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         )
     # Kahn's algorithm for topological sort
     _name_to_entry = {n.instance_name: (nid, n) for nid, n in raw_obj_nodes}
-    _in_degree: dict[str, int] = {name: (1 if dep is not None else 0) for name, dep in _dep.items()}
+    _in_degree: dict[str, int] = {
+        name: (1 if dep is not None and dep in _name_to_entry else 0)
+        for name, dep in _dep.items()
+    }
     _children: dict[str, list[str]] = {name: [] for name in _dep}
     for name, dep in _dep.items():
         if dep is not None and dep in _children:
@@ -476,6 +636,27 @@ def _is_sampled(node: "ObjectNode | MovableSupportNode", plan: PerturbationPlan)
 def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     lines = ["# Distance constraints"]
 
+    # Materialize declared support / containment relations once.  The
+    # relative-positioning specifier already encodes the positive
+    # support / containment constraint via its offset Range; the constraint
+    # block must only suppress contradictory clearance constraints between
+    # the same (child, support) pair.
+    support_relations = _collect_support_relations(plan, graph)
+
+    # Annotate each declared relation in the generated Scenic so the
+    # semantic intent is auditable from the .scenic alone.  These comments
+    # are pure documentation — they emit no Scenic constraints.
+    if support_relations:
+        lines.append(
+            "# Declared support / containment relations "
+            "(positive constraints encoded via 'at <support> offset by Range' specifier above):"
+        )
+        for rel in support_relations:
+            lines.append(
+                f"#   {rel.child_name} {rel.kind} {rel.support_name}"
+                f"{' (fixture)' if rel.support_is_fixture else ' (movable)'}"
+            )
+
     # Collect (var_name, dims, instance_name, is_sampled) tuples for
     # non-contained objects.  is_sampled drives the constraint skip rule.
     obj_info: list[tuple[str, tuple[float, float, float], str, bool]] = []
@@ -490,13 +671,6 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         sampled = _is_sampled(node, plan)
         obj_info.append((var_name, dims, node.instance_name, sampled))
 
-    # Build the set of (child_var, support_var) pairs that use relative
-    # positioning — no distance constraint should be emitted between these.
-    relative_pairs: set[frozenset[str]] = set()
-    for obj_name, pp in plan.position_plans.items():
-        if pp is not None and pp.use_relative_positioning and pp.support_name:
-            relative_pairs.add(frozenset({_to_var(obj_name), _to_var(pp.support_name)}))
-
     # Pairwise AABB clearance constraints.
     #
     # Rule 1 — fixed-vs-fixed: BOTH objects sit at BDDL canonical positions
@@ -509,12 +683,16 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
     #
     # Rule 3 — sampled-vs-sampled: both positions are Scenic-sampled.
     #   Use footprint-based thresholds — exact AABB non-overlap guarantee.
+    #
+    # Rule 4 — declared support pair (e.g., bowl stacked on cookies_box):
+    #   skip — the relative-positioning specifier already pins the child
+    #   on top of the support.
     for i in range(len(obj_info)):
         for j in range(i + 1, len(obj_info)):
             var_a, dims_a, _name_a, sampled_a = obj_info[i]
             var_b, dims_b, _name_b, sampled_b = obj_info[j]
-            if frozenset({var_a, var_b}) in relative_pairs:
-                continue  # object sits on support — no separation constraint
+            if _is_declared_support_pair(var_a, var_b, support_relations):
+                continue
             # Rule 1: both fixed — skip (positions are valid by BDDL design)
             if not sampled_a and not sampled_b:
                 continue
@@ -532,8 +710,11 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
     # positions that still penetrate fixture geometry (one axis satisfied but
     # the other not).  The diagonal radius sum guarantees clearance from all
     # approach angles.
-    # Only emit for sampled objects — fixed task objects already have valid
-    # BDDL-authored positions that the fixture placement was designed around.
+    #
+    # Decision routed through ``_should_emit_fixture_clearance`` so that:
+    #   - fixed BDDL placements stay un-constrained (trust author), and
+    #   - declared support relations between the object and this fixture
+    #     suppress the (otherwise unsatisfiable) clearance constraint.
     for node_id, fnode in graph.nodes.items():
         if not isinstance(fnode, FixtureNode):
             continue
@@ -542,8 +723,10 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         fvar = _to_var(fnode.instance_name)
         fdims = _fixture_dims(fnode.object_class)
         for var_name, dims, _name, sampled in obj_info:
-            if not sampled:
-                continue  # fixed task object — trust BDDL author placement
+            if not _should_emit_fixture_clearance(
+                var_name, sampled, fvar, support_relations
+            ):
+                continue
             clearance = _footprint_clearance_xy(fdims, dims)
             lines.append(f"require (distance from {var_name} to {fvar}) > {clearance:.4f}")
 
@@ -552,21 +735,28 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         lines.append("")
         lines.append('param anti_trivialization = "active"')
 
-    # Distractor clearance (fixed small margin — distractors are intentionally small)
+    # Distractor clearance (fixed small margin — distractors are intentionally small).
+    # Distractors do not currently carry a PositionPlan with a declared support
+    # relation, so ``_should_emit_fixture_clearance`` for a synthetic
+    # distractor var would always return True; we keep the existing
+    # distractor-vs-fixture loop unconditional but wire it through the
+    # helper to remain forward-compatible if the planner is later extended
+    # to put distractors on a fixture.
     obj_vars = [var for var, _, _n, _s in obj_info]
     if plan.distractor_budget > 0 and "distractor" in plan.active_axes:
         distractor_dims = (0.08, 0.08, 0.08)
         for i in range(plan.distractor_budget):
+            d_var = f"distractor_{i}"
             for var in obj_vars:
                 lines.append(
                     f"require (_n_distractors <= {i}) "
-                    f"or ((distance from distractor_{i} to {var}) > 0.13)"
+                    f"or ((distance from {d_var} to {var}) > 0.13)"
                 )
             for j in range(i + 1, plan.distractor_budget):
                 lines.append(
                     f"require (_n_distractors <= {i}) "
                     f"or (_n_distractors <= {j}) "
-                    f"or ((distance from distractor_{i} to distractor_{j}) > 0.06)"
+                    f"or ((distance from {d_var} to distractor_{j}) > 0.06)"
                 )
             for node_id, fnode in graph.nodes.items():
                 if not isinstance(fnode, FixtureNode):
@@ -574,11 +764,20 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
                 if fnode.init_x is None or fnode.init_y is None:
                     continue
                 fvar = _to_var(fnode.instance_name)
+                # Distractors are always Scenic-sampled (they have no BDDL
+                # canonical position) and currently have no support relations,
+                # so the helper trivially returns True today.  Routing
+                # through the helper keeps a future planner extension
+                # (e.g., distractors-on-fixtures) automatically correct.
+                if not _should_emit_fixture_clearance(
+                    d_var, True, fvar, support_relations
+                ):
+                    continue
                 fdims = _fixture_dims(fnode.object_class)
                 clearance = _footprint_clearance_xy(fdims, distractor_dims)
                 lines.append(
                     f"require (_n_distractors <= {i}) "
-                    f"or ((distance from distractor_{i} to {fvar}) > {clearance:.4f})"
+                    f"or ((distance from {d_var} to {fvar}) > {clearance:.4f})"
                 )
 
     lines.append("")

@@ -152,6 +152,22 @@ def _surface_spawn_z(surface_z: float, asset_class: str) -> float:
     return surface_z + max(float(h) / 2.0, 0.01) + 1e-3
 
 
+def _bddl_contained_object_names(bddl_path: str) -> set[str]:
+    """Return objects whose authored initial relation is true containment."""
+    try:
+        from libero_infinity.task_config import TaskConfig
+
+        cfg = TaskConfig.from_bddl(bddl_path)
+    except Exception:
+        log.debug(
+            "Could not parse BDDL containment metadata from %s",
+            bddl_path,
+            exc_info=True,
+        )
+        return set()
+    return {obj.instance_name for obj in cfg.movable_objects if obj.contained}
+
+
 def _infer_root_surface_z(scene_objects, default_pose: dict[str, np.ndarray]) -> float:
     """Infer the canonical root support height from default LIBERO placements."""
     surface_candidates: list[float] = []
@@ -185,6 +201,111 @@ def _visibility_anchor_points(
         np.array((0.0, 0.0, half_z), dtype=float),
     ]
     return [center + offset for offset in offsets]
+
+
+def _geom_world_aabb(sim, geom_id: int) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return a world-frame AABB for a MuJoCo geom when enough data is exposed."""
+    model = sim.model
+    data = sim.data
+    try:
+        center = np.array(data.geom_xpos[geom_id], dtype=float)
+        rot = np.array(data.geom_xmat[geom_id], dtype=float).reshape(3, 3)
+    except Exception:
+        return None
+
+    try:
+        import mujoco
+
+        mesh_type = int(mujoco.mjtGeom.mjGEOM_MESH)
+    except Exception:
+        mesh_type = 7
+
+    geom_type = int(model.geom_type[geom_id])
+    if geom_type == mesh_type and int(model.geom_dataid[geom_id]) >= 0:
+        mesh_id = int(model.geom_dataid[geom_id])
+        vert_adr = int(model.mesh_vertadr[mesh_id])
+        vert_num = int(model.mesh_vertnum[mesh_id])
+        if vert_num > 0:
+            verts = np.array(model.mesh_vert[vert_adr : vert_adr + vert_num], dtype=float)
+            points = center + verts @ rot.T
+            return points.min(axis=0), points.max(axis=0)
+
+    try:
+        radius = float(model.geom_rbound[geom_id])
+    except Exception:
+        return None
+    extent = np.array((radius, radius, radius), dtype=float)
+    return center - extent, center + extent
+
+
+def _body_world_aabb(sim, object_name: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return a live world-frame AABB for an object/fixture body prefix."""
+    mins: list[np.ndarray] = []
+    maxs: list[np.ndarray] = []
+    for geom_id in range(int(sim.model.ngeom)):
+        body_name = sim.model.body_id2name(sim.model.geom_bodyid[geom_id]) or ""
+        if body_name != object_name and not body_name.startswith(f"{object_name}_"):
+            continue
+        aabb = _geom_world_aabb(sim, geom_id)
+        if aabb is None:
+            continue
+        geom_min, geom_max = aabb
+        mins.append(geom_min)
+        maxs.append(geom_max)
+    if not mins:
+        return None
+    return np.min(mins, axis=0), np.max(maxs, axis=0)
+
+
+def _visibility_anchor_points_for_body(
+    *,
+    sim,
+    object_name: str,
+    center: np.ndarray,
+    dims: tuple[float, float, float],
+) -> list[np.ndarray]:
+    """Anchor visibility checks on the live object surface instead of its interior."""
+    aabb = _body_world_aabb(sim, object_name)
+    if aabb is None:
+        return _visibility_anchor_points(center, dims)
+
+    min_corner, max_corner = aabb
+    if not np.all(np.isfinite(min_corner)) or not np.all(np.isfinite(max_corner)):
+        return _visibility_anchor_points(center, dims)
+    if np.any(max_corner <= min_corner):
+        return _visibility_anchor_points(center, dims)
+
+    mid = (min_corner + max_corner) / 2.0
+    xs = (float(min_corner[0]), float(mid[0]), float(max_corner[0]))
+    ys = (float(min_corner[1]), float(mid[1]), float(max_corner[1]))
+    top_z = float(max_corner[2])
+    mid_z = float(mid[2])
+
+    anchors = [np.array((x, y, top_z), dtype=float) for x in xs for y in ys]
+    anchors.extend(
+        np.array((x, y, mid_z), dtype=float)
+        for x in (float(min_corner[0]), float(max_corner[0]))
+        for y in (float(min_corner[1]), float(max_corner[1]))
+    )
+    return anchors
+
+
+def _visibility_depth_tolerance(
+    *,
+    sim,
+    object_name: str,
+    base_tolerance: float = 0.05,
+) -> float:
+    """Depth slack for anchors lying behind the visible front surface."""
+    aabb = _body_world_aabb(sim, object_name)
+    if aabb is None:
+        return base_tolerance
+    min_corner, max_corner = aabb
+    if not np.all(np.isfinite(min_corner)) or not np.all(np.isfinite(max_corner)):
+        return base_tolerance
+    extent = np.maximum(max_corner - min_corner, 0.0)
+    front_surface_slack = min(0.20, max(0.02, float(np.max(extent)) * 1.5))
+    return base_tolerance + front_surface_slack
 
 
 def _anchor_visible(
@@ -621,6 +742,7 @@ class LIBEROSimulation(Simulation):
 
         self._canonical_rot = dict(default_rot)
         root_surface_z = _infer_root_surface_z(self.scene.objects, default_pose)
+        contained_object_names = _bddl_contained_object_names(effective_bddl)
         self._apply_robot_perturbation()
 
         # ── inject Scenic-sampled positions ───────────────────────────────
@@ -649,23 +771,29 @@ class LIBEROSimulation(Simulation):
                     continue
             pos = np.array(obj.position, dtype=float)  # (x, y, z) MuJoCo frame
             preserve_default_z = bool(getattr(obj, "preserve_default_z", True))
-            # Contained objects (support_parent_name is set) must stay at their
-            # init height inside the container, regardless of ELEVATED_Z_THRESHOLD.
-            # This handles bowls inside cabinet drawers, which sit above the normal
-            # table surface but must not be relocated to table-surface z.
-            is_contained = bool(support_parent_names.get(libero_name, ""))
+            # True containment comes from authored BDDL "(In ...)" relations.
+            # support_parent_name is broader: it is also used for ordinary
+            # "On" support stacks such as bowl-on-ramekin or bowl-on-stove.
+            is_contained = libero_name in contained_object_names
+            is_supported_child = (
+                bool(support_parent_names.get(libero_name, "")) and not is_contained
+            )
             # Use LIBERO's default support height only when the generated
             # Scenic object explicitly opts into it AND the object starts near
             # the table surface (or is inside a container at any height).
             # Objects with elevated default_z (e.g. starting on a stove or
             # cabinet shelf that the robot placed them on) should be placed at
             # table-surface z when their XY position is being perturbed to the
-            # table area — but contained objects are the exception since their
-            # fixture holds them at the correct height.
+            # table area. Contained objects and supported children are the
+            # exceptions: both derive their z from an authored support relation.
             if (
                 preserve_default_z
                 and libero_name in default_pose
-                and (default_pose[libero_name][2] <= ELEVATED_Z_THRESHOLD or is_contained)
+                and (
+                    default_pose[libero_name][2] <= ELEVATED_Z_THRESHOLD
+                    or is_contained
+                    or is_supported_child
+                )
             ):
                 pos[2] = default_pose[libero_name][2]
             else:
@@ -676,7 +804,9 @@ class LIBEROSimulation(Simulation):
                 table_spawned_names.add(libero_name)
             self._inject_object_pose(libero_name, pos, obj)
             injected_targets[libero_name] = pos.copy()
-            object_dimensions[libero_name] = get_dimensions(getattr(obj, "asset_class", "_default"))
+            object_dimensions[libero_name] = get_dimensions(
+                getattr(obj, "asset_class", "_default")
+            )
             n_injected += 1
 
         self._apply_articulation_perturbation()
@@ -702,6 +832,12 @@ class LIBEROSimulation(Simulation):
             # the policy starts from a quiescent state.
             for _ in range(50):
                 mujoco.mj_step(mjmodel, mjdata)
+            mjdata.qvel[:] = 0
+            mujoco.mj_forward(mjmodel, mjdata)
+            self._restack_supported_children(
+                support_parent_names=support_parent_names,
+                contained_object_names=contained_object_names,
+            )
             mjdata.qvel[:] = 0
             mujoco.mj_forward(mjmodel, mjdata)
 
@@ -989,6 +1125,70 @@ class LIBEROSimulation(Simulation):
                 pass
 
         log.warning("Could not inject pose for %s: not found as joint or body", libero_name)
+
+    def _restack_supported_children(
+        self,
+        *,
+        support_parent_names: dict[str, str],
+        contained_object_names: set[str],
+    ) -> None:
+        """Lift supported children that settled into their parent support."""
+        if self.libero_env is None:
+            return
+
+        sim = self.libero_env.env.sim
+        for child_name, parent_name in support_parent_names.items():
+            if not parent_name or child_name in contained_object_names:
+                continue
+
+            child_aabb = _body_world_aabb(sim, child_name)
+            parent_aabb = _body_world_aabb(sim, parent_name)
+            if child_aabb is None or parent_aabb is None:
+                continue
+
+            child_min, child_max = child_aabb
+            _parent_min, parent_max = parent_aabb
+            if not np.all(np.isfinite(child_min)) or not np.all(np.isfinite(parent_max)):
+                continue
+
+            child_height = max(float(child_max[2] - child_min[2]), 0.0)
+            clearance = max(0.003, min(0.010, child_height * 0.05))
+            min_child_bottom_z = float(parent_max[2]) + clearance
+            current_child_bottom_z = float(child_min[2])
+            if current_child_bottom_z >= min_child_bottom_z:
+                continue
+
+            dz = min_child_bottom_z - current_child_bottom_z
+            joint_name = f"{child_name}_joint0"
+            try:
+                qpos = sim.data.get_joint_qpos(joint_name).copy()
+                qpos[2] = float(qpos[2]) + dz
+                sim.data.set_joint_qpos(joint_name, qpos)
+                log.debug(
+                    "Lifted supported child %s by %.4f m above %s",
+                    child_name,
+                    dz,
+                    parent_name,
+                )
+                continue
+            except Exception:
+                pass
+
+            for body_name in (child_name, child_name + "_main"):
+                try:
+                    body_id = sim.model.body_name2id(body_name)
+                    sim.model.body_pos[body_id][2] = (
+                        float(sim.model.body_pos[body_id][2]) + dz
+                    )
+                    log.debug(
+                        "Lifted supported child body %s by %.4f m above %s",
+                        body_name,
+                        dz,
+                        parent_name,
+                    )
+                    break
+                except Exception:
+                    continue
 
     def _validate_settled_positions(
         self,
@@ -1320,9 +1520,19 @@ class LIBEROSimulation(Simulation):
                 continue
             center = np.array(sim.data.body_xpos[body_id][:3], dtype=float)
             dims = object_dimensions.get(target_name, (0.06, 0.06, 0.06))
+            anchor_points = _visibility_anchor_points_for_body(
+                sim=sim,
+                object_name=target_name,
+                center=center,
+                dims=dims,
+            )
+            depth_tolerance = _visibility_depth_tolerance(
+                sim=sim,
+                object_name=target_name,
+            )
             visible = 0
             anchors = 0
-            for point in _visibility_anchor_points(center, dims):
+            for point in anchor_points:
                 anchors += 1
                 visible += int(
                     _anchor_visible(
@@ -1332,11 +1542,12 @@ class LIBEROSimulation(Simulation):
                         depth_map=depth_map,
                         image_height=height,
                         image_width=width,
+                        depth_tolerance=depth_tolerance,
                     )
                 )
             if visible == 0:
                 failures.append(f"{target_name} is out of frame or fully occluded")
-            elif visible < max(1, anchors // 3):
+            elif visible < max(1, min(3, anchors // 4)):
                 failures.append(f"{target_name} is only weakly visible in agentview")
 
         if failures:
