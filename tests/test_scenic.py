@@ -107,7 +107,12 @@ class TestPositionPerturbationAudit:
         stacked_cfg = TaskConfig.from_bddl(str(stacked_bddl))
         moving_fixtures, movable_supports, _parent_map = moving_support_names(stacked_cfg)
         assert "cookies_1" in movable_supports
-        assert not moving_fixtures
+        # The cookie-box-and-plate BDDL also declares a wooden_cabinet_1
+        # fixture that supports akita_black_bowl_2; that fixture is therefore
+        # a legitimate "moving support fixture" too. (Earlier revisions of
+        # this test asserted ``not moving_fixtures``, inconsistent with the
+        # BDDL's actual (:fixtures ...) block.)
+        assert "wooden_cabinet_1" in moving_fixtures
 
         drawer_cfg = TaskConfig.from_bddl(str(DRAWER_PICK_BOWL_BDDL))
         moving_fixtures, movable_supports, _parent_map = moving_support_names(drawer_cfg)
@@ -466,8 +471,20 @@ class TestScenicGenerator:
             os.unlink(path)
 
     def test_combined_mode_compiles(self, bowl_config):
+        import random
+
+        import numpy as np
+
         import scenic as sc
         from libero_infinity.compiler import generate_scenic_file
+
+        # Pin the RNGs so Scenic's rejection sampler is deterministic — same
+        # rationale as test_full_mode_compiles below: tight radial
+        # footprint-clearance constraints make pass/fail probabilistic even
+        # at maxIterations=10000 without a fixed seed, causing intermittent
+        # flakes in CI.
+        random.seed(0)
+        np.random.seed(0)
 
         path = generate_scenic_file(bowl_config, perturbation="combined")
         try:
