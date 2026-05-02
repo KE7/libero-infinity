@@ -473,6 +473,77 @@ def _is_sampled(node: "ObjectNode | MovableSupportNode", plan: PerturbationPlan)
     return False
 
 
+def _relative_parent_map(plan: PerturbationPlan) -> dict[str, str]:
+    """Map relatively positioned object names to their direct support names."""
+    return {
+        obj_name: pp.support_name
+        for obj_name, pp in plan.position_plans.items()
+        if pp is not None and pp.use_relative_positioning and pp.support_name
+    }
+
+
+def _support_relation_label(
+    graph: SemanticSceneGraph,
+    child_name: str,
+    parent_name: str,
+) -> str | None:
+    child_ids = [child_name]
+    child_ids.extend(
+        node_id
+        for node_id, node in graph.nodes.items()
+        if node.instance_name == child_name and node_id != child_name
+    )
+    for child_id in child_ids:
+        edges = graph.edges_from(child_id)
+        for edge in edges:
+            parent = graph.get_node(edge.dst_id)
+            parent_matches = edge.dst_id == parent_name or (
+                parent is not None and parent.instance_name == parent_name
+            )
+            if parent_matches and edge.label in {
+                "contained_in",
+                "stacked_on",
+                "supported_by",
+            }:
+                return edge.label
+    return None
+
+
+def _clearance_relationship(
+    name_a: str,
+    name_b: str,
+    relative_parent: dict[str, str],
+    graph: SemanticSceneGraph,
+) -> str:
+    """Classify how pairwise clearance should treat two object nodes."""
+    parent_a = relative_parent.get(name_a)
+    parent_b = relative_parent.get(name_b)
+
+    if parent_a == name_b or parent_b == name_a:
+        return "direct_parent"
+
+    if parent_a is None or parent_b is None or parent_a != parent_b:
+        return "independent"
+
+    label_a = _support_relation_label(graph, name_a, parent_a)
+    label_b = _support_relation_label(graph, name_b, parent_b)
+    if label_a is None or label_b is None:
+        raise ValueError(
+            "Relative-positioned siblings share support "
+            f"{parent_a!r}, but graph support edges are missing for "
+            f"{name_a!r} and/or {name_b!r}"
+        )
+    if label_a != label_b:
+        raise ValueError(
+            "Relative-positioned siblings share support "
+            f"{parent_a!r} with incompatible relationships: "
+            f"{name_a!r}={label_a}, {name_b!r}={label_b}"
+        )
+    if label_a == "contained_in":
+        return "contained_sibling"
+    return "independent"
+
+
 def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     lines = ["# Distance constraints"]
 
@@ -490,12 +561,7 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         sampled = _is_sampled(node, plan)
         obj_info.append((var_name, dims, node.instance_name, sampled))
 
-    # Build the set of (child_var, support_var) pairs that use relative
-    # positioning — no distance constraint should be emitted between these.
-    relative_pairs: set[frozenset[str]] = set()
-    for obj_name, pp in plan.position_plans.items():
-        if pp is not None and pp.use_relative_positioning and pp.support_name:
-            relative_pairs.add(frozenset({_to_var(obj_name), _to_var(pp.support_name)}))
+    relative_parent = _relative_parent_map(plan)
 
     # Pairwise AABB clearance constraints.
     #
@@ -513,8 +579,9 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         for j in range(i + 1, len(obj_info)):
             var_a, dims_a, _name_a, sampled_a = obj_info[i]
             var_b, dims_b, _name_b, sampled_b = obj_info[j]
-            if frozenset({var_a, var_b}) in relative_pairs:
-                continue  # object sits on support — no separation constraint
+            relationship = _clearance_relationship(_name_a, _name_b, relative_parent, graph)
+            if relationship in {"direct_parent", "contained_sibling"}:
+                continue
             # Rule 1: both fixed — skip (positions are valid by BDDL design)
             if not sampled_a and not sampled_b:
                 continue

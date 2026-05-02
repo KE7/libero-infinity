@@ -40,6 +40,20 @@ _CONTAINER_FIXTURE_INTERIOR: dict[str, tuple[float, float]] = {
 }
 _CONTAINER_FIXTURE_INTERIOR_DEFAULT = (0.15, 0.12)  # conservative fallback
 
+# Interior (x, y) sampling extent for known movable containers.
+# Unlike fixtures, movable objects do not get a generic footprint fallback:
+# treating every object footprint as usable interior silently turns arbitrary
+# supports into containers.
+_MOVABLE_CONTAINER_INTERIOR: dict[str, tuple[float, float]] = {
+    "basket": (0.14, 0.09),
+    "tray": (0.18, 0.12),
+    "wooden_tray": (0.18, 0.12),
+    "white_storage_box": (0.13, 0.09),
+    "caddy": (0.10, 0.07),
+    "desk_caddy": (0.10, 0.07),
+    "bowl_drainer": (0.12, 0.10),
+}
+
 
 def plan_position(
     graph: SemanticSceneGraph,
@@ -194,27 +208,33 @@ def _plan_contained_position(
     )
     child_class = node.object_class or ""
 
-    # Determine parent interior extents (x, y).
-    if isinstance(container_node, FixtureNode):
-        parent_x, parent_y = _CONTAINER_FIXTURE_INTERIOR.get(
-            container_class, _CONTAINER_FIXTURE_INTERIOR_DEFAULT
+    parent_interior = container_interior_xy(container_node)
+    if parent_interior is None:
+        diagnostics.drop_axis(
+            "position",
+            f"unsupported movable container {container_id!r} "
+            f"({container_class or 'unknown class'}) for contained object {node.node_id}",
         )
-    else:
-        # Movable support or object: use registry footprint directly.
-        pdims = get_dimensions(container_class)
-        parent_x, parent_y = pdims[0], pdims[1]
+        return None
+    parent_x, parent_y = parent_interior
 
     # Child half-footprint.
     cdims = get_dimensions(child_class)
     child_hx = cdims[0] / 2.0
     child_hy = cdims[1] / 2.0
 
-    # Sampling half-extents: keep child fully inside parent interior.
-    dx = max(0.02, parent_x / 2.0 - child_hx)
-    dy = max(0.02, parent_y / 2.0 - child_hy)
+    x_lo, x_hi, y_lo, y_hi = _contained_child_bounds(
+        node.node_id,
+        container_id,
+        graph,
+        parent_x,
+        parent_y,
+        child_hx,
+        child_hy,
+    )
 
-    x_env = AxisEnvelope(-dx, dx, "x")
-    y_env = AxisEnvelope(-dy, dy, "y")
+    x_env = AxisEnvelope(x_lo, x_hi, "x")
+    y_env = AxisEnvelope(y_lo, y_hi, "y")
 
     try:
         x_env.validate()
@@ -232,4 +252,64 @@ def _plan_contained_position(
         y_envelope=y_env,
         support_name=container_id,
         use_relative_positioning=True,
+    )
+
+
+def container_interior_xy(container_node: object) -> tuple[float, float] | None:
+    """Return usable interior xy dimensions for a known container node."""
+    container_class = getattr(container_node, "object_class", "") or ""
+    if isinstance(container_node, FixtureNode):
+        return _CONTAINER_FIXTURE_INTERIOR.get(
+            container_class, _CONTAINER_FIXTURE_INTERIOR_DEFAULT
+        )
+    return _MOVABLE_CONTAINER_INTERIOR.get(container_class)
+
+
+def _contained_child_bounds(
+    node_id: str,
+    container_id: str,
+    graph: SemanticSceneGraph,
+    parent_x: float,
+    parent_y: float,
+    child_hx: float,
+    child_hy: float,
+) -> tuple[float, float, float, float]:
+    """Return deterministic relative bounds for one contained child.
+
+    Multiple children in the same container are split into stable slots along
+    the container's longer axis so Scenic does not have to discover a
+    non-overlapping packing from identical broad ranges.
+    """
+    siblings = sorted(
+        e.src_id
+        for e in graph.edges
+        if e.label == "contained_in" and e.dst_id == container_id
+    )
+    if node_id not in siblings or len(siblings) <= 1:
+        return (
+            -(parent_x / 2.0 - child_hx),
+            parent_x / 2.0 - child_hx,
+            -(parent_y / 2.0 - child_hy),
+            parent_y / 2.0 - child_hy,
+        )
+
+    index = siblings.index(node_id)
+    count = len(siblings)
+    if parent_x >= parent_y:
+        slot = parent_x / count
+        center = -parent_x / 2.0 + slot * (index + 0.5)
+        return (
+            center - (slot / 2.0 - child_hx),
+            center + (slot / 2.0 - child_hx),
+            -(parent_y / 2.0 - child_hy),
+            parent_y / 2.0 - child_hy,
+        )
+
+    slot = parent_y / count
+    center = -parent_y / 2.0 + slot * (index + 0.5)
+    return (
+        -(parent_x / 2.0 - child_hx),
+        parent_x / 2.0 - child_hx,
+        center - (slot / 2.0 - child_hy),
+        center + (slot / 2.0 - child_hy),
     )
