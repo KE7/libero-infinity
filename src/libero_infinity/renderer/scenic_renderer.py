@@ -136,9 +136,7 @@ def _collect_support_relations(
     return relations
 
 
-def _is_declared_support_pair(
-    var_a: str, var_b: str, relations: list[_SupportRelation]
-) -> bool:
+def _is_declared_support_pair(var_a: str, var_b: str, relations: list[_SupportRelation]) -> bool:
     """Return True if ``{var_a, var_b}`` are a declared (child, support) pair.
 
     Order-insensitive: works for both the object-fixture clearance loop
@@ -395,8 +393,7 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     # Kahn's algorithm for topological sort
     _name_to_entry = {n.instance_name: (nid, n) for nid, n in raw_obj_nodes}
     _in_degree: dict[str, int] = {
-        name: (1 if dep is not None and dep in _name_to_entry else 0)
-        for name, dep in _dep.items()
+        name: (1 if dep is not None and dep in _name_to_entry else 0) for name, dep in _dep.items()
     }
     _children: dict[str, list[str]] = {name: [] for name in _dep}
     for name, dep in _dep.items():
@@ -492,9 +489,17 @@ def _render_robot(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         f"_robot_qpos_canonical = [{canonical_terms}]",
         f"_robot_radius = Range({rp.radius_lo:.4f}, {rp.radius_hi:.4f})",
     ]
+    # Sample direction components from a standard normal rather than a
+    # uniform-on-cube. Projecting cube-uniform draws onto the unit sphere
+    # is the canonical biased spherical sampler — corner directions are
+    # over-represented and axis-aligned directions under-represented, with
+    # the bias growing in higher dimensions. A 7-vector of i.i.d.
+    # Normal(0, 1) draws normalised by its L2 norm is the standard
+    # uniform-on-S^6 construction (Marsaglia / Müller). The radius envelope
+    # is unchanged.
     dir_terms: list[str] = []
     for idx in range(len(rp.canonical_qpos)):
-        lines.append(f"_robot_dir_{idx} = Range(-1.0, 1.0)")
+        lines.append(f"_robot_dir_{idx} = Normal(0.0, 1.0)")
         dir_terms.append(f"_robot_dir_{idx}")
     norm_expr = " + ".join(f"({_term} * {_term})" for _term in dir_terms)
     lines.append(f"_robot_dir_norm = (({norm_expr}) + 1e-12) ** 0.5")
@@ -818,9 +823,7 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         fvar = _to_var(fnode.instance_name)
         fdims = _fixture_dims(fnode.object_class)
         for var_name, dims, _name, sampled in obj_info:
-            if not _should_emit_fixture_clearance(
-                var_name, sampled, fvar, support_relations
-            ):
+            if not _should_emit_fixture_clearance(var_name, sampled, fvar, support_relations):
                 continue
             clearance = _footprint_clearance_xy(fdims, dims)
             lines.append(f"require (distance from {var_name} to {fvar}) > {clearance:.4f}")
@@ -840,18 +843,24 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
     obj_vars = [var for var, _, _n, _s in obj_info]
     if plan.distractor_budget > 0 and "distractor" in plan.active_axes:
         distractor_dims = (0.08, 0.08, 0.08)
+        # Diagonal-radius clearance between two AABBs of equal half-extent h
+        # is 2 * sqrt(2) * h ≈ 2.828 h. For h = 0.04 m this is ≈ 0.1131 m.
+        # The previous 0.06 threshold was the *axis-aligned* sum of half-
+        # widths only; two distractors aligned diagonally could satisfy
+        # `distance > 0.06` while their AABBs still overlapped on both axes.
+        _DISTRACTOR_PAIR_CLEARANCE = math.sqrt(distractor_dims[0] ** 2 + distractor_dims[1] ** 2)
         for i in range(plan.distractor_budget):
             d_var = f"distractor_{i}"
             for var in obj_vars:
                 lines.append(
-                    f"require (_n_distractors <= {i}) "
-                    f"or ((distance from {d_var} to {var}) > 0.13)"
+                    f"require (_n_distractors <= {i}) or ((distance from {d_var} to {var}) > 0.13)"
                 )
             for j in range(i + 1, plan.distractor_budget):
                 lines.append(
                     f"require (_n_distractors <= {i}) "
                     f"or (_n_distractors <= {j}) "
-                    f"or ((distance from {d_var} to distractor_{j}) > 0.06)"
+                    f"or ((distance from {d_var} to distractor_{j}) "
+                    f"> {_DISTRACTOR_PAIR_CLEARANCE:.4f})"
                 )
             for node_id, fnode in graph.nodes.items():
                 if not isinstance(fnode, FixtureNode):
@@ -864,9 +873,7 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
                 # so the helper trivially returns True today.  Routing
                 # through the helper keeps a future planner extension
                 # (e.g., distractors-on-fixtures) automatically correct.
-                if not _should_emit_fixture_clearance(
-                    d_var, True, fvar, support_relations
-                ):
+                if not _should_emit_fixture_clearance(d_var, True, fvar, support_relations):
                     continue
                 fdims = _fixture_dims(fnode.object_class)
                 clearance = _footprint_clearance_xy(fdims, distractor_dims)

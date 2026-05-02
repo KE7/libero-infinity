@@ -155,7 +155,12 @@ def plan_object(
                         f"{contained_edges[0].dst_id}",
                     )
 
-        # Stacking dimensional check: variant footprint must fit on support
+        # Stacking dimensional check: variant footprint must fit on support.
+        # The previous 20% over-footprint tolerance silently allowed stacks
+        # whose centre of mass projected outside the support surface (e.g. a
+        # plate that overhangs by 10% on each side). Tightened to a small
+        # 5% tolerance — enough to absorb measurement noise on hand-edited
+        # bounding-box JSON entries without admitting visibly unstable stacks.
         stacked_edges = [e for e in graph.edges_from(node_id) if e.label == "stacked_on"]
         if stacked_edges:
             support_node = graph.get_node(stacked_edges[0].dst_id)
@@ -164,8 +169,7 @@ def plan_object(
                 filtered = []
                 for v in variants:
                     vw, vl, _ = get_dimensions(v)
-                    # Allow 20% tolerance beyond support surface
-                    if vw <= sw * 1.2 and vl <= sl * 1.2:
+                    if vw <= sw * 1.05 and vl <= sl * 1.05:
                         filtered.append(v)
                 if filtered:
                     variants = filtered
@@ -201,18 +205,37 @@ def plan_articulation(
 ) -> dict[str, ArticulationPlan]:
     """Plan initial articulation states for articulatable fixtures.
 
-    Always runs for articulatable fixtures regardless of request_axes, to
-    ensure goal-reachability is never violated.
+    Two emission paths:
+
+    1. **Goal-reachability override (always active).** When the BDDL goal
+       requires the robot to place an object *inside* an articulated fixture
+       (``In <obj> <fixture_region>`` with ``contained=True``), the fixture
+       must be Open at init regardless of which perturbation axes the user
+       requested — otherwise the goal is geometrically unreachable.
+    2. **Articulation axis (gated).** When ``"articulation"`` is in
+       ``request_axes`` the planner additionally perturbs articulatable
+       fixtures whose canonical init state is *not* dictated by goal
+       reachability (e.g. opening the microwave for a "put-on-table" task).
+
+    The previous implementation always emitted an "Open" plan for every
+    microwave/cabinet — silently turning the canonical (no-perturbation)
+    baseline into an *already-perturbed* environment for any task with one
+    of those fixtures. That broke benchmark comparability: any reported
+    "no-perturbation" success rate was actually measured on a perturbed
+    init state. Gating non-mandatory plans on the axis request restores
+    parity between the BDDL canonical state and the planner's "no axes"
+    baseline.
 
     Args:
         graph: The semantic scene graph for the task.
-        request_axes: Set of active perturbation axis names (informational only).
+        request_axes: Set of active perturbation axis names.
         diagnostics: Diagnostics collector.
 
     Returns:
         Dict mapping fixture instance_name -> ArticulationPlan.
     """
     result: dict[str, ArticulationPlan] = {}
+    axis_requested = "articulation" in request_axes
 
     for node_id, node in graph.nodes.items():
         if not isinstance(node, FixtureNode):
@@ -226,14 +249,48 @@ def plan_articulation(
         if not ranges:
             continue
 
-        # Check if any object must end up inside this fixture (In goal)
+        # Check if any object must end up *inside* this fixture (In goal).
+        # We can't rely on ``ObjectNode.contained`` here because that flag
+        # captures *initial* containment from the BDDL ``:init`` block, not
+        # *goal* containment from the ``:goal`` block. We instead parse the
+        # goal text directly for ``(In <obj> <region>)`` predicates whose
+        # region is anchored to this fixture (either by name match or by
+        # the region node's ``target`` attribute).
         need_open_at_init = False
-        for edge in graph.edges_to(node_id):
-            if edge.label == "goal_target":
-                src_node = graph.get_node(edge.src_id)
-                if isinstance(src_node, ObjectNode) and src_node.contained:
-                    need_open_at_init = True
-                    break
+        fixture_region_names: set[str] = {
+            region.instance_name
+            for region in graph.nodes.values()
+            if getattr(region, "target", None) == node.instance_name
+        }
+        for edge in graph.edges:
+            if edge.label != "goal_target":
+                continue
+            # Match either a region whose target is this fixture, or a
+            # region name that contains the fixture's instance name as a
+            # substring (covers BDDL region patterns like
+            # ``<fixture>_<sub>_region`` even when the RegionNode wasn't
+            # registered with a matching target).
+            in_fixture_region = (
+                edge.dst_id in fixture_region_names or node.instance_name in edge.dst_id
+            )
+            if not in_fixture_region:
+                continue
+            # The graph_builder doesn't preserve the predicate kind
+            # (On/In) on the edge — treat any goal_target into a fixture-
+            # anchored region as a containment requirement. This is
+            # conservative: if the BDDL says (On X <fixture_region>) we'd
+            # also flag Open. That matches the original behaviour for the
+            # axis-requested case and the previous always-Open logic; the
+            # alternative (false negative) silently breaks goal
+            # reachability for In-style goals which is far worse.
+            need_open_at_init = True
+            break
+
+        # If the axis isn't requested AND there's no goal-reachability
+        # requirement, leave the fixture alone — its BDDL canonical init
+        # state is what the simulator should load.
+        if not axis_requested and not need_open_at_init:
+            continue
 
         # Determine initial state kind and range
         family = art_model.get_family(fixture_class)
@@ -247,17 +304,28 @@ def plan_articulation(
                 state_kind = "Open"
                 reason = "goal requires interior access — init must be Open"
             else:
-                # Default: start Open (robot can work with fixture)
+                # axis_requested implied here (we returned earlier otherwise).
                 state_kind = "Open"
-                reason = "default articulation perturbation — Open init"
+                reason = "articulation axis requested — Open init"
         elif family_name == "stove":
-            # Stove starts off by default; goal is typically to turn it on
+            # Stove starts off by default; goal is typically to turn it on.
             state_kind = "Turnoff"
             reason = "stove default init — Turnoff"
+            # Bug 17 fix: surface the silent fallback as a diagnostic.
+            diagnostics.narrow_axis(
+                "articulation",
+                f"{node_id}: stove fixture defaulted to 'Turnoff' init state",
+            )
         else:
-            # Unknown family: use first available state
+            # Unknown family: use first available state.
             state_kind = next(iter(ranges))
             reason = f"unknown family '{family_name}' — using first state"
+            # Bug 17 fix: surface the silent fallback as a diagnostic.
+            diagnostics.narrow_axis(
+                "articulation",
+                f"{node_id}: unknown family '{family_name}' — defaulting to "
+                f"first state '{state_kind}'",
+            )
 
         state_range = ranges.get(state_kind)
         if state_range is None:

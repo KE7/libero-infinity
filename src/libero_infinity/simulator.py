@@ -57,6 +57,7 @@ from scenic.core.vectors import Vector
 from scipy.spatial.transform import Rotation as _Rotation
 
 from libero_infinity.asset_registry import get_dimensions
+from libero_infinity.planner.axes import LIBERO_BACKGROUND_TEXTURES
 from libero_infinity.validation_errors import (  # noqa: F401 — re-exported for callers
     MAX_VISIBILITY_RETRIES,
     RECOVERY_STRATEGY,
@@ -599,6 +600,14 @@ class LIBEROSimulation(Simulation):
         self._done: bool = False
         self._max_steps = int(kwargs.get("maxSteps") or 500)
 
+        # Snapshot of model arrays taken at env-creation time so the
+        # ``_apply_*_perturbation`` passes can restore the canonical baseline
+        # before each application. This prevents the cumulative-mutation bug
+        # where additive writes (cam_pos += dx, light_diffuse *=
+        # intensity, mat_texid = tex_id) drift the model further from baseline
+        # on every reuse of the same env.
+        self._model_baseline: dict | None = None
+
     # ------------------------------------------------------------------
     # setup — called once before stepping begins
     # ------------------------------------------------------------------
@@ -695,6 +704,12 @@ class LIBEROSimulation(Simulation):
         log.debug("LIBEROSimulation.setup: creating env from %s", effective_bddl)
         self.libero_env = OffScreenRenderEnv(**env_cfg)
         self._last_obs = self.libero_env.reset()
+
+        # Snapshot canonical model arrays before any perturbation runs so the
+        # apply pass below — and any future re-application — always starts
+        # from the XML-loaded baseline rather than a previously-perturbed
+        # state. See ``_capture_model_baseline`` docstring.
+        self._capture_model_baseline()
 
         # ── capture LIBERO's default pose for each object / fixture ────
         # After env.reset(), LIBERO places objects at correct z heights
@@ -804,14 +819,16 @@ class LIBEROSimulation(Simulation):
                 table_spawned_names.add(libero_name)
             self._inject_object_pose(libero_name, pos, obj)
             injected_targets[libero_name] = pos.copy()
-            object_dimensions[libero_name] = get_dimensions(
-                getattr(obj, "asset_class", "_default")
-            )
+            object_dimensions[libero_name] = get_dimensions(getattr(obj, "asset_class", "_default"))
             n_injected += 1
 
         self._apply_articulation_perturbation()
 
         # ── apply environment perturbations from Scenic params ──────────
+        # Restore the canonical XML-loaded model state before each apply pass
+        # so additive (`+=`) and multiplicative (`*=`) writes inside the
+        # _apply_* helpers never accumulate across reuse of the env.
+        self._restore_model_baseline()
         self._apply_camera_perturbation()
         self._apply_lighting_perturbation()
         self._apply_texture_perturbation()
@@ -1177,9 +1194,7 @@ class LIBEROSimulation(Simulation):
             for body_name in (child_name, child_name + "_main"):
                 try:
                     body_id = sim.model.body_name2id(body_name)
-                    sim.model.body_pos[body_id][2] = (
-                        float(sim.model.body_pos[body_id][2]) + dz
-                    )
+                    sim.model.body_pos[body_id][2] = float(sim.model.body_pos[body_id][2]) + dz
                     log.debug(
                         "Lifted supported child body %s by %.4f m above %s",
                         body_name,
@@ -1362,6 +1377,66 @@ class LIBEROSimulation(Simulation):
                 "table_texture",
             )
         )
+
+    # ------------------------------------------------------------------
+    # Model state snapshot / restore (Bug 1 fix)
+    # ------------------------------------------------------------------
+
+    def _capture_model_baseline(self) -> None:
+        """Snapshot the MuJoCo model arrays mutated by ``_apply_*_perturbation``.
+
+        Called once per env, immediately after ``OffScreenRenderEnv`` is
+        constructed. Stores deep copies of the canonical (XML-loaded) values so
+        ``_restore_model_baseline`` can return the model to that baseline before
+        each apply pass. This makes the perturbation pipeline idempotent under
+        repeated application — without it, additive writes to cam_pos /
+        light_pos and multiplicative writes to light_diffuse / light_specular
+        accumulate every time the apply functions run, silently mutating the
+        realised perturbation envelope.
+        """
+        if self.libero_env is None:
+            return
+        sim = self.libero_env.env.sim
+        m = sim.model
+        try:
+            self._model_baseline = {
+                "cam_pos": np.array(m.cam_pos, dtype=float, copy=True),
+                "cam_quat": np.array(m.cam_quat, dtype=float, copy=True),
+                "light_pos": np.array(m.light_pos, dtype=float, copy=True),
+                "light_diffuse": np.array(m.light_diffuse, dtype=float, copy=True),
+                "light_specular": np.array(m.light_specular, dtype=float, copy=True),
+                "light_ambient": np.array(m.light_ambient, dtype=float, copy=True),
+                "mat_texid": np.array(m.mat_texid, dtype=int, copy=True),
+                "headlight_ambient": np.array(m.vis.headlight.ambient, dtype=float, copy=True),
+            }
+        except Exception as exc:
+            log.debug("Model baseline capture failed: %s", exc)
+            self._model_baseline = None
+
+    def _restore_model_baseline(self) -> None:
+        """Restore the snapshotted MuJoCo model arrays.
+
+        Called before each apply pass so that perturbations always start from
+        the canonical XML-loaded state, never from a previously-perturbed
+        state. No-op if no snapshot has been captured (e.g. baseline capture
+        failed).
+        """
+        if self.libero_env is None or self._model_baseline is None:
+            return
+        sim = self.libero_env.env.sim
+        m = sim.model
+        baseline = self._model_baseline
+        try:
+            m.cam_pos[:] = baseline["cam_pos"]
+            m.cam_quat[:] = baseline["cam_quat"]
+            m.light_pos[:] = baseline["light_pos"]
+            m.light_diffuse[:] = baseline["light_diffuse"]
+            m.light_specular[:] = baseline["light_specular"]
+            m.light_ambient[:] = baseline["light_ambient"]
+            m.mat_texid[:] = baseline["mat_texid"]
+            m.vis.headlight.ambient[:] = baseline["headlight_ambient"]
+        except Exception as exc:
+            log.debug("Model baseline restore failed: %s", exc)
 
     def _has_robot_perturbation(self) -> bool:
         """True if Scenic sampled a robot init-qpos vector for this scene."""
@@ -1738,8 +1813,18 @@ class LIBEROSimulation(Simulation):
                 sim.model.light_diffuse[i] *= float(intensity)
                 sim.model.light_specular[i] *= float(intensity)
 
+            # Apply ambient to each declared light, not just the headlight.
+            # MuJoCo's headlight is only active when the model declares no
+            # other lights — most LIBERO scenes do declare lights, so writing
+            # only to vis.headlight.ambient was a no-op for the rendered
+            # frame. Per-light ``light_ambient[i]`` is the channel that
+            # actually contributes to scene shading.
+            if ambient is not None:
+                sim.model.light_ambient[i][:] = float(ambient)
+
         if ambient is not None:
-            # Set global ambient light (headlight ambient in MuJoCo model)
+            # Also set the global headlight ambient as a belt-and-braces
+            # fallback for any scenes that *don't* declare lights.
             sim.model.vis.headlight.ambient[:] = float(ambient)
             log.debug("  ambient level: %.2f", ambient)
 
@@ -1750,6 +1835,27 @@ class LIBEROSimulation(Simulation):
             ldy,
             ldz,
         )
+
+    def _curated_loaded_tex_ids(self, sim) -> list[int]:
+        """Return texture IDs whose names appear in the curated background pool.
+
+        This is the intersection of ``LIBERO_BACKGROUND_TEXTURES`` (the
+        curated wall/floor/table-looking texture names the planner draws over)
+        with the textures actually loaded into the current MuJoCo model. It is
+        used by the ``"random"`` resolution path so that a "random table /
+        background texture" cannot pick a robot, gripper, or character mesh
+        texture that just happens to be loaded.
+        """
+        n_tex = int(getattr(sim.model, "ntex", 0))
+        if n_tex <= 0:
+            return []
+        curated: list[int] = []
+        for name in LIBERO_BACKGROUND_TEXTURES:
+            try:
+                curated.append(int(sim.model.texture_name2id(name)))
+            except Exception:
+                continue
+        return curated
 
     def _apply_texture_perturbation(self) -> None:
         """Perturb table texture from Scenic params.
@@ -1782,12 +1888,22 @@ class LIBEROSimulation(Simulation):
             return
 
         if texture_name == "random":
-            # Pick a random texture from available textures
-            n_tex = sim.model.ntex
-            if n_tex > 0:
-                tex_id = np.random.randint(0, n_tex)
+            # Pick a random texture from the *curated* loaded subset so the
+            # table cannot accidentally adopt a robot/gripper/character mesh
+            # texture that happens to be loaded in the model.
+            curated = self._curated_loaded_tex_ids(sim)
+            if curated:
+                tex_id = int(curated[np.random.randint(0, len(curated))])
             else:
-                return
+                # Fall back to any loaded texture only if no curated entries
+                # are present in the model (e.g. minimal arenas).
+                n_tex = sim.model.ntex
+                if n_tex <= 0:
+                    return
+                tex_id = int(np.random.randint(0, n_tex))
+                log.debug(
+                    "  texture: no curated textures loaded; falling back to any-texture random"
+                )
         else:
             # Look up by name
             try:
@@ -1834,22 +1950,36 @@ class LIBEROSimulation(Simulation):
         def _resolve_tex_id(texture_name: str) -> int | None:
             """Resolve a texture name to a loaded MuJoCo texture ID.
 
+            "random" and named-but-not-loaded fallbacks both go through the
+            curated wall/floor texture subset rather than ``randint(0, ntex)``,
+            which would otherwise pick robot/gripper/object mesh textures.
+
             Returns:
                 Integer texture ID, or None if the model has no textures.
             """
             n_tex = sim.model.ntex
             if n_tex <= 0:
                 return None
+            curated = self._curated_loaded_tex_ids(sim)
             if texture_name == "random":
+                if curated:
+                    return int(curated[np.random.randint(0, len(curated))])
+                log.debug(
+                    "  background: no curated textures loaded; falling back to any-texture random"
+                )
                 return int(np.random.randint(0, n_tex))
             try:
                 return int(sim.model.texture_name2id(texture_name))
             except Exception:
-                # Named texture not loaded in this model — fall back to random
+                # Named texture not loaded in this model — fall back to a
+                # random *curated* texture so the realised distribution stays
+                # close to the marketed pool.
                 log.debug(
-                    "  background: texture '%s' not in model; using random",
+                    "  background: texture '%s' not in model; using curated random",
                     texture_name,
                 )
+                if curated:
+                    return int(curated[np.random.randint(0, len(curated))])
                 return int(np.random.randint(0, n_tex))
 
         def _apply_mat_texture(mat_name: str, texture_name: str) -> None:

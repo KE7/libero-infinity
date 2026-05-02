@@ -117,7 +117,9 @@ def _plan_object_position(
     is_stacked = edge.label == "stacked_on"
     support_node = graph.get_node(edge.dst_id)
 
-    def _support_half_extents(parent_node: FixtureNode | MovableSupportNode | ObjectNode | None) -> tuple[float, float]:
+    def _support_half_extents(
+        parent_node: FixtureNode | MovableSupportNode | ObjectNode | None,
+    ) -> tuple[float, float]:
         """Return conservative half-width/half-length extents for a support.
 
         For non-workspace supports, we derive this from registry dimensions so
@@ -148,7 +150,17 @@ def _plan_object_position(
         rel_hi: float,
         axis: str,
     ) -> tuple[float, float]:
-        """Clip relative offsets to a bounded table-safe absolute range."""
+        """Clip relative offsets to the table-safe absolute interval.
+
+        Implementation note: this is an *intersection* clip, not a translation.
+        The previous implementation re-centred any envelope that touched a
+        table boundary toward the table interior, which silently biased the
+        realised position distribution toward the workspace centre and
+        undid anti-trivialisation whenever the canonical anchor was near a
+        table edge. Now we instead shrink the envelope to the intersection
+        of the requested range with the table-safe interval, preserving
+        coverage at edges (at the cost of a smaller envelope there).
+        """
         parent_x = float(getattr(parent_node, "init_x", 0.0) or 0.0)
         parent_y = float(getattr(parent_node, "init_y", 0.0) or 0.0)
 
@@ -159,27 +171,26 @@ def _plan_object_position(
         if axis == "x":
             target_min = _TABLE_X_MIN + _TABLE_X_MARGIN
             target_max = _TABLE_X_MAX - _TABLE_X_MARGIN
-            centre = parent_x + (rel_lo + rel_hi) / 2.0
+            anchor = parent_x
         else:
             target_min = _TABLE_Y_MIN + _TABLE_Y_MARGIN
             target_max = _TABLE_Y_MAX - _TABLE_Y_MARGIN
-            centre = parent_y + (rel_lo + rel_hi) / 2.0
+            anchor = parent_y
 
-        half_w = width / 2.0
-        clipped_centre = min(max(centre, target_min + half_w), target_max - half_w)
-        abs_lo = clipped_centre - half_w
-        abs_hi = clipped_centre + half_w
+        # Convert to absolute coords, intersect, convert back.
+        abs_lo = max(anchor + rel_lo, target_min)
+        abs_hi = min(anchor + rel_hi, target_max)
 
-        if abs_lo < target_min:
-            abs_lo = target_min
-            abs_hi = abs_lo + width
-        if abs_hi > target_max:
-            abs_hi = target_max
-            abs_lo = abs_hi - width
+        # Degenerate intersection — fall back to a degenerate-but-valid
+        # envelope clamped to the closer side, preserving the anchor's
+        # original directionality without flipping the interval.
+        if abs_lo > abs_hi:
+            if anchor < target_min:
+                abs_lo = abs_hi = target_min
+            else:
+                abs_lo = abs_hi = target_max
 
-        if axis == "x":
-            return abs_lo - parent_x, abs_hi - parent_x
-        return abs_lo - parent_y, abs_hi - parent_y
+        return abs_lo - anchor, abs_hi - anchor
 
     def _clamped_relative_envelope(
         parent_node: FixtureNode | MovableSupportNode | ObjectNode,
@@ -192,8 +203,7 @@ def _plan_object_position(
             (isinstance(parent_node, RegionNode) and parent_node.x_min is not None)
             or parent_class in OBJECT_DIMENSIONS
             or (
-                isinstance(parent_node, FixtureNode)
-                and parent_class in _CONTAINER_FIXTURE_INTERIOR
+                isinstance(parent_node, FixtureNode) and parent_class in _CONTAINER_FIXTURE_INTERIOR
             )
         )
         child_class = child_node.object_class or ""
