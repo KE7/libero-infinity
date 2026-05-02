@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1620" font-family="Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#37474F"/>
+    </marker>
+    <marker id="arrow-dashed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9E9E9E"/>
+    </marker>
+    <style>
+      .stage      { stroke-width: 2; fill-opacity: 0.55; }
+      .stage-lbl  { font-size: 14px; font-weight: 700; }
+      .box        { fill: #FFFFFF; stroke: #37474F; stroke-width: 1.5; rx: 6; }
+      .box-title  { font-weight: 600; font-size: 13px; }
+      .box-sub    { font-size: 11px; fill: #455A64; }
+      .edge       { stroke: #37474F; stroke-width: 1.6; fill: none; }
+      .edge-d     { stroke: #9E9E9E; stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+      .edge-lbl   { fill: #455A64; font-size: 11px; }
+      .title      { font-size: 22px; font-weight: 700; }
+      .subtitle   { font-size: 12px; fill: #607D8B; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="600" y="34" text-anchor="middle" class="title">LIBERO-Infinity pipeline</text>
+  <text x="600" y="56" text-anchor="middle" class="subtitle">BDDL → planner → renderer → Scenic → simulator → policy. Module names match `src/libero_infinity/`.</text>
+
+  <!-- ───────── Stage 1 — Input ───────── -->
+  <rect x="40" y="80" width="1120" height="100" rx="10" class="stage" fill="#E3F2FD" stroke="#1565C0"/>
+  <text x="60" y="102" class="stage-lbl" fill="#0D47A1">1. Input</text>
+  <rect x="80" y="116" width="240" height="50" class="box"/>
+  <text x="200" y="138" text-anchor="middle" class="box-title">BDDL task file</text>
+  <text x="200" y="154" text-anchor="middle" class="box-sub">.bddl text — objects, regions, goal</text>
+  <rect x="380" y="116" width="500" height="50" class="box"/>
+  <text x="630" y="135" text-anchor="middle" class="box-title">--perturbation axis subset</text>
+  <text x="630" y="151" text-anchor="middle" class="box-sub">position · object · camera · lighting · texture · distractor · articulation · robot · background · sensor_noise</text>
+
+  <!-- ───────── Stage 2 — Offline generators ───────── -->
+  <rect x="40" y="200" width="1120" height="160" rx="10" class="stage" fill="#FFF8E1" stroke="#F57F17"/>
+  <text x="60" y="222" class="stage-lbl" fill="#E65100">2. Offline BDDL-rewrite generators (no Scenic — change task / arena / language ground truth)</text>
+  <rect x="60" y="240" width="350" height="100" class="box"/>
+  <text x="235" y="260" text-anchor="middle" class="box-title">bddl_preprocessor.</text>
+  <text x="235" y="277" text-anchor="middle" class="box-title">generate_task_perturbed_bddls</text>
+  <text x="235" y="297" text-anchor="middle" class="box-sub">destination swaps · predicate negations</text>
+  <text x="235" y="312" text-anchor="middle" class="box-sub">compositional do-also · color swaps</text>
+  <text x="235" y="327" text-anchor="middle" class="box-sub">e.g. "Turn on stove" → "Turn off stove"</text>
+  <rect x="430" y="240" width="340" height="100" class="box"/>
+  <text x="600" y="260" text-anchor="middle" class="box-title">bddl_preprocessor.</text>
+  <text x="600" y="277" text-anchor="middle" class="box-title">swap_arena</text>
+  <text x="600" y="297" text-anchor="middle" class="box-sub">workspace fixture rewrite +</text>
+  <text x="600" y="312" text-anchor="middle" class="box-sub">region-target re-pointing +</text>
+  <text x="600" y="327" text-anchor="middle" class="box-sub">geometry compatibility check</text>
+  <rect x="790" y="240" width="350" height="100" class="box"/>
+  <text x="965" y="260" text-anchor="middle" class="box-title">language_paraphrase.</text>
+  <text x="965" y="277" text-anchor="middle" class="box-title">generate_paraphrased_bddls</text>
+  <text x="965" y="297" text-anchor="middle" class="box-sub">litellm-driven LLM paraphrase of</text>
+  <text x="965" y="312" text-anchor="middle" class="box-sub">(:language ...) string;</text>
+  <text x="965" y="327" text-anchor="middle" class="box-sub">optional `paraphrase` extra</text>
+
+  <!-- ───────── Stage 3 — Parse ───────── -->
+  <rect x="40" y="380" width="1120" height="100" rx="10" class="stage" fill="#E8EAF6" stroke="#283593"/>
+  <text x="60" y="402" class="stage-lbl" fill="#1A237E">3. Parsing</text>
+  <rect x="80" y="416" width="500" height="50" class="box"/>
+  <text x="330" y="436" text-anchor="middle" class="box-title">task_config.TaskConfig.from_bddl()</text>
+  <text x="330" y="452" text-anchor="middle" class="box-sub">objects · fixtures · regions · goal_text</text>
+  <rect x="640" y="416" width="240" height="50" class="box"/>
+  <text x="760" y="436" text-anchor="middle" class="box-title">task_reverser</text>
+  <text x="760" y="452" text-anchor="middle" class="box-sub">--reverse (optional)</text>
+
+  <!-- ───────── Stage 4 — Plan ───────── -->
+  <rect x="40" y="500" width="1120" height="190" rx="10" class="stage" fill="#EDE7F6" stroke="#5E35B1"/>
+  <text x="60" y="522" class="stage-lbl" fill="#311B92">4. Planner (per-axis, independent plans)</text>
+  <rect x="80" y="540" width="380" height="130" class="box"/>
+  <text x="270" y="560" text-anchor="middle" class="box-title">ir.graph_builder.</text>
+  <text x="270" y="577" text-anchor="middle" class="box-title">build_semantic_scene_graph</text>
+  <text x="270" y="600" text-anchor="middle" class="box-sub">Workspace · Fixture · Object · Region nodes</text>
+  <text x="270" y="615" text-anchor="middle" class="box-sub">supported_by · contained_in · stacked_on</text>
+  <text x="270" y="630" text-anchor="middle" class="box-sub">articulated_by · goal_target · visibility</text>
+  <text x="270" y="652" text-anchor="middle" class="box-sub">→ SemanticSceneGraph</text>
+  <rect x="490" y="540" width="630" height="130" class="box"/>
+  <text x="805" y="560" text-anchor="middle" class="box-title">planner.composition.plan_perturbations</text>
+  <text x="805" y="582" text-anchor="middle" class="box-sub">plan_position · plan_object · plan_camera · plan_lighting</text>
+  <text x="805" y="599" text-anchor="middle" class="box-sub">plan_texture · plan_distractor · plan_articulation</text>
+  <text x="805" y="616" text-anchor="middle" class="box-sub">plan_robot · plan_background · plan_sensor_noise</text>
+  <text x="805" y="640" text-anchor="middle" class="box-sub">single-pass cross-axis validator (support / containment</text>
+  <text x="805" y="655" text-anchor="middle" class="box-sub">/ articulation interference / camera visibility / envelope quality)</text>
+
+  <!-- ───────── Stage 5 — Render ───────── -->
+  <rect x="40" y="710" width="1120" height="140" rx="10" class="stage" fill="#F3E5F5" stroke="#7B1FA2"/>
+  <text x="60" y="732" class="stage-lbl" fill="#4A148C">5. Renderer</text>
+  <rect x="80" y="750" width="540" height="90" class="box"/>
+  <text x="350" y="772" text-anchor="middle" class="box-title">renderer.scenic_renderer.render_scenic</text>
+  <text x="350" y="794" text-anchor="middle" class="box-sub">emits one auto-generated .scenic program parameterised by the</text>
+  <text x="350" y="810" text-anchor="middle" class="box-sub">chosen axis subset (Range / Uniform / DiscreteRange + require constraints)</text>
+  <text x="350" y="828" text-anchor="middle" class="box-sub">replaces the prior handwritten scenic/*_perturbation.scenic files</text>
+  <rect x="650" y="750" width="470" height="90" class="box"/>
+  <text x="885" y="772" text-anchor="middle" class="box-title">scenic/libero_model.scenic</text>
+  <text x="885" y="794" text-anchor="middle" class="box-sub">Layer 2 — shared world vocabulary</text>
+  <text x="885" y="810" text-anchor="middle" class="box-sub">LIBEROObject · LIBEROFixture</text>
+  <text x="885" y="826" text-anchor="middle" class="box-sub">asset registry (ASSET_VARIANTS, OBJECT_DIMENSIONS)</text>
+
+  <!-- ───────── Stage 6 — Scenic 3 ───────── -->
+  <rect x="40" y="870" width="1120" height="80" rx="10" class="stage" fill="#FCE4EC" stroke="#AD1457"/>
+  <text x="60" y="892" class="stage-lbl" fill="#880E4F">6. Scenic 3 solver</text>
+  <rect x="80" y="906" width="1040" height="36" class="box"/>
+  <text x="600" y="930" text-anchor="middle" class="box-title">Scenic 3 rejection sampler — satisfies all `require` constraints; one fresh i.i.d. scene per scenario.generate() call</text>
+
+  <!-- ───────── Stage 7 — Simulator bridge ───────── -->
+  <rect x="40" y="970" width="1120" height="200" rx="10" class="stage" fill="#E8F5E9" stroke="#2E7D32"/>
+  <text x="60" y="992" class="stage-lbl" fill="#1B5E20">7. Simulator bridge — Layer 1</text>
+  <rect x="80" y="1010" width="700" height="150" class="box"/>
+  <text x="430" y="1030" text-anchor="middle" class="box-title">simulator.LIBEROSimulation</text>
+  <text x="430" y="1052" text-anchor="middle" class="box-sub">setup(): inject Scenic-sampled object poses · capture model baseline</text>
+  <text x="430" y="1067" text-anchor="middle" class="box-sub">apply camera / lighting / texture / background perturbations from baseline</text>
+  <text x="430" y="1083" text-anchor="middle" class="box-sub">apply articulation init state (goal-reachability override)</text>
+  <text x="430" y="1098" text-anchor="middle" class="box-sub">apply robot init qpos perturbation</text>
+  <text x="430" y="1118" text-anchor="middle" class="box-sub">step() / step_with_action():</text>
+  <text x="430" y="1133" text-anchor="middle" class="box-sub">apply _apply_sensor_noise to obs[*_image] keys</text>
+  <rect x="810" y="1010" width="310" height="150" class="box"/>
+  <text x="965" y="1030" text-anchor="middle" class="box-title">bddl_preprocessor.</text>
+  <text x="965" y="1047" text-anchor="middle" class="box-title">bddl_for_scene</text>
+  <text x="965" y="1070" text-anchor="middle" class="box-sub">substitute_multi (chained-collision-safe)</text>
+  <text x="965" y="1086" text-anchor="middle" class="box-sub">substitute_per_instance (same-class</text>
+  <text x="965" y="1102" text-anchor="middle" class="box-sub">multi-instance differing replacements)</text>
+  <text x="965" y="1124" text-anchor="middle" class="box-sub">add_distractor_objects</text>
+  <text x="965" y="1140" text-anchor="middle" class="box-sub">→ patched BDDL temp file</text>
+
+  <!-- ───────── Stage 8 — Engine ───────── -->
+  <rect x="40" y="1190" width="1120" height="130" rx="10" class="stage" fill="#FFF3E0" stroke="#E65100"/>
+  <text x="60" y="1212" class="stage-lbl" fill="#BF360C">8. LIBERO + MuJoCo</text>
+  <rect x="80" y="1230" width="430" height="80" class="box"/>
+  <text x="295" y="1252" text-anchor="middle" class="box-title">OffScreenRenderEnv</text>
+  <text x="295" y="1273" text-anchor="middle" class="box-sub">physics + rendering</text>
+  <text x="295" y="1289" text-anchor="middle" class="box-sub">robosuite + LIBERO arena</text>
+  <rect x="540" y="1230" width="580" height="80" class="box"/>
+  <text x="830" y="1252" text-anchor="middle" class="box-title">Observations</text>
+  <text x="830" y="1273" text-anchor="middle" class="box-sub">agentview_image · eye_in_hand_image</text>
+  <text x="830" y="1289" text-anchor="middle" class="box-sub">proprio (joints, eef pose) · object states</text>
+
+  <!-- ───────── Stage 9 — Policy / Eval ───────── -->
+  <rect x="40" y="1340" width="1120" height="130" rx="10" class="stage" fill="#FFEBEE" stroke="#C62828"/>
+  <text x="60" y="1362" class="stage-lbl" fill="#B71C1C">9. Policy evaluation</text>
+  <rect x="80" y="1380" width="430" height="80" class="box"/>
+  <text x="295" y="1402" text-anchor="middle" class="box-title">VLA policy</text>
+  <text x="295" y="1422" text-anchor="middle" class="box-sub">obs dict → action ∈ R⁷ (OSC_POSE)</text>
+  <text x="295" y="1438" text-anchor="middle" class="box-sub">π(obs, language) → action</text>
+  <rect x="540" y="1380" width="580" height="80" class="box"/>
+  <text x="830" y="1402" text-anchor="middle" class="box-title">eval.py / gym_env.py</text>
+  <text x="830" y="1422" text-anchor="middle" class="box-sub">aggregate success rate ± 95% Wilson CI</text>
+  <text x="830" y="1438" text-anchor="middle" class="box-sub">i.i.d. mode · adversarial (VerifAI CE) mode · gym.Env wrapper</text>
+
+  <!-- Footer note -->
+  <text x="600" y="1500" text-anchor="middle" class="subtitle">
+    Solid arrows: per-scene data flow.  Dashed arrows: offline pre-generation feeds variant BDDLs into the parsing stage.
+  </text>
+
+  <!-- ───────── Edges (top-to-bottom flow) ───────── -->
+  <!-- BDDL → offline generators (3 fans) -->
+  <path d="M 200 166 Q 200 200 235 240" class="edge" marker-end="url(#arrow)"/>
+  <path d="M 200 166 Q 200 200 600 240" class="edge" marker-end="url(#arrow)"/>
+  <path d="M 200 166 Q 200 200 965 240" class="edge" marker-end="url(#arrow)"/>
+  <!-- Generators → Parse (dashed: alternate-BDDL feed) -->
+  <path d="M 235 340 Q 235 380 330 416" class="edge-d" marker-end="url(#arrow-dashed)"/>
+  <path d="M 600 340 L 600 380 L 380 416" class="edge-d" marker-end="url(#arrow-dashed)"/>
+  <path d="M 965 340 Q 965 380 470 416" class="edge-d" marker-end="url(#arrow-dashed)"/>
+  <text x="190" y="384" class="edge-lbl">alternate BDDLs (offline pre-gen, selected per reset)</text>
+  <!-- BDDL (input) → Parse (direct) -->
+  <path d="M 200 166 L 200 380 L 250 416" class="edge" marker-end="url(#arrow)"/>
+  <!-- perturbation flag → Plan -->
+  <path d="M 880 166 Q 880 350 805 540" class="edge" marker-end="url(#arrow)"/>
+  <!-- Parse → Plan -->
+  <path d="M 330 466 L 330 540" class="edge" marker-end="url(#arrow)"/>
+  <path d="M 760 466 L 760 540" class="edge" marker-end="url(#arrow)"/>
+  <!-- Plan IR → AX (within stage) -->
+  <path d="M 460 605 L 490 605" class="edge" marker-end="url(#arrow)"/>
+  <!-- Plan → Render -->
+  <path d="M 350 670 L 350 750" class="edge" marker-end="url(#arrow)"/>
+  <path d="M 805 670 L 805 750" class="edge" marker-end="url(#arrow)"/>
+  <!-- libero_model → renderer (within stage) -->
+  <path d="M 650 795 L 620 795" class="edge" marker-end="url(#arrow)"/>
+  <!-- Render → Scenic solver -->
+  <path d="M 600 840 L 600 906" class="edge" marker-end="url(#arrow)"/>
+  <!-- Scenic solver → Simulator bridge -->
+  <path d="M 600 942 L 600 1010" class="edge" marker-end="url(#arrow)"/>
+  <text x="610" y="970" class="edge-lbl">scene.objects · scene.params</text>
+  <!-- Simulator → Engine -->
+  <path d="M 430 1160 L 430 1230" class="edge" marker-end="url(#arrow)"/>
+  <path d="M 965 1160 L 700 1230" class="edge" marker-end="url(#arrow)"/>
+  <text x="450" y="1188" class="edge-lbl">inject poses + perturbations</text>
+  <!-- Engine → Policy -->
+  <path d="M 830 1310 L 830 1380" class="edge" marker-end="url(#arrow)"/>
+  <text x="845" y="1340" class="edge-lbl">obs</text>
+  <!-- Policy → Engine (action loop) -->
+  <path d="M 295 1380 Q 50 1380 50 1270 L 80 1270" class="edge" marker-end="url(#arrow)"/>
+  <text x="60" y="1325" class="edge-lbl">action 7D</text>
+  <!-- Engine → eval results -->
+  <path d="M 510 1280 L 540 1395" class="edge" marker-end="url(#arrow)"/>
+  <text x="490" y="1340" class="edge-lbl">done · success</text>
+</svg>

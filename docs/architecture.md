@@ -5,7 +5,7 @@
 ## System Overview
 
 <p align="center">
-  <img src="../assets/architecture_pipeline.png" width="85%" alt="LIBERO-Infinity Architecture">
+  <img src="../assets/architecture_pipeline.svg" width="85%" alt="LIBERO-Infinity Architecture">
 </p>
 
 ### Detailed Flow

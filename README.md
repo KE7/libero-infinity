@@ -412,7 +412,7 @@ See [docs/evaluation_pipeline.md](docs/evaluation_pipeline.md) for the complete 
 ## Architecture
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/KE7/libero-infinity/main/assets/architecture_pipeline.png" width="85%" alt="LIBERO-Infinity Architecture">
+  <img src="https://raw.githubusercontent.com/KE7/libero-infinity/main/assets/architecture_pipeline.svg" width="85%" alt="LIBERO-Infinity Architecture">
 </p>
 
 ### Layered Scenic Design
