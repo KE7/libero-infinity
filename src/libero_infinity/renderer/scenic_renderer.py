@@ -286,6 +286,7 @@ def render_scenic(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     fragments.append(_render_texture(plan, graph))
     fragments.append(_render_background(plan, graph))
     fragments.append(_render_distractors(plan, graph))
+    fragments.append(_render_sensor_noise(plan, graph))
     fragments.append(_render_constraints(plan, graph))
     fragments.append(_render_visibility(plan, graph))
 
@@ -582,6 +583,28 @@ def _render_background(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str
         "# Background perturbation",
         f"param wall_texture = {wall_val}",
         f"param floor_texture = {floor_val}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _render_sensor_noise(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
+    """Emit ``param sensor_noise_kind`` and ``param sensor_noise_severity``.
+
+    Sensor noise is purely an observation-pipeline transform (applied by
+    ``simulator._apply_sensor_noise`` to the rendered RGB image at every
+    ``step()``); it has no scene-geometry effect, so the only renderer
+    output is the two parameters that the simulator consumes.
+    """
+    del graph
+    if plan.sensor_noise_plan is None or "sensor_noise" not in plan.active_axes:
+        return ""
+    sn = plan.sensor_noise_plan
+    kinds_str = ", ".join(f'"{k}"' for k in sn.kinds)
+    lines = [
+        "# Sensor / image-noise perturbation",
+        f"param sensor_noise_kind = Uniform({kinds_str})",
+        f"param sensor_noise_severity = DiscreteRange({sn.severity_lo}, {sn.severity_hi})",
         "",
     ]
     return "\n".join(lines)

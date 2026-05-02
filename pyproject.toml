@@ -59,6 +59,13 @@ Documentation = "https://github.com/KE7/libero-infinity/tree/main/docs"
 verifai = [
     "verifai>=2.0",
 ]
+# Optional LLM-driven language paraphrasing (libero-pro-style language OOD).
+# Pulls in litellm so we can target Anthropic / OpenAI / local models with one
+# call signature; users must still set the relevant API key
+# (ANTHROPIC_API_KEY, OPENAI_API_KEY, …) for the chosen backend.
+paraphrase = [
+    "litellm>=1.40",
+]
 dev = [
     "pytest>=7.0",
     "ruff>=0.4",

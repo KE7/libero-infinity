@@ -382,6 +382,105 @@ def _camera_transforms(
     return world_to_pixel, world_to_camera
 
 
+def _apply_image_corruption(image: np.ndarray, kind: str, severity: int) -> np.ndarray:
+    """Apply a sensor-noise corruption to a single RGB image.
+
+    Severity follows the *Common Image Corruptions* convention (1..5).
+    All transforms preserve dtype (uint8 in, uint8 out) and shape (H, W, 3).
+    Implementations are deliberately lightweight and dependency-free —
+    we use only numpy here to avoid pulling in scipy.ndimage / opencv at
+    the simulator-import level. The corruption family follows the
+    *Common Image Corruptions* taxonomy (Hendrycks & Dietterich, 2019)
+    so users can swap in the higher-fidelity ``imagecorruptions``
+    package later if needed.
+    """
+    if image.ndim != 3 or image.shape[-1] not in (3, 4) or image.dtype != np.uint8:
+        return image
+    img = image[..., :3].astype(np.float32)
+
+    if kind == "gaussian_noise":
+        sigma = [4.0, 8.0, 16.0, 24.0, 32.0][severity - 1]
+        rng = np.random.default_rng(severity)
+        noise = rng.normal(0.0, sigma, size=img.shape).astype(np.float32)
+        out = img + noise
+    elif kind == "shot_noise":
+        scale = [60.0, 25.0, 12.0, 5.0, 3.0][severity - 1]
+        rng = np.random.default_rng(severity + 1)
+        out = rng.poisson(np.clip(img, 0, 255) / 255.0 * scale) / scale * 255.0
+    elif kind == "impulse_noise":
+        prob = [0.01, 0.02, 0.04, 0.08, 0.15][severity - 1]
+        rng = np.random.default_rng(severity + 2)
+        mask = rng.random(img.shape[:2])
+        out = img.copy()
+        out[mask < prob / 2.0] = 0.0
+        out[mask > 1.0 - prob / 2.0] = 255.0
+    elif kind == "gaussian_blur":
+        sigma = [0.6, 1.0, 1.5, 2.5, 4.0][severity - 1]
+        out = _gaussian_blur(img, sigma)
+    elif kind == "motion_blur":
+        # Approximate motion blur as a horizontal moving-average box.
+        radius = [2, 3, 5, 8, 12][severity - 1]
+        out = _moving_average(img, radius=radius, axis=1)
+    elif kind == "defocus_blur":
+        sigma = [0.8, 1.2, 1.8, 2.6, 4.0][severity - 1]
+        out = _gaussian_blur(img, sigma)
+    elif kind == "jpeg_compression":
+        # Severity-driven coarse quantisation in YCbCr-ish space; cheap
+        # standin for a real JPEG round-trip without bringing in PIL.
+        steps = [4, 8, 16, 32, 48][severity - 1]
+        out = (np.round(img / steps) * steps).astype(np.float32)
+    elif kind == "brightness_jitter":
+        delta = [10, 25, 45, 70, 100][severity - 1]
+        rng = np.random.default_rng(severity + 3)
+        shift = rng.uniform(-delta, delta)
+        out = img + shift
+    elif kind == "contrast_jitter":
+        gain = [0.95, 0.9, 0.8, 0.65, 0.5][severity - 1]
+        rng = np.random.default_rng(severity + 4)
+        scale = rng.uniform(gain, 1.0 / gain)
+        mean = float(img.mean())
+        out = (img - mean) * scale + mean
+    elif kind == "saturation_jitter":
+        gain = [0.9, 0.75, 0.5, 0.25, 0.1][severity - 1]
+        gray = img.mean(axis=-1, keepdims=True)
+        out = gray + (img - gray) * gain
+    else:
+        return image  # unknown kind; pass-through
+    out = np.clip(out, 0.0, 255.0).astype(np.uint8)
+    if image.shape[-1] == 4:
+        out_rgba = image.copy()
+        out_rgba[..., :3] = out
+        return out_rgba
+    return out
+
+
+def _gaussian_blur(img: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian blur using a numpy 1-D convolution."""
+    radius = max(1, int(round(3.0 * sigma)))
+    x = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-(x**2) / (2.0 * max(sigma, 1e-6) ** 2))
+    kernel /= kernel.sum()
+    out = img.copy()
+    for axis in (0, 1):
+        out = np.apply_along_axis(
+            lambda v: np.convolve(v, kernel, mode="same"),
+            axis=axis,
+            arr=out,
+        )
+    return out
+
+
+def _moving_average(img: np.ndarray, radius: int, axis: int) -> np.ndarray:
+    """Approximate motion-blur kernel along a single axis."""
+    width = 2 * radius + 1
+    kernel = np.ones(width, dtype=np.float32) / float(width)
+    return np.apply_along_axis(
+        lambda v: np.convolve(v, kernel, mode="same"),
+        axis=axis,
+        arr=img,
+    )
+
+
 def _real_depth_map(sim, depth_map: np.ndarray) -> np.ndarray:
     """Convert MuJoCo's normalized depth image to metric depth."""
     assert np.all(depth_map >= 0.0) and np.all(depth_map <= 1.0)
@@ -933,6 +1032,7 @@ class LIBEROSimulation(Simulation):
             return
 
         obs, _reward, done, _info = self.libero_env.step(self._zero_action)
+        obs = self._apply_sensor_noise(obs)
         self._last_obs = obs
         self._done = bool(done)
 
@@ -1035,6 +1135,7 @@ class LIBEROSimulation(Simulation):
         if self.libero_env is None:
             raise RuntimeError("Call setup() before step_with_action()")
         obs, reward, done, info = self.libero_env.step(action)
+        obs = self._apply_sensor_noise(obs)
         self._last_obs = obs
         self._done = bool(done)
         return obs, reward, done, info
@@ -1920,6 +2021,40 @@ class LIBEROSimulation(Simulation):
                     sim.model.mat_texid[mat_id] = tex_id
                     log.debug("  table texture: geom %d → tex %d", geom_id, tex_id)
 
+    def _apply_sensor_noise(self, obs: dict | None) -> dict | None:
+        """Post-process visual observations with the sampled corruption.
+
+        Reads ``sensor_noise_kind`` and ``sensor_noise_severity`` from
+        ``scene.params`` and applies the corresponding image transform to
+        every key in ``obs`` whose name ends in ``"_image"`` (RGB only;
+        depth and segmentation channels are left untouched). The
+        transform is a deterministic function of (kind, severity) so the
+        same scene + step yields the same corrupted image.
+
+        Severity follows the C-level convention from the *Common Image
+        Corruptions* benchmark — ``1`` = barely visible, ``5`` = severe.
+        """
+        if not isinstance(obs, dict) or self.scene is None:
+            return obs
+        params = getattr(self.scene, "params", {}) or {}
+        kind = params.get("sensor_noise_kind")
+        if not kind or kind == "none":
+            return obs
+        severity = int(params.get("sensor_noise_severity") or 1)
+        severity = max(1, min(5, severity))
+
+        out = dict(obs)
+        for key, value in obs.items():
+            if not (isinstance(key, str) and key.endswith("_image")):
+                continue
+            if not isinstance(value, np.ndarray):
+                continue
+            try:
+                out[key] = _apply_image_corruption(value, kind, severity)
+            except Exception as exc:
+                log.debug("Sensor-noise transform '%s' failed: %s", kind, exc)
+        return out
+
     def _apply_background_perturbation(self) -> None:
         """Perturb wall and floor textures from Scenic params.
 
@@ -1930,8 +2065,8 @@ class LIBEROSimulation(Simulation):
                            or ``"random"`` to pick any loaded texture.
 
         Material names (``walls_mat`` and ``floorplane``) are the names used
-        across all LIBERO scene XMLs — confirmed by inspecting every style XML
-        in vendor/libero/libero/libero/assets/scenes/.  Missing material or
+        across all LIBERO scene XMLs — confirmed by inspecting the installed
+        LIBERO scene assets. Missing material or
         texture names are handled gracefully so that scenes without these
         materials (e.g. custom arenas) are unaffected.
         """

@@ -24,6 +24,7 @@ from libero_infinity.planner.axes import (
     plan_lighting,
     plan_object,
     plan_robot,
+    plan_sensor_noise,
     plan_texture,
 )
 from libero_infinity.planner.position import (
@@ -52,6 +53,7 @@ AXIS_PRESETS: dict[str, frozenset[str]] = {
             "articulation",
             "background",
             "robot",
+            "sensor_noise",
         ]
     ),
 }
@@ -142,6 +144,9 @@ def plan_perturbations(
 
     if "background" in axes:
         plan.background_plan = plan_background(graph, axes, diagnostics)
+
+    if "sensor_noise" in axes:
+        plan.sensor_noise_plan = plan_sensor_noise(graph, axes, diagnostics)
 
     # STEP 2: Single-pass validation (7 fixed steps)
     _validate_plan(plan, graph, diagnostics)

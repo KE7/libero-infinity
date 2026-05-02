@@ -25,7 +25,13 @@ from libero_infinity.ir.nodes import (
     PlanDiagnostics,
 )
 from libero_infinity.ir.scene_graph import SemanticSceneGraph
-from libero_infinity.planner.types import BackgroundPlan, LightingPlan, RobotInitPlan, TexturePlan
+from libero_infinity.planner.types import (
+    BackgroundPlan,
+    LightingPlan,
+    RobotInitPlan,
+    SensorNoisePlan,
+    TexturePlan,
+)
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -779,3 +785,40 @@ def plan_background(
         floor_texture="random",
         texture_candidates=candidates,
     )
+
+
+# ---------------------------------------------------------------------------
+# plan_sensor_noise
+# ---------------------------------------------------------------------------
+
+
+def plan_sensor_noise(
+    graph: SemanticSceneGraph,
+    request_axes: frozenset[str],
+    diagnostics: PlanDiagnostics,
+) -> SensorNoisePlan | None:
+    """Plan sensor / image-noise perturbation.
+
+    The plan exposes a (kinds, severity_range) pair that the renderer
+    converts to two Scenic params:
+
+        param sensor_noise_kind = Uniform("none", "gaussian_noise", …)
+        param sensor_noise_severity = DiscreteRange(severity_lo, severity_hi)
+
+    The simulator's ``_apply_sensor_noise`` post-processes
+    ``obs["agentview_image"]`` (and the eye-in-hand camera, when present)
+    at every ``step()`` by dispatching on the sampled kind.
+
+    Args:
+        graph: The semantic scene graph (unused; kept for API consistency).
+        request_axes: Set of active perturbation axis names.
+        diagnostics: Diagnostics collector.
+
+    Returns:
+        A SensorNoisePlan, or None if ``"sensor_noise"`` is not in
+        ``request_axes``.
+    """
+    del graph, diagnostics
+    if "sensor_noise" not in request_axes:
+        return None
+    return SensorNoisePlan()

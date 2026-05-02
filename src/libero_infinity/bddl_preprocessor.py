@@ -827,6 +827,376 @@ def generate_cf_bddls(bddl_content: str) -> list[tuple[str, str]]:
     return cross_category_results if cross_category_results else same_category_results
 
 
+# ---------------------------------------------------------------------------
+# Arena swap — rewrite the workspace fixture to a different table arena
+# ---------------------------------------------------------------------------
+
+
+# Arena-class compatibility table. Each arena's half-extents are sourced from
+# LIBERO's ``libero_*_manipulation.py`` problem classes (full_size / 2):
+#   table / kitchen_table / study_table → 1.0 × 1.2 m
+#   living_room_table / coffee_table     → 0.70 × 1.6 m
+# Two arenas are layout-compatible when each authored region rectangle from
+# the original BDDL fits inside the target arena's half-extents (so the
+# rewrite doesn't push placements off the table edge).
+_ARENA_HALF_EXTENTS: dict[str, tuple[float, float]] = {
+    "table": (0.5, 0.6),
+    "kitchen_table": (0.5, 0.6),
+    "study_table": (0.5, 0.6),
+    "living_room_table": (0.35, 0.8),
+    "coffee_table": (0.35, 0.8),
+}
+
+
+def swap_arena(bddl_content: str, target_arena_class: str) -> str | None:
+    """Rewrite a BDDL to use a different table arena while preserving
+    region coordinates.
+
+    The (:fixtures …) declaration is rewritten to declare the target
+    arena class and every region's ``(:target …)`` is re-pointed at the
+    new workspace fixture instance. The region range coordinates are
+    kept verbatim — LIBERO's table arenas all use a centred-at-origin
+    coordinate convention (table centre at (0, 0, table_z)), so x/y
+    region ranges are arena-agnostic *as long as* every original region
+    rectangle fits inside the target arena's half-extents.
+
+    Args:
+        bddl_content: Full text of the source BDDL.
+        target_arena_class: One of the keys in ``_ARENA_HALF_EXTENTS``.
+
+    Returns:
+        Rewritten BDDL string, or ``None`` if the swap is rejected
+        (incompatible region geometry, or the source declares no
+        recognised workspace fixture).
+    """
+    import re as _re
+
+    if target_arena_class not in _ARENA_HALF_EXTENTS:
+        return None
+
+    fixtures_block = _extract_block(bddl_content, "fixtures") or ""
+    workspace_inst: str | None = None
+    workspace_class: str | None = None
+    for line in fixtures_block.splitlines():
+        line = line.strip()
+        if " - " not in line:
+            continue
+        insts_str, cls = line.split(" - ", 1)
+        cls = cls.strip()
+        if cls in _ARENA_HALF_EXTENTS:
+            workspace_inst = insts_str.strip().split()[0]
+            workspace_class = cls
+            break
+    if workspace_inst is None or workspace_class is None:
+        return None
+    if workspace_class == target_arena_class:
+        return None  # no-op swap
+
+    # Geometric compatibility check: every region rectangle must fit in
+    # the target arena's half-extents (with a 4 cm margin to match
+    # ``planner.position._TABLE_*_MARGIN``).
+    target_x_half, target_y_half = _ARENA_HALF_EXTENTS[target_arena_class]
+    margin = 0.04
+    region_re = _re.compile(
+        r"\(\s*:ranges\s*\(\s*\(\s*([-\d\.]+)\s+([-\d\.]+)\s+([-\d\.]+)\s+([-\d\.]+)\s*\)"
+    )
+    for m in region_re.finditer(bddl_content):
+        x_min, y_min, x_max, y_max = (float(s) for s in m.groups())
+        if (
+            x_min < -target_x_half + margin
+            or x_max > target_x_half - margin
+            or y_min < -target_y_half + margin
+            or y_max > target_y_half - margin
+        ):
+            return None  # region would clip off the new table
+
+    # Compute target instance name. Convention: <class>_<n>; we use the
+    # source instance number when shaped that way, else default to _1.
+    suffix = (
+        workspace_inst[len(workspace_class) :]
+        if workspace_inst.startswith(workspace_class)
+        else "_1"
+    )
+    target_inst = (
+        f"{target_arena_class}{suffix}"
+        if suffix.startswith("_") and suffix[1:].isdigit()
+        else target_arena_class
+    )
+
+    # Rewrite (:fixtures ...) declarations: swap the workspace instance/class.
+    def _fix_block(m: _re.Match) -> str:
+        body = m.group(2)
+        new_body = _re.sub(
+            rf"\b{_re.escape(workspace_inst)}\b\s*-\s*\b{_re.escape(workspace_class)}\b",
+            f"{target_inst} - {target_arena_class}",
+            body,
+            count=1,
+        )
+        return f"{m.group(1)}{new_body}{m.group(3)}"
+
+    out = _re.sub(
+        r"(?s)(\(:fixtures\s+)(.*?)(\))",
+        _fix_block,
+        bddl_content,
+        count=1,
+    )
+
+    # Rewrite all references to the workspace instance everywhere else
+    # (region targets, init predicates that anchor to it, goal predicates).
+    bounded = _re.compile(rf"(?<![A-Za-z0-9_]){_re.escape(workspace_inst)}(?![A-Za-z0-9_])")
+    out = bounded.sub(target_inst, out)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Task perturbations — generate task-level BDDL variants
+# ---------------------------------------------------------------------------
+
+
+_PREDICATE_INVERSES: dict[str, tuple[str, str]] = {
+    # (forward_predicate) → (negated_predicate, language_phrase_for_negated)
+    "Open": ("Close", "Close"),
+    "Close": ("Open", "Open"),
+    "Turnon": ("Turnoff", "Turn off"),
+    "Turnoff": ("Turnon", "Turn on"),
+}
+
+_VISIBLE_COLOR_VARIANTS: dict[str, list[str]] = {
+    # Sub-class variant pools keyed by canonical class. Each variant must be
+    # a *visually distinct* version of the same functional category — picking
+    # red_coffee_mug instead of white_yellow_mug exercises the policy's
+    # color-grounding ability without changing the manipulation skill.
+    # These are the variants whose change would meaningfully change the
+    # natural-language description ("yellow mug" vs "red mug"), as opposed
+    # to variants that change shape only.
+    "akita_black_bowl": ["akita_black_bowl", "white_bowl"],
+    "white_bowl": ["white_bowl", "akita_black_bowl"],
+    "red_coffee_mug": ["red_coffee_mug", "white_yellow_mug", "porcelain_mug"],
+    "white_yellow_mug": ["white_yellow_mug", "red_coffee_mug", "porcelain_mug"],
+    "porcelain_mug": ["porcelain_mug", "red_coffee_mug", "white_yellow_mug"],
+    "black_book": ["black_book", "yellow_book"],
+    "yellow_book": ["yellow_book", "black_book"],
+    "wine_bottle": ["wine_bottle"],  # no color variant in registry
+}
+
+
+def _bare_class_phrase(cls: str) -> str:
+    """Convert a class name to a human phrase used in language strings."""
+    overrides = {
+        "akita_black_bowl": "black bowl",
+        "white_yellow_mug": "yellow mug",
+        "red_coffee_mug": "red mug",
+        "porcelain_mug": "white mug",
+        "white_bowl": "white bowl",
+        "yellow_book": "yellow book",
+        "black_book": "black book",
+        "chefmate_8_frypan": "frying pan",
+        "wine_bottle": "wine bottle",
+    }
+    return overrides.get(cls, cls.replace("_", " "))
+
+
+def generate_task_perturbed_bddls(
+    bddl_content: str,
+    *,
+    include_destination_swaps: bool = True,
+    include_predicate_negations: bool = True,
+    include_compositional: bool = True,
+    include_color_swaps: bool = True,
+) -> list[tuple[str, str]]:
+    """Generate task-level BDDL perturbations.
+
+    Variant families produced (each toggleable):
+
+    1. **Destination swaps** (``include_destination_swaps``): for each
+       ``(On|In source dest)`` goal predicate, replace ``dest`` with another
+       graspable scene object. Produces e.g. "put the bowl on the plate"
+       → "put the bowl on the wine bottle". Complements
+       :func:`generate_cf_bddls` which swaps the source.
+    2. **Predicate negations** (``include_predicate_negations``): for each
+       ``(Open|Close|Turnon|Turnoff fixture)`` goal predicate, emit the
+       inverse predicate as a separate task. Produces e.g.
+       "turn on the stove" → "Turn off the stove".
+    3. **Compositional do-also tasks** (``include_compositional``): when a
+       goal has a single On/In predicate, emit a 2-predicate variant that
+       additionally requires placing a *second* graspable object on a
+       second free destination. Produces "and also put the cream cheese
+       in the basket"-style multi-step tasks.
+    4. **Color/visible-attribute swaps** (``include_color_swaps``): pick a
+       visible-color variant of the source object class and swap both the
+       BDDL ``(:objects ...)`` declaration and the ``(:language ...)`` so
+       the realised task changes from "pick up the red mug" to "pick up
+       the yellow mug".
+
+    Args:
+        bddl_content: Full text of the original BDDL file.
+        include_destination_swaps: Emit family (1).
+        include_predicate_negations: Emit family (2).
+        include_compositional: Emit family (3).
+        include_color_swaps: Emit family (4).
+
+    Returns:
+        List of ``(filename_suffix, perturbed_bddl_text)`` pairs. Empty
+        list if none of the families could generate a valid variant.
+    """
+    import re as _re
+
+    out: list[tuple[str, str]] = []
+
+    goal_block = _extract_block(bddl_content, "goal")
+    if not goal_block:
+        return out
+
+    obj_classes = parse_object_classes(bddl_content)
+    fixtures_block = _extract_block(bddl_content, "fixtures") or ""
+    fixture_instances: set[str] = set()
+    fixture_classes: dict[str, str] = {}
+    for line in fixtures_block.splitlines():
+        line = line.strip()
+        if " - " in line:
+            parts = line.split(" - ")
+            if len(parts) == 2:
+                insts_str, cls = parts[0].strip(), parts[1].strip()
+                for inst in insts_str.split():
+                    fixture_instances.add(inst)
+                    fixture_classes[inst] = cls
+
+    # Combined instance → class lookup so language helpers can resolve both
+    # graspable and fixture instances uniformly.
+    inst_to_class: dict[str, str] = {**obj_classes, **fixture_classes}
+
+    pred_re = _re.compile(r"\((On|In|Open|Close|Turnon|Turnoff)\s+([^\s()]+)(?:\s+([^\s()]+))?\)")
+    pred_matches = list(pred_re.finditer(goal_block))
+
+    # ── 1. Destination swaps ────────────────────────────────────────────
+    if include_destination_swaps:
+        for m in pred_matches:
+            predicate = m.group(1)
+            if predicate not in ("On", "In"):
+                continue
+            source_inst = m.group(2)
+            dest_inst = m.group(3)
+            if dest_inst is None:
+                continue
+            for cf_dest, cf_dest_class in obj_classes.items():
+                if cf_dest in (source_inst, dest_inst):
+                    continue
+                if cf_dest in fixture_instances:
+                    continue
+                source_class = inst_to_class.get(source_inst, "")
+                if cf_dest_class == source_class:
+                    continue  # same-class destination → physically nonsense
+                new_pred = f"({predicate} {source_inst} {cf_dest})"
+                cf_text = bddl_content.replace(m.group(0), new_pred)
+                source_phrase = _bare_class_phrase(source_class) if source_class else source_inst
+                dest_phrase = _bare_class_phrase(cf_dest_class)
+                prep = "in" if predicate == "In" else "on"
+                lang = f"Put the {source_phrase} {prep} the {dest_phrase}"
+                cf_text = _re.sub(
+                    r"\(:language\s+[^)]+\)",
+                    f"(:language {lang})",
+                    cf_text,
+                )
+                out.append((f"_task_dest_{cf_dest_class}", cf_text))
+
+    # ── 2. Predicate negations ──────────────────────────────────────────
+    if include_predicate_negations:
+        for m in pred_matches:
+            predicate = m.group(1)
+            target = m.group(2)
+            inverse = _PREDICATE_INVERSES.get(predicate)
+            if inverse is None:
+                continue
+            new_pred_kw, neg_phrase = inverse
+            new_pred = f"({new_pred_kw} {target})"
+            cf_text = bddl_content.replace(m.group(0), new_pred)
+            target_phrase = _bare_class_phrase(inst_to_class.get(target, target))
+            lang = f"{neg_phrase} the {target_phrase}"
+            cf_text = _re.sub(
+                r"\(:language\s+[^)]+\)",
+                f"(:language {lang})",
+                cf_text,
+            )
+            out.append((f"_task_neg_{new_pred_kw.lower()}", cf_text))
+
+    # ── 3. Compositional 2-predicate tasks ───────────────────────────────
+    if include_compositional and len(pred_matches) == 1:
+        m = pred_matches[0]
+        predicate = m.group(1)
+        if predicate in ("On", "In"):
+            source_inst = m.group(2)
+            dest_inst = m.group(3)
+            # Pick a second graspable as the new source; second new dest = dest.
+            for second_inst, second_class in obj_classes.items():
+                if second_inst in (source_inst, dest_inst):
+                    continue
+                if second_inst in fixture_instances:
+                    continue
+                if second_class == obj_classes.get(source_inst, ""):
+                    continue
+                # And-compose a second predicate. The original (And ...) is
+                # parsed; we emit (And <orig> (predicate second dest)).
+                inner_orig = m.group(0)
+                second_pred = f"({predicate} {second_inst} {dest_inst})"
+                # Locate the (And ...) wrapper; if absent, wrap.
+                and_match = _re.search(r"\(And\s+(.*?)\)\s*\)\s*\Z", goal_block, _re.DOTALL)
+                if and_match:
+                    new_and_body = and_match.group(0)
+                    new_and_body = new_and_body.replace(inner_orig, f"{inner_orig} {second_pred}")
+                    cf_text = bddl_content.replace(goal_block, "")
+                    cf_text = bddl_content.replace(
+                        f"(:goal{goal_block}",
+                        f"(:goal{goal_block.replace(inner_orig, f'{inner_orig} {second_pred}')}",
+                    )
+                else:
+                    cf_text = bddl_content.replace(
+                        f"(:goal{goal_block}",
+                        f"(:goal{goal_block} {second_pred}",
+                    )
+                source_phrase = _bare_class_phrase(inst_to_class.get(source_inst, source_inst))
+                second_phrase = _bare_class_phrase(second_class)
+                dest_phrase = _bare_class_phrase(inst_to_class.get(dest_inst, dest_inst))
+                prep = "in" if predicate == "In" else "on"
+                lang = (
+                    f"Put the {source_phrase} {prep} the {dest_phrase} "
+                    f"and also put the {second_phrase} {prep} the {dest_phrase}"
+                )
+                cf_text = _re.sub(
+                    r"\(:language\s+[^)]+\)",
+                    f"(:language {lang})",
+                    cf_text,
+                )
+                out.append((f"_task_compose_{second_class}", cf_text))
+                break  # one compositional variant is enough
+
+    # ── 4. Visible-attribute (color) swaps ──────────────────────────────
+    if include_color_swaps:
+        for inst, cls in obj_classes.items():
+            if inst in fixture_instances:
+                continue
+            variants = _VISIBLE_COLOR_VARIANTS.get(cls, [])
+            for variant in variants:
+                if variant == cls:
+                    continue
+                # Only the source object is renamed; goal predicate +
+                # objects of interest still reference the same instance,
+                # but the (:objects ...) declaration uses the new class.
+                cf_text = substitute_multi(bddl_content, {cls: variant})
+                # Update the language to reflect the new color/visible
+                # attribute (e.g. "red mug" → "yellow mug").
+                old_phrase = _bare_class_phrase(cls)
+                new_phrase = _bare_class_phrase(variant)
+                cf_text = _re.sub(
+                    r"\(:language\s+([^)]+)\)",
+                    lambda mm: "(:language " + mm.group(1).replace(old_phrase, new_phrase) + ")",
+                    cf_text,
+                )
+                out.append((f"_task_color_{variant}", cf_text))
+
+    return out
+
+
 def parse_object_classes(bddl_content: str) -> dict[str, str]:
     """Extract {instance_name: class_name} from (:objects ...) block.
 
