@@ -129,7 +129,16 @@ def plan_perturbations(
         plan.texture_plan = plan_texture(graph, axes, diagnostics)
 
     if "distractor" in axes:
-        plan.distractor_budget, plan.distractor_classes = plan_distractor(graph, axes, diagnostics)
+        # Pass the in-progress position + object plans so the distractor
+        # planner can compute the actual remaining free area instead of
+        # relying on a global default + composition fudge factor.
+        plan.distractor_budget, plan.distractor_classes = plan_distractor(
+            graph,
+            axes,
+            diagnostics,
+            position_plans=plan.position_plans,
+            object_substitutions=plan.object_substitutions,
+        )
 
     if "background" in axes:
         plan.background_plan = plan_background(graph, axes, diagnostics)

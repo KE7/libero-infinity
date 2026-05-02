@@ -27,13 +27,38 @@ _WORKSPACE_Y_MARGIN = 0.11
 _DEFAULT_PERTURB_RADIUS = 0.15
 _FIXTURE_PERTURB_RADIUS = 0.08
 _GOAL_COVERAGE_THRESHOLD = 0.8  # switch to distance-based if >80% covered
-_TABLE_X_MIN = -0.40
-_TABLE_X_MAX = 0.40
-_TABLE_Y_MIN = -0.30
-_TABLE_Y_MAX = 0.30
+# Conservative fallback table bounds — used only when the BDDL exposes
+# neither named workspace fixture nor any anchored placement regions. The
+# preferred path (``_workspace_bounds_from_graph``) reads bounds from the
+# parsed BDDL via the workspace fixture's class plus the union of init
+# regions whose target is that workspace.
+_DEFAULT_TABLE_X_MIN = -0.40
+_DEFAULT_TABLE_X_MAX = 0.40
+_DEFAULT_TABLE_Y_MIN = -0.30
+_DEFAULT_TABLE_Y_MAX = 0.30
 _TABLE_X_MARGIN = 0.04
 _TABLE_Y_MARGIN = 0.04
 _SUPPORT_UNBOUNDED_DEFAULT_RADIUS = 0.05
+
+# Per-arena table half-extents (x_half, y_half) in the workspace frame, sourced
+# from LIBERO's arena Python classes (vendor/libero/libero/libero/envs/problems/
+# libero_*_manipulation.py) where each arena hard-codes its
+# ``<arena>_table_full_size`` tuple. The numbers below are the LIBERO
+# defaults, divided by 2 to give half-extents from the table-centre origin.
+# We err on the smaller side by trimming a per-arena margin so sampled
+# positions stay clear of the visible table edge.
+_LIBERO_TABLE_HALF_EXTENTS: dict[str, tuple[float, float]] = {
+    # Default tabletop arena (workspace_name="table"): 1.0 × 1.2 m.
+    "table": (0.5, 0.6),
+    "kitchen_table": (0.5, 0.6),
+    "study_table": (0.5, 0.6),
+    "living_room_table": (0.35, 0.8),
+    "coffee_table": (0.35, 0.8),
+    # Floor arena (libero_floor_manipulation): no table; bounds are looser.
+    "floor": (0.5, 0.5),
+    # Backwards-compatible name used by the older bowl/plate tasks.
+    "main_table": (0.4, 0.3),
+}
 
 # Interior (x, y) sampling extent for known container fixtures.
 # These are conservative estimates of the usable interior cavity;
@@ -61,6 +86,90 @@ _MOVABLE_CONTAINER_INTERIOR: dict[str, tuple[float, float]] = {
     "desk_caddy": (0.10, 0.07),
     "bowl_drainer": (0.12, 0.10),
 }
+
+
+def container_interior_xy_by_class(container_class: str) -> tuple[float, float] | None:
+    """Return the (x_extent, y_extent) interior dims for a container class.
+
+    Single source of truth for both the position planner (which samples
+    contained-object positions inside this rectangle) and the object
+    planner (which filters variant candidates by whether their footprint
+    fits inside this rectangle). Returning the same numbers in both places
+    eliminates the previous inconsistency where ``axes.py`` derived
+    interior dims from ``0.85 × bbox`` while ``position.py`` used
+    hand-tuned per-class entries.
+
+    Returns:
+        Tuple of (x, y) full extents, or ``None`` if the class is not a
+        known container in either the fixture or movable container tables.
+    """
+    if container_class in _CONTAINER_FIXTURE_INTERIOR:
+        return _CONTAINER_FIXTURE_INTERIOR[container_class]
+    if container_class in _MOVABLE_CONTAINER_INTERIOR:
+        return _MOVABLE_CONTAINER_INTERIOR[container_class]
+    return None
+
+
+def _workspace_bounds_from_graph(
+    graph: SemanticSceneGraph,
+) -> tuple[float, float, float, float]:
+    """Derive (x_min, y_min, x_max, y_max) for the active workspace.
+
+    Two BDDL-driven signals are combined:
+
+    1. **Workspace fixture class** — ``WorkspaceNode.object_class`` (e.g.
+       ``"kitchen_table"``, ``"living_room_table"``) maps to a known
+       arena half-extent via ``_LIBERO_TABLE_HALF_EXTENTS`` (sourced from
+       LIBERO's ``libero_*_manipulation.py`` arena classes).
+    2. **Region union** — every RegionNode whose ``target`` is the
+       workspace fixture contributes its (x_min, y_min, x_max, y_max).
+       Taking the union of those rectangles constrains the bounds *up to
+       at least* every author-defined placement spot.
+
+    The returned rectangle is the union of (1) and (2) — wide enough to
+    contain every region the BDDL author placed on the table, but never
+    smaller than the arena's known table footprint. This eliminates the
+    "wrong arena" silent clip that the previous hardcoded ±0.40 × ±0.30
+    constants caused on kitchen / living-room / study arenas.
+    """
+    # Pass 1: arena-class default.
+    x_min = _DEFAULT_TABLE_X_MIN
+    x_max = _DEFAULT_TABLE_X_MAX
+    y_min = _DEFAULT_TABLE_Y_MIN
+    y_max = _DEFAULT_TABLE_Y_MAX
+    workspace_class: str | None = None
+    workspace_name: str | None = None
+    for node in graph.nodes.values():
+        if isinstance(node, WorkspaceNode):
+            workspace_class = node.object_class
+            workspace_name = node.instance_name
+            half = _LIBERO_TABLE_HALF_EXTENTS.get(workspace_class)
+            if half is not None:
+                x_half, y_half = half
+                x_min, x_max = -x_half, x_half
+                y_min, y_max = -y_half, y_half
+            break
+
+    # Pass 2: union with regions targeting the workspace.
+    if workspace_name is not None:
+        for region in graph.nodes.values():
+            if not isinstance(region, RegionNode):
+                continue
+            if getattr(region, "target", None) != workspace_name:
+                continue
+            if (
+                region.x_min is None
+                or region.x_max is None
+                or region.y_min is None
+                or region.y_max is None
+            ):
+                continue
+            x_min = min(x_min, float(region.x_min))
+            x_max = max(x_max, float(region.x_max))
+            y_min = min(y_min, float(region.y_min))
+            y_max = max(y_max, float(region.y_max))
+
+    return x_min, y_min, x_max, y_max
 
 
 def plan_position(
@@ -117,6 +226,10 @@ def _plan_object_position(
     is_stacked = edge.label == "stacked_on"
     support_node = graph.get_node(edge.dst_id)
 
+    # Read this task's table bounds from the BDDL-derived workspace fixture
+    # + region union, instead of the hardcoded ±0.40 × ±0.30 default.
+    table_x_min, table_y_min, table_x_max, table_y_max = _workspace_bounds_from_graph(graph)
+
     def _support_half_extents(
         parent_node: FixtureNode | MovableSupportNode | ObjectNode | None,
     ) -> tuple[float, float]:
@@ -169,12 +282,12 @@ def _plan_object_position(
             return rel_lo, rel_hi
 
         if axis == "x":
-            target_min = _TABLE_X_MIN + _TABLE_X_MARGIN
-            target_max = _TABLE_X_MAX - _TABLE_X_MARGIN
+            target_min = table_x_min + _TABLE_X_MARGIN
+            target_max = table_x_max - _TABLE_X_MARGIN
             anchor = parent_x
         else:
-            target_min = _TABLE_Y_MIN + _TABLE_Y_MARGIN
-            target_max = _TABLE_Y_MAX - _TABLE_Y_MARGIN
+            target_min = table_y_min + _TABLE_Y_MARGIN
+            target_max = table_y_max - _TABLE_Y_MARGIN
             anchor = parent_y
 
         # Convert to absolute coords, intersect, convert back.

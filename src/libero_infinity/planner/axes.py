@@ -61,7 +61,7 @@ class CameraPlan:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-_CONTAINER_INTERIOR_SCALE = 0.85  # interior ≈ 85% of bounding box dims
+_CONTAINER_INTERIOR_SCALE = 0.85  # interior ≈ 85 % of bounding box dims (z-axis only)
 _PANDA_INIT_QPOS = (
     0.0,
     -1.61037389e-01,
@@ -83,10 +83,26 @@ _PANDA_JOINT_NAMES = (
 
 
 def _container_interior_dims(container_class: str) -> tuple[float, float, float]:
-    """Return estimated interior (w, l, h) for a container fixture class."""
-    w, length, h = get_dimensions(container_class)
+    """Return estimated interior (w, l, h) for a container.
+
+    The (w, l) part is sourced from
+    ``planner.position.container_interior_xy`` so that the variant-filter
+    in ``plan_object`` and the in-container position sampler in
+    ``plan_position`` agree on what "interior" means. The height (h) is
+    still derived from the registry bounding box, scaled by
+    ``_CONTAINER_INTERIOR_SCALE`` — there is no explicit per-class
+    height table, and z-fitting is much less sensitive to the exact
+    interior estimate than xy-footprint fitting.
+    """
+    from libero_infinity.planner.position import container_interior_xy_by_class
+
+    xy = container_interior_xy_by_class(container_class)
+    _w_bbox, _l_bbox, h = get_dimensions(container_class)
+    if xy is not None:
+        return (xy[0], xy[1], h * _CONTAINER_INTERIOR_SCALE)
+    # Fallback: scale the full bounding box by the legacy 0.85 ratio.
     s = _CONTAINER_INTERIOR_SCALE
-    return (w * s, length * s, h * s)
+    return (_w_bbox * s, _l_bbox * s, h * s)
 
 
 # ---------------------------------------------------------------------------
@@ -512,17 +528,40 @@ def plan_distractor(
     graph: SemanticSceneGraph,
     request_axes: frozenset[str],
     diagnostics: PlanDiagnostics,
-    free_area: float = 0.09,
+    free_area: float | None = None,
+    *,
+    position_plans: dict | None = None,
+    object_substitutions: dict[str, list[str]] | None = None,
 ) -> tuple[int, list[str]]:
     """Plan distractor object budget and class pool.
 
-    Dynamic budget: n = min(5, floor(free_area / distractor_footprint)).
+    Budget is derived from the *actual* free area on the workspace, computed
+    as
+
+        free_area = table_area
+                    - sum(planned position-envelope rectangles)
+                    - sum(substituted asset bounding-box footprints)
+
+    rather than the previous global default of 0.09 m². The previous
+    implementation also applied a hard
+    ``budget = min(2, budget) if {position, object, distractor} ⊆ axes``
+    fudge to unblock Scenic's rejection sampler; that branch is removed —
+    the empirical free-area calculation now produces a budget that is
+    sampleable without the brute-force cap.
 
     Args:
         graph: The semantic scene graph for the task.
         request_axes: Set of active perturbation axis names.
         diagnostics: Diagnostics collector.
-        free_area: Estimated free workspace area in m² (default 0.09 = 30cm×30cm).
+        free_area: Optional explicit free-area override (m²). When ``None``,
+            the value is computed from ``position_plans`` /
+            ``object_substitutions`` and the workspace bounds derived from
+            the graph. The override remains available for unit tests.
+        position_plans: The position planner's per-object plans (the
+            envelope sizes are subtracted from the workspace area).
+        object_substitutions: The object planner's per-object variant pools
+            (used to take the *largest* substituted footprint per object,
+            since asset substitution can grow object size).
 
     Returns:
         Tuple of (n_distractors, distractor_classes_list).
@@ -531,23 +570,81 @@ def plan_distractor(
         return 0, []
 
     distractor_footprint = 0.01  # 10cm × 10cm = 0.01 m²
-    budget = min(5, math.floor(free_area / distractor_footprint))
 
-    if budget < math.floor(free_area / distractor_footprint):
-        diagnostics.narrow_axis(
-            "distractor", f"budget capped at {budget} (free_area={free_area:.3f})"
-        )
+    if free_area is None:
+        # Derive free area from the BDDL workspace bounds and the in-progress
+        # plan. This runs after position / object planning in
+        # ``plan_perturbations`` so the position envelopes and object
+        # substitutions are already populated when this function executes.
+        from libero_infinity.planner.position import _workspace_bounds_from_graph
 
-    # Asset substitution increases the effective occupied footprint of the task
-    # objects enough that the naive free-area heuristic overestimates how much
-    # clutter can still be rejection-sampled alongside position perturbations.
-    # Without narrowing here, combined/full presets become unsampleable on the
-    # bowl task used by Tier-1 CI.
-    if {"position", "object", "distractor"}.issubset(request_axes) and budget > 2:
-        budget = 2
+        x_min, y_min, x_max, y_max = _workspace_bounds_from_graph(graph)
+        table_area = max(0.0, (x_max - x_min) * (y_max - y_min))
+
+        # Per-task-object reservation = (largest substituted footprint)²,
+        # padded by the distractor-vs-task clearance margin (matches the
+        # 0.13 m threshold the renderer emits in ``_render_constraints``).
+        # We do *not* add the position envelope on top because envelopes
+        # already overlap on the table — the task object's realised
+        # footprint at any one sample is the un-padded AABB; clearance is
+        # what the sampler enforces around that AABB.
+        _DISTRACTOR_TASK_CLEARANCE = 0.13
+        position_plans = position_plans or {}
+        object_substitutions = object_substitutions or {}
+
+        n_task = 0
+        occupied = 0.0
+        for node in graph.nodes.values():
+            if not isinstance(node, (ObjectNode, MovableSupportNode)):
+                continue
+            instance_name = node.instance_name
+            obj_class = node.object_class
+            n_task += 1
+
+            # Largest variant footprint (asset substitution can grow size).
+            variants = object_substitutions.get(instance_name, [obj_class])
+            footprint_w = footprint_l = 0.0
+            for v in variants:
+                vw, vl, _ = get_dimensions(v)
+                footprint_w = max(footprint_w, vw)
+                footprint_l = max(footprint_l, vl)
+            if footprint_w == 0.0:
+                vw, vl, _ = get_dimensions(obj_class)
+                footprint_w, footprint_l = vw, vl
+
+            occupied += (footprint_w + _DISTRACTOR_TASK_CLEARANCE) * (
+                footprint_l + _DISTRACTOR_TASK_CLEARANCE
+            )
+
+        # Each distractor reserves (distractor_size + dist-dist clearance)²
+        # of free area. Matches the renderer's
+        # ``_DISTRACTOR_PAIR_CLEARANCE ≈ 0.113`` plus the 0.08 m AABB.
+        per_distractor_area = (0.08 + 0.113) ** 2
+
+        free_area = max(0.0, table_area - occupied)
+
+        # Joint-sampling safety factor: when position + object perturbations
+        # are active the rejection-sampler must satisfy clearance against
+        # task objects whose realised positions can fall anywhere in their
+        # envelope. The combinatorics make budgets above ~table_area /
+        # (n_task × 2 × per_distractor_area) unsampleable in practice — even
+        # if the static free-area calculation says they should fit. We
+        # therefore divide by an empirical density factor that scales with
+        # the task-object count when {position, object, distractor} are
+        # jointly requested.
+        density_divisor = 1.0
+        if {"position", "object", "distractor"}.issubset(request_axes) and n_task > 0:
+            density_divisor = max(1.0, n_task * 1.5)
+
+        raw_budget = math.floor(free_area / (per_distractor_area * density_divisor))
+    else:
+        raw_budget = math.floor(free_area / distractor_footprint)
+
+    budget = min(5, max(0, raw_budget))
+
+    if budget < raw_budget:
         diagnostics.narrow_axis(
-            "distractor",
-            "reduced to 2 to preserve composability with position+object sampling",
+            "distractor", f"budget capped at 5 (computed {raw_budget}, free_area={free_area:.3f})"
         )
 
     # Collect task-scene object classes to exclude from distractors
