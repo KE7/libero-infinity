@@ -633,6 +633,77 @@ def _is_sampled(node: "ObjectNode | MovableSupportNode", plan: PerturbationPlan)
     return False
 
 
+def _relative_parent_map(plan: PerturbationPlan) -> dict[str, str]:
+    """Map relatively positioned object names to their direct support names."""
+    return {
+        obj_name: pp.support_name
+        for obj_name, pp in plan.position_plans.items()
+        if pp is not None and pp.use_relative_positioning and pp.support_name
+    }
+
+
+def _support_relation_label(
+    graph: SemanticSceneGraph,
+    child_name: str,
+    parent_name: str,
+) -> str | None:
+    child_ids = [child_name]
+    child_ids.extend(
+        node_id
+        for node_id, node in graph.nodes.items()
+        if node.instance_name == child_name and node_id != child_name
+    )
+    for child_id in child_ids:
+        edges = graph.edges_from(child_id)
+        for edge in edges:
+            parent = graph.get_node(edge.dst_id)
+            parent_matches = edge.dst_id == parent_name or (
+                parent is not None and parent.instance_name == parent_name
+            )
+            if parent_matches and edge.label in {
+                "contained_in",
+                "stacked_on",
+                "supported_by",
+            }:
+                return edge.label
+    return None
+
+
+def _clearance_relationship(
+    name_a: str,
+    name_b: str,
+    relative_parent: dict[str, str],
+    graph: SemanticSceneGraph,
+) -> str:
+    """Classify how pairwise clearance should treat two object nodes."""
+    parent_a = relative_parent.get(name_a)
+    parent_b = relative_parent.get(name_b)
+
+    if parent_a == name_b or parent_b == name_a:
+        return "direct_parent"
+
+    if parent_a is None or parent_b is None or parent_a != parent_b:
+        return "independent"
+
+    label_a = _support_relation_label(graph, name_a, parent_a)
+    label_b = _support_relation_label(graph, name_b, parent_b)
+    if label_a is None or label_b is None:
+        raise ValueError(
+            "Relative-positioned siblings share support "
+            f"{parent_a!r}, but graph support edges are missing for "
+            f"{name_a!r} and/or {name_b!r}"
+        )
+    if label_a != label_b:
+        raise ValueError(
+            "Relative-positioned siblings share support "
+            f"{parent_a!r} with incompatible relationships: "
+            f"{name_a!r}={label_a}, {name_b!r}={label_b}"
+        )
+    if label_a == "contained_in":
+        return "contained_sibling"
+    return "independent"
+
+
 def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     lines = ["# Distance constraints"]
 
@@ -671,6 +742,13 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         sampled = _is_sampled(node, plan)
         obj_info.append((var_name, dims, node.instance_name, sampled))
 
+    # Map of relatively-positioned child -> direct support, used for the
+    # contained-sibling detection below. This is the same data
+    # ``support_relations`` carries (child/support pairs), but indexed by
+    # child name so ``_clearance_relationship`` can look up shared parents
+    # without scanning the relations list.
+    relative_parent = _relative_parent_map(plan)
+
     # Pairwise AABB clearance constraints.
     #
     # Rule 1 — fixed-vs-fixed: BOTH objects sit at BDDL canonical positions
@@ -687,11 +765,28 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
     # Rule 4 — declared support pair (e.g., bowl stacked on cookies_box):
     #   skip — the relative-positioning specifier already pins the child
     #   on top of the support.
+    #
+    # Rule 5 — contained siblings (e.g., two soup cans inside one basket):
+    #   skip — both children are sampled relative to the same container's
+    #   interior envelope, which already enforces non-overlap via per-child
+    #   slot ranges in the planner. Emitting an additional pairwise AABB
+    #   clearance here would over-constrain the sampler and reject most
+    #   valid layouts.
     for i in range(len(obj_info)):
         for j in range(i + 1, len(obj_info)):
             var_a, dims_a, _name_a, sampled_a = obj_info[i]
             var_b, dims_b, _name_b, sampled_b = obj_info[j]
+            # Rule 4: declared (child, support) pair across any kind
+            # (on_surface / inside / stacked).
             if _is_declared_support_pair(var_a, var_b, support_relations):
+                continue
+            # Rule 5: contained siblings sharing one movable container.
+            # ``_clearance_relationship`` also re-detects the direct-parent
+            # case, which is a no-op here because Rule 4 already short-
+            # circuits it; the value of going through it is the
+            # ``contained_sibling`` classification.
+            relationship = _clearance_relationship(_name_a, _name_b, relative_parent, graph)
+            if relationship in {"direct_parent", "contained_sibling"}:
                 continue
             # Rule 1: both fixed — skip (positions are valid by BDDL design)
             if not sampled_a and not sampled_b:

@@ -619,6 +619,132 @@ def test_contained_position_fixture_interior_limits_envelope() -> None:
     assert pp.y_envelope.hi == pytest.approx(expected_dy, abs=1e-6)
 
 
+@pytest.mark.parametrize(
+    "container_class",
+    ["basket", "tray", "wooden_tray", "desk_caddy", "caddy"],
+)
+def test_contained_position_known_movable_container_uses_explicit_interior(
+    container_class: str,
+) -> None:
+    """Known movable containers must use explicit interior geometry, not full footprint."""
+    from libero_infinity.ir.nodes import ObjectNode, SceneEdge
+    from libero_infinity.planner.position import (
+        _MOVABLE_CONTAINER_INTERIOR,
+        _plan_contained_position,
+    )
+
+    graph = SemanticSceneGraph(
+        task_language="put soup in basket",
+        bddl_path="<test>",
+        articulation_model=ArticulationModel.canonical(),
+    )
+    basket = ObjectNode(
+        node_id="basket_1",
+        node_type="object",
+        instance_name="basket_1",
+        object_class=container_class,
+    )
+    child = ObjectNode(
+        node_id="alphabet_soup_1",
+        node_type="object",
+        instance_name="alphabet_soup_1",
+        object_class="alphabet_soup",
+        contained=True,
+    )
+    graph.add_node(basket)
+    graph.add_node(child)
+    graph.add_edge(SceneEdge(src_id="alphabet_soup_1", dst_id="basket_1", label="contained_in"))
+
+    diag = PlanDiagnostics()
+    pp = _plan_contained_position(child, "basket_1", graph, diag)
+
+    assert pp is not None
+    parent_x, parent_y = _MOVABLE_CONTAINER_INTERIOR[container_class]
+    assert pp.x_envelope.lo == pytest.approx(-(parent_x / 2.0 - 0.03), abs=1e-6)
+    assert pp.y_envelope.hi == pytest.approx(parent_y / 2.0 - 0.03, abs=1e-6)
+
+
+def test_contained_position_unsupported_movable_container_fails_closed() -> None:
+    """Unsupported movable containers must be dropped with a diagnostic."""
+    from libero_infinity.ir.nodes import ObjectNode, SceneEdge
+    from libero_infinity.planner.position import _plan_contained_position
+
+    graph = SemanticSceneGraph(
+        task_language="put bowl in plate",
+        bddl_path="<test>",
+        articulation_model=ArticulationModel.canonical(),
+    )
+    plate = ObjectNode(
+        node_id="plate_1",
+        node_type="object",
+        instance_name="plate_1",
+        object_class="plate",
+    )
+    child = ObjectNode(
+        node_id="akita_black_bowl_1",
+        node_type="object",
+        instance_name="akita_black_bowl_1",
+        object_class="akita_black_bowl",
+        contained=True,
+    )
+    graph.add_node(plate)
+    graph.add_node(child)
+    graph.add_edge(SceneEdge(src_id="akita_black_bowl_1", dst_id="plate_1", label="contained_in"))
+
+    diag = PlanDiagnostics()
+    result = _plan_contained_position(child, "plate_1", graph, diag)
+
+    assert result is None
+    assert "position" in diag.dropped_axes
+    assert "unsupported movable container" in diag.reasons["position"]
+
+
+def test_contained_siblings_share_container_with_deterministic_slots() -> None:
+    """Contained siblings in one movable container get stable disjoint ranges."""
+    from libero_infinity.ir.nodes import ObjectNode, SceneEdge
+    from libero_infinity.planner.position import _plan_contained_position
+
+    graph = SemanticSceneGraph(
+        task_language="put both objects in basket",
+        bddl_path="<test>",
+        articulation_model=ArticulationModel.canonical(),
+    )
+    graph.add_node(
+        ObjectNode(
+            node_id="basket_1",
+            node_type="object",
+            instance_name="basket_1",
+            object_class="basket",
+        )
+    )
+    left = ObjectNode(
+        node_id="alphabet_soup_1",
+        node_type="object",
+        instance_name="alphabet_soup_1",
+        object_class="alphabet_soup",
+        contained=True,
+    )
+    right = ObjectNode(
+        node_id="tomato_sauce_1",
+        node_type="object",
+        instance_name="tomato_sauce_1",
+        object_class="tomato_sauce",
+        contained=True,
+    )
+    graph.add_node(left)
+    graph.add_node(right)
+    graph.add_edge(SceneEdge(src_id="tomato_sauce_1", dst_id="basket_1", label="contained_in"))
+    graph.add_edge(SceneEdge(src_id="alphabet_soup_1", dst_id="basket_1", label="contained_in"))
+
+    diag = PlanDiagnostics()
+    left_plan = _plan_contained_position(left, "basket_1", graph, diag)
+    right_plan = _plan_contained_position(right, "basket_1", graph, diag)
+
+    assert left_plan is not None
+    assert right_plan is not None
+    assert left_plan.x_envelope.hi < right_plan.x_envelope.lo
+
+
 def test_contained_position_missing_container_returns_none_and_drops_axis() -> None:
     """_plan_contained_position must return None and drop axis if container is missing."""
     from libero_infinity.ir.nodes import ObjectNode
