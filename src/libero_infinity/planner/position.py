@@ -259,9 +259,7 @@ def container_interior_xy(container_node: object) -> tuple[float, float] | None:
     """Return usable interior xy dimensions for a known container node."""
     container_class = getattr(container_node, "object_class", "") or ""
     if isinstance(container_node, FixtureNode):
-        return _CONTAINER_FIXTURE_INTERIOR.get(
-            container_class, _CONTAINER_FIXTURE_INTERIOR_DEFAULT
-        )
+        return _CONTAINER_FIXTURE_INTERIOR.get(container_class, _CONTAINER_FIXTURE_INTERIOR_DEFAULT)
     return _MOVABLE_CONTAINER_INTERIOR.get(container_class)
 
 
@@ -281,9 +279,7 @@ def _contained_child_bounds(
     non-overlapping packing from identical broad ranges.
     """
     siblings = sorted(
-        e.src_id
-        for e in graph.edges
-        if e.label == "contained_in" and e.dst_id == container_id
+        e.src_id for e in graph.edges if e.label == "contained_in" and e.dst_id == container_id
     )
     if node_id not in siblings or len(siblings) <= 1:
         return (

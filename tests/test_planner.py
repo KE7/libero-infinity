@@ -8,6 +8,7 @@ independence, contained object exclusion, camera sub-envelope.
 from __future__ import annotations
 
 import glob
+
 import pytest
 
 from libero_infinity.ir.graph_builder import build_semantic_scene_graph
