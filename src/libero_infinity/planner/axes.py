@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from libero_infinity.asset_registry import (
     DEFAULT_DISTRACTOR_POOL,
+    OBJECT_DIMENSIONS,
     UNLOADABLE_ASSET_CLASSES,
     get_dimensions,
     get_distractor_pool,
@@ -121,11 +122,23 @@ def plan_object(
         obj_class = node.object_class
         variants = get_variants(obj_class, include_canonical=True, require_loadable=True)
 
-        # Containment-dimensional filtering: variant must fit inside container
+        # Containment-dimensional filtering: variant must fit inside container.
+        # We can only apply this filter when the container's interior dimensions
+        # are *known*. Fixture containers (microwave, cabinet, drawer, …) and
+        # any class missing from OBJECT_DIMENSIONS fall through to the
+        # conservative default (0.08 × 0.08 × 0.06), which is smaller than
+        # almost every graspable variant — silently collapsing the variant pool
+        # to the canonical class. Skipping the filter in that case preserves
+        # the full variant pool; positional sampling provides the actual
+        # geometric feasibility guard.
         contained_edges = [e for e in graph.edges_from(node_id) if e.label == "contained_in"]
         if contained_edges:
             container_node = graph.get_node(contained_edges[0].dst_id)
-            if container_node is not None:
+            if (
+                container_node is not None
+                and not isinstance(container_node, FixtureNode)
+                and container_node.object_class in OBJECT_DIMENSIONS
+            ):
                 iw, il, ih = _container_interior_dims(container_node.object_class)
                 filtered = []
                 for v in variants:

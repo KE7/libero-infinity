@@ -145,6 +145,12 @@ def substitute_multi(
 ) -> str:
     """Apply multiple class substitutions in one pass.
 
+    Substitutions are applied via a two-phase placeholder pass to avoid
+    chained collisions. Without this, substitutions like
+    ``{"alphabet_soup": "tomato_sauce", "tomato_sauce": "popcorn"}`` would
+    mis-rewrite ``alphabet_soup`` instances all the way to ``popcorn`` because
+    the second pass would re-match the output of the first.
+
     Args:
         bddl_content: Full BDDL text.
         substitutions: Mapping from original_class → replacement_class.
@@ -152,14 +158,91 @@ def substitute_multi(
     Returns:
         Modified BDDL string.
     """
+    # Drop identity / no-op subs.
+    effective = {k: v for k, v in substitutions.items() if k != v}
+    if not effective:
+        return bddl_content
+
+    # Phase 1: orig → unique placeholder. Placeholders must be impossible to
+    # collide with any real BDDL token (no spaces, parens, or hyphens).
+    placeholders: dict[str, str] = {}
     result = bddl_content
-    for orig, repl in substitutions.items():
-        if orig != repl:
-            try:
-                result = substitute_asset(result, orig, repl)
-            except ValueError:
-                pass  # class not present in this particular BDDL — skip silently
+    for idx, orig in enumerate(effective):
+        placeholder = f"__libinf_sub_placeholder_{idx}__"
+        placeholders[orig] = placeholder
+        try:
+            result = substitute_asset(result, orig, placeholder)
+        except ValueError:
+            # Class not present in this BDDL — skip silently. Drop the
+            # placeholder so phase 2 does not try to rewrite something that
+            # never landed in the text.
+            placeholders.pop(orig)
+
+    # Phase 2: placeholder → final replacement.
+    for orig, placeholder in placeholders.items():
+        repl = effective[orig]
+        try:
+            result = substitute_asset(result, placeholder, repl)
+        except ValueError:
+            # Should be unreachable — phase 1 guarantees the placeholder is
+            # present — but stay defensive.
+            pass
+
     return _merge_duplicate_object_declarations(result)
+
+
+def substitute_per_instance(
+    bddl_content: str,
+    instance_substitutions: dict[str, str],
+) -> str:
+    """Apply per-instance class substitutions.
+
+    Unlike :func:`substitute_multi`, this rewrites each instance's class
+    independently. Required when multiple instances share an original class
+    but receive *different* replacement classes (e.g. ``butter_1 → cream_cheese``
+    while ``butter_2 → popcorn``). Splits multi-instance declarations
+    (``butter_1 butter_2 - butter``) into per-class lines so each instance
+    points at its own asset class. Goal predicates and other blocks are
+    untouched (instance names are preserved verbatim).
+
+    Args:
+        bddl_content: Full BDDL text.
+        instance_substitutions: Mapping from instance_name → replacement_class.
+
+    Returns:
+        Modified BDDL string with each instance assigned its requested class.
+    """
+    if not instance_substitutions:
+        return bddl_content
+
+    obj_marker = "(:objects"
+    obj_start = bddl_content.find(obj_marker)
+    if obj_start == -1:
+        return bddl_content
+
+    obj_end = _find_closing_paren(bddl_content, obj_start)
+    obj_body = bddl_content[obj_start + len(obj_marker) : obj_end]
+
+    # Group resolved per-instance class assignments, preserving discovery order.
+    inst_classes: list[tuple[str, str]] = []
+    for inst, cls in _parse_declarations(obj_body):
+        new_cls = instance_substitutions.get(inst, cls)
+        inst_classes.append((inst, new_cls))
+
+    # Re-group by class (preserving first-seen order) so identical classes
+    # share a single declaration line.
+    class_to_instances: dict[str, list[str]] = {}
+    class_order: list[str] = []
+    for inst, cls in inst_classes:
+        if cls not in class_to_instances:
+            class_order.append(cls)
+            class_to_instances[cls] = []
+        class_to_instances[cls].append(inst)
+
+    indent = "    "
+    merged_lines = [f"{indent}{' '.join(class_to_instances[cls])} - {cls}" for cls in class_order]
+    merged_block = f"{obj_marker}\n" + "\n".join(merged_lines) + "\n  )"
+    return bddl_content[:obj_start] + merged_block + bddl_content[obj_end + 1 :]
 
 
 def _merge_duplicate_object_declarations(bddl_content: str) -> str:
@@ -253,14 +336,50 @@ def bddl_for_scene(
     This is the single source of truth for BDDL substitution resolution,
     used by both ``eval.py`` and ``gym_env.py``.
     """
-    subs = {}
+    # Collect per-instance assignments first so we can detect same-class
+    # multi-instance overwrites and route through the per-instance path.
+    inst_subs: dict[str, str] = {}
     for obj in scene.objects:
         asset_cls = getattr(obj, "asset_class", "")
         libero_name = getattr(obj, "libero_name", "")
         if libero_name and asset_cls:
             orig_cls = orig_obj_classes.get(libero_name, "")
             if orig_cls and orig_cls != asset_cls:
-                subs[orig_cls] = asset_cls
+                inst_subs[libero_name] = asset_cls
+
+    # Detect whether any original class has multiple instances with *differing*
+    # asset assignments (or a mix of "rewrite" + "keep canonical"). When that
+    # happens we must split per-instance to avoid the class-level rewrite
+    # silently collapsing them into the same replacement class.
+    needs_per_instance = False
+    by_orig: dict[str, set[str]] = {}
+    for libero_name, repl in inst_subs.items():
+        orig_cls = orig_obj_classes.get(libero_name, "")
+        if not orig_cls:
+            continue
+        by_orig.setdefault(orig_cls, set()).add(repl)
+    for orig_cls, repls in by_orig.items():
+        # Count how many *total* instances share this original class.
+        siblings = [n for n, c in orig_obj_classes.items() if c == orig_cls]
+        rewritten = [n for n in siblings if n in inst_subs]
+        if len(siblings) > 1 and (len(repls) > 1 or len(rewritten) != len(siblings)):
+            needs_per_instance = True
+            break
+
+    if needs_per_instance:
+        source_path = pathlib.Path(bddl_path)
+        original = source_path.read_text()
+        patched = substitute_per_instance(original, inst_subs)
+        with patched_bddl_from_string(patched, stem=source_path.stem) as tmp:
+            yield tmp
+        return
+
+    # Fall back to the simpler class-level rewrite path.
+    subs: dict[str, str] = {}
+    for libero_name, repl in inst_subs.items():
+        orig_cls = orig_obj_classes.get(libero_name, "")
+        if orig_cls:
+            subs[orig_cls] = repl
 
     if not subs:
         chosen_asset = scene.params.get("chosen_asset")
@@ -393,9 +512,16 @@ def generate_cf_bddls(bddl_content: str) -> list[tuple[str, str]]:
         return []
 
     pred_re = _re.compile(r"\((On|In)\s+([^\s()]+)\s+([^\s()]+)\)")
-    goal_match = pred_re.search(goal_block)
-    if not goal_match:
+    pred_matches = list(pred_re.finditer(goal_block))
+    if not pred_matches:
         return []  # Open/Close/TurnOn/TurnOff — not swappable
+    if len(pred_matches) > 1:
+        # Multi-predicate goal (e.g. (And (On a b) (On c d))). Rewriting only
+        # the first predicate while leaving the rest untouched produces a CF
+        # whose language describes one swap but whose goal still requires the
+        # other original predicates — semantically inconsistent. Skip.
+        return []
+    goal_match = pred_matches[0]
 
     predicate = goal_match.group(1)  # "On" or "In"
     source_inst = goal_match.group(2)  # e.g. "akita_black_bowl_1"
@@ -521,6 +647,21 @@ def generate_cf_bddls(bddl_content: str) -> list[tuple[str, str]]:
             return f"Put the {obj_phrase} in the {dest_phrase_for_lang}"
         return f"Put the {obj_phrase} on the {dest_phrase_for_lang}"
 
+    # Container/landmark classes whose names commonly appear inside region
+    # identifiers (e.g. ``main_table_basket_region``,
+    # ``study_table_desk_caddy_front_left_contain_region``). We probe these
+    # before falling back to the table-prefix heuristic so that a region whose
+    # surface is a basket / tray / caddy is described as such rather than
+    # losing the landmark to "kitchen table" / "study table".
+    _REGION_LANDMARKS: tuple[str, ...] = (
+        "desk_caddy",
+        "wooden_tray",
+        "white_storage_box",
+        "bowl_drainer",
+        "basket",
+        "tray",
+    )
+
     def _region_to_phrase(region: str) -> str:
         """Convert a BDDL region ID to a ≤2-word human-readable phrase.
 
@@ -528,11 +669,18 @@ def generate_cf_bddls(bddl_content: str) -> list[tuple[str, str]]:
         main_table_stove_front_region    → 'stove'
         kitchen_table_porcelain_mug_...  → 'kitchen table'  (object landmark stripped)
         living_room_table_plate_left_... → 'living room table'
+        study_table_desk_caddy_front_... → 'desk caddy'
+        main_table_basket_region         → 'basket'
         """
         # Numbered container regions: 'basket_1_contain_region' → 'basket'
         m = _re.match(r"(.+?)_\d+_\w+_region$", region)
         if m:
             base = m.group(1)
+            # Strip a leading table prefix if present
+            base = _re.sub(r"^(?:main|kitchen|living_room|study)_table_", "", base)
+            for landmark in _REGION_LANDMARKS:
+                if landmark in base:
+                    return _DISPLAY_NAMES.get(landmark, landmark).replace("_", " ")
             return _DISPLAY_NAMES.get(base, base).replace("_", " ")
 
         # Table surface regions — strip table prefix + position/object suffix.
@@ -546,10 +694,16 @@ def generate_cf_bddls(bddl_content: str) -> list[tuple[str, str]]:
             "drawer",
             "fridge",
         )
-        s = region
         for kw in _FIXTURE_KEYWORDS:
             if kw in region:
                 return kw  # 'main_table_stove_front_region' → 'stove'
+
+        # Container/landmark embedded in region name (no number) — pick that
+        # before defaulting to the table label, otherwise we silently lose
+        # the actual placement surface.
+        for landmark in _REGION_LANDMARKS:
+            if landmark in region:
+                return _DISPLAY_NAMES.get(landmark, landmark).replace("_", " ")
 
         # Fall back to the table name (1-2 words)
         table_m = _re.match(r"(main|kitchen|living_room|study)_table_", region)
@@ -643,10 +797,14 @@ def generate_cf_bddls(bddl_content: str) -> list[tuple[str, str]]:
             cf_text,
         )
 
-        # (c) Rewrite :obj_of_interest — replace source_inst with cf_inst
+        # (c) Rewrite :obj_of_interest — replace source_inst with cf_inst,
+        # bounded by whitespace / paren delimiters to avoid swallowing
+        # substring matches (e.g. ``bowl_1`` colliding with ``bowl_10``).
+        _bounded = _re.compile(rf"(?<![A-Za-z0-9_]){_re.escape(source_inst)}(?![A-Za-z0-9_])")
+
         def _rewrite_ooi(m: _re.Match) -> str:
             block = m.group(0)
-            return block.replace(source_inst, cf_inst)
+            return _bounded.sub(cf_inst, block)
 
         cf_text = _re.sub(
             r"\(:obj_of_interest[^)]*\)",
