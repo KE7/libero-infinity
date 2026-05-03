@@ -27,7 +27,7 @@
 ## Highlights
 
 - **Open-Ended Evaluation** -- Sample unlimited i.i.d. test scenes from constraint-checked probability distributions; success rate converges to a true population statistic
-- **9 Composable Perturbation Axes** -- Position, object identity, robot joint reset, camera, lighting, texture, distractor objects, background, articulation -- mix any subset
+- **10 Composable Perturbation Axes** -- Position, object identity, robot joint reset, camera, lighting, texture, distractor objects, background, articulation, sensor noise -- mix any subset
 - **Unlimited Tasks, Zero Hand-Writing** -- Point at any LIBERO BDDL task file; Scenic programs are synthesized automatically
 - **Adversarial Search** -- Cross-entropy Bayesian optimization finds worst-case scenes via [VerifAI](https://github.com/BerkeleyLearnVerify/VerifAI)
 - **Task Reversal** -- Flip any forward task backward for novel evaluation from goal-state initial configs
@@ -289,7 +289,7 @@ LIBERO-Infinity exposes **two complementary perturbation surfaces**:
 
 | Axis | What Varies | Distribution | Constraints |
 |------|------------|-------------|-------------|
-| **Position** | Object (x, y) placement | Uniform over reachable workspace | Pairwise clearance > 0.10 m; intersection-clip to BDDL-derived table bounds |
+| **Position** | Object (x, y) placement | Uniform over reachable workspace | Per-axis AABB pairwise clearance (renderer emits `(dims_a[i]+dims_b[i])/2` per x/y); intersection-clip to BDDL-derived table bounds |
 | **Object** | Visual identity (mesh + texture) | Uniform over per-class asset variant pools | BDDL rewriting for asset substitution |
 | **Robot** | Panda arm start configuration | Marsaglia uniform-on-S^6 × radius `[0.1, 0.5]` around canonical `init_qpos` | Applied to the 7 arm joints; base pose unchanged |
 | **Camera** | Viewpoint pose | Orbit (azimuth/elevation/distance) + offsets + tilt | Applied to agentview camera pos & quat |

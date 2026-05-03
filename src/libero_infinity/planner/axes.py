@@ -624,8 +624,13 @@ def plan_distractor(
 
         # Each distractor reserves (distractor_size + dist-dist clearance)²
         # of free area. Matches the renderer's
-        # ``_DISTRACTOR_PAIR_CLEARANCE ≈ 0.113`` plus the 0.08 m AABB.
-        per_distractor_area = (0.08 + 0.113) ** 2
+        # ``_DISTRACTOR_PAIR_CLEARANCE`` plus the distractor AABB side. Keep
+        # the constants in sync with ``renderer/scenic_renderer.py`` (audit
+        # E2): the renderer authors a 0.08 m AABB cube and emits a diagonal
+        # clearance of ``sqrt(2 * 0.08²) ≈ 0.1131`` m between distractors.
+        _DISTRACTOR_AABB_SIDE = 0.08
+        _DISTRACTOR_PAIR_CLEARANCE = math.sqrt(2.0) * _DISTRACTOR_AABB_SIDE
+        per_distractor_area = (_DISTRACTOR_AABB_SIDE + _DISTRACTOR_PAIR_CLEARANCE) ** 2
 
         free_area = max(0.0, table_area - occupied)
 

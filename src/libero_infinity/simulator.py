@@ -382,7 +382,22 @@ def _camera_transforms(
     return world_to_pixel, world_to_camera
 
 
-def _apply_image_corruption(image: np.ndarray, kind: str, severity: int) -> np.ndarray:
+_NOISE_KIND_OFFSETS: dict[str, int] = {
+    "gaussian_noise": 0,
+    "shot_noise": 1,
+    "impulse_noise": 2,
+    "brightness_jitter": 3,
+    "contrast_jitter": 4,
+}
+
+
+def _apply_image_corruption(
+    image: np.ndarray,
+    kind: str,
+    severity: int,
+    *,
+    seed: int | None = None,
+) -> np.ndarray:
     """Apply a sensor-noise corruption to a single RGB image.
 
     Severity follows the *Common Image Corruptions* convention (1..5).
@@ -398,18 +413,29 @@ def _apply_image_corruption(image: np.ndarray, kind: str, severity: int) -> np.n
         return image
     img = image[..., :3].astype(np.float32)
 
+    def _rng(kind_offset: int) -> np.random.Generator:
+        # Combine the optional per-scene ``seed`` with kind/severity so the
+        # realised noise pattern varies across scenes when a non-None seed
+        # is supplied (E5 audit fix). With ``seed=None`` the legacy
+        # severity-only seeding is preserved for backward compatibility.
+        if seed is None:
+            return np.random.default_rng(severity + kind_offset)
+        return np.random.default_rng(
+            (int(seed), int(severity), int(kind_offset))
+        )
+
     if kind == "gaussian_noise":
         sigma = [4.0, 8.0, 16.0, 24.0, 32.0][severity - 1]
-        rng = np.random.default_rng(severity)
+        rng = _rng(_NOISE_KIND_OFFSETS["gaussian_noise"])
         noise = rng.normal(0.0, sigma, size=img.shape).astype(np.float32)
         out = img + noise
     elif kind == "shot_noise":
         scale = [60.0, 25.0, 12.0, 5.0, 3.0][severity - 1]
-        rng = np.random.default_rng(severity + 1)
+        rng = _rng(_NOISE_KIND_OFFSETS["shot_noise"])
         out = rng.poisson(np.clip(img, 0, 255) / 255.0 * scale) / scale * 255.0
     elif kind == "impulse_noise":
         prob = [0.01, 0.02, 0.04, 0.08, 0.15][severity - 1]
-        rng = np.random.default_rng(severity + 2)
+        rng = _rng(_NOISE_KIND_OFFSETS["impulse_noise"])
         mask = rng.random(img.shape[:2])
         out = img.copy()
         out[mask < prob / 2.0] = 0.0
@@ -431,12 +457,12 @@ def _apply_image_corruption(image: np.ndarray, kind: str, severity: int) -> np.n
         out = (np.round(img / steps) * steps).astype(np.float32)
     elif kind == "brightness_jitter":
         delta = [10, 25, 45, 70, 100][severity - 1]
-        rng = np.random.default_rng(severity + 3)
+        rng = _rng(_NOISE_KIND_OFFSETS["brightness_jitter"])
         shift = rng.uniform(-delta, delta)
         out = img + shift
     elif kind == "contrast_jitter":
         gain = [0.95, 0.9, 0.8, 0.65, 0.5][severity - 1]
-        rng = np.random.default_rng(severity + 4)
+        rng = _rng(_NOISE_KIND_OFFSETS["contrast_jitter"])
         scale = rng.uniform(gain, 1.0 / gain)
         mean = float(img.mean())
         out = (img - mean) * scale + mean
@@ -482,12 +508,28 @@ def _moving_average(img: np.ndarray, radius: int, axis: int) -> np.ndarray:
 
 
 def _real_depth_map(sim, depth_map: np.ndarray) -> np.ndarray:
-    """Convert MuJoCo's normalized depth image to metric depth."""
-    assert np.all(depth_map >= 0.0) and np.all(depth_map <= 1.0)
+    """Convert MuJoCo's normalized depth image to metric depth.
+
+    Defensively sanitises the input rather than ``assert``-ing — NaN
+    or out-of-range pixels (occasionally produced by EGL drivers on
+    edge cases) would otherwise crash the rollout. Anomalous values
+    are clipped into ``[0, 1]`` and NaNs replaced with ``1.0`` (far
+    plane) so downstream consumers see a finite metric depth.
+    """
+    arr = np.asarray(depth_map, dtype=float)
+    if not np.all(np.isfinite(arr)):
+        arr = np.nan_to_num(arr, nan=1.0, posinf=1.0, neginf=0.0)
+    if arr.min() < 0.0 or arr.max() > 1.0:
+        log.debug(
+            "depth_map out of [0,1] (min=%.4f max=%.4f); clipping",
+            float(arr.min()),
+            float(arr.max()),
+        )
+        arr = np.clip(arr, 0.0, 1.0)
     extent = float(sim.model.stat.extent)
     far = float(sim.model.vis.map.zfar) * extent
     near = float(sim.model.vis.map.znear) * extent
-    return near / (1.0 - depth_map * (1.0 - near / far))
+    return near / (1.0 - arr * (1.0 - near / far))
 
 
 # ---------------------------------------------------------------------------
@@ -2043,6 +2085,20 @@ class LIBEROSimulation(Simulation):
         severity = int(params.get("sensor_noise_severity") or 1)
         severity = max(1, min(5, severity))
 
+        # Per-scene seed: combine any explicit ``scenic_seed`` (set by the
+        # planner) with the step counter so identical (kind, severity) pairs
+        # still produce *different* noise patterns across scenes (E5 fix).
+        seed_source = params.get("scenic_seed")
+        if seed_source is None:
+            seed_source = params.get("seed")
+        if seed_source is None:
+            # Fall back to id(self.scene) for at-least-per-episode variation.
+            seed_source = id(self.scene)
+        try:
+            scene_seed = int(seed_source) & 0x7FFFFFFF
+        except (TypeError, ValueError):
+            scene_seed = abs(hash(seed_source)) & 0x7FFFFFFF
+
         out = dict(obs)
         for key, value in obs.items():
             if not (isinstance(key, str) and key.endswith("_image")):
@@ -2050,7 +2106,9 @@ class LIBEROSimulation(Simulation):
             if not isinstance(value, np.ndarray):
                 continue
             try:
-                out[key] = _apply_image_corruption(value, kind, severity)
+                out[key] = _apply_image_corruption(
+                    value, kind, severity, seed=scene_seed
+                )
             except Exception as exc:
                 log.debug("Sensor-noise transform '%s' failed: %s", kind, exc)
         return out

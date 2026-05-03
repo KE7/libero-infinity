@@ -92,40 +92,37 @@ Neither of these has a direct counterpart in libero-infinity's current perturbat
 
 ### 3.1 Architecture
 
-libero-infinity defines six composable perturbation axes, each as a **Scenic 3 probability distribution** with formal constraint checking via rejection sampling:
+libero-infinity defines ten composable perturbation axes in total. Standalone hand-written `*_perturbation.scenic` files no longer exist on the current branch; instead, the compiler/renderer pipeline auto-generates a single Scenic program per scene from `libero_model.scenic` plus per-axis renderer modules under `src/libero_infinity/renderer/`:
 
-| Axis | Scenic File | Distribution Family | Parameters |
-|------|------------|---------------------|------------|
-| Position | `position_perturbation.scenic` | Uniform over workspace | x ∈ [-0.40,0.40] m, y ∈ [-0.30,0.30] m per object |
-| Object | `object_perturbation.scenic` | Uniform over variant pool | 34 object classes, 2–5 variants each |
-| Camera | `camera_perturbation.scenic` | Uniform range offsets | x/y: ±10 cm, z: ±8 cm, tilt: ±15° |
-| Lighting | `lighting_perturbation.scenic` | Uniform ranges | intensity ×[0.4,2.0], x/y/z offset ±0.5 m, ambient [0.05,0.6] |
-| Texture | *(via params)* | Discrete pool | Table surface material swap |
-| Distractor | `distractor_perturbation.scenic` | DiscreteRange(1,5) + Uniform pool | 10-item pool, spatially constrained |
+| Axis | Renderer Module / Source | Distribution Family | Parameters |
+|------|--------------------------|---------------------|------------|
+| Position | `renderer/scenic_renderer.py::_render_position` | Uniform over BDDL-derived workspace (parent-relative for supported objects) | per-axis envelope from `_workspace_bounds_from_graph` (≈ table bounds with 0.04 m margin) |
+| Object | `renderer/scenic_renderer.py::_render_objects` | Uniform over variant pool | 34 object classes, 2–5 variants each (most have 3) |
+| Robot | `renderer/scenic_renderer.py::_render_robot` | Marsaglia uniform on S^6 × radius `[0.1,0.5]` | Applied to 7 arm joints around canonical `init_qpos` |
+| Camera | `renderer/scenic_renderer.py::_render_camera` | Orbit only | `cam_azimuth`, `cam_elevation`, `cam_distance` |
+| Lighting | `renderer/scenic_renderer.py::_render_lighting` | Uniform ranges | intensity, ambient, optional position offset |
+| Texture | *(via params, applied in `simulator.py`)* | Discrete pool | Table surface material swap (`main_table` / `table_main`) |
+| Distractor | `renderer/scenic_renderer.py` distractor block | `DiscreteRange(0,5)` + Uniform pool | data-driven budget; per-task-class exclusion |
+| Background | *(via params, applied in `simulator.py`)* | Discrete pool | `walls_mat` / `floorplane` texture swap |
+| Articulation | `planner/axes.py::plan_articulation` | Per-fixture joint range | `state_kind`, `lo`, `hi`, plus goal-reachability override (init + goal predicates) |
+| Sensor noise | `simulator.py::_apply_image_corruption` | Uniform over 10 corruption families × severity 1..5 | Applied to every `*_image` obs key |
 
-All axes are **composable**: `--perturbation position,camera,distractor` or preset `full` activates all axes simultaneously in a single jointly-sampled Scenic program.
+All axes are **composable**: `--perturbation position,camera,distractor` or preset `full` activates them simultaneously in a single jointly-sampled evaluation pipeline.
 
 ### 3.2 Position Perturbation (vs. LIBERO-PRO P1)
 
-**Distribution:** Each object's (x, y) is drawn **independently and uniformly** from the full workspace.
+**Distribution:** For top-level objects, (x, y) is drawn **independently and uniformly** from the BDDL-derived workspace. For supported objects (e.g. food on a plate, items inside a tray), positioning is **parent-relative**: the renderer samples within an envelope clipped around the parent anchor, with bounds derived from `perturbation_policy.support_offset_bounds`.
 
-```
-x ∈ [TABLE_X_MIN + WORKSPACE_MARGIN, TABLE_X_MAX − WORKSPACE_MARGIN]
-   = [-0.29, 0.29] m  (with default margin 0.11 m)
-y ∈ [TABLE_Y_MIN + WORKSPACE_MARGIN, TABLE_Y_MAX − WORKSPACE_MARGIN]
-   = [-0.19, 0.19] m
-z = TABLE_Z = 0.82 m  (fixed to table surface)
-```
+Workspace bounds are not hardcoded — they come from `planner/position.py::_workspace_bounds_from_graph` and are trimmed by `_TABLE_X_MARGIN = _TABLE_Y_MARGIN = 0.04 m`. Z is captured from LIBERO's default per-object z after `env.reset()` (the `0.82` constant in older docs was wrong for many tasks; actual table surface is closer to `0.90`).
 
 **Hard constraints** (rejection sampler loops until satisfied):
-- Pairwise clearance: `distance(A, B) > min_clearance` (default 0.22 m for bowl+plate pair)
-- Workspace bounds enforced by `in SAFE_REGION` / `in PLATE_SAFE_REGION` specifiers
+- Per-axis AABB pairwise clearance: `(dims_a[i] + dims_b[i]) / 2` along x and y (no fixed 0.10 m / 0.22 m floor).
+- Workspace bounds enforced by `at Vector(Range(...), Range(...), Z)` per object.
+- Distractor pairwise clearance uses the AABB diagonal (≈ 0.113 m for the default 0.08 m cube).
 
-**Soft constraints** (preference, not prohibition):
-- `require[0.8] distance(bowl, bowl_train_pt) > ood_margin (0.15 m)` — 80% bias toward OOD positions
-- `require[0.7] distance(plate, plate_train_pt) > ood_margin` — 70% bias
+**Soft constraints:** None. Earlier drafts mentioned `require[p]` probabilistic preferences (e.g. `require[0.8] distance(...) > ood_margin`); these were intentionally removed because Scenic's soft constraints fire `RejectSimulationException` mid-rollout. The renderer now emits only hard sampling-time `require` clauses (see `renderer/scenic_renderer.py::_render_constraints`). Tests assert their absence.
 
-**Fixture support:** Goal fixtures (drawers, stoves, microwaves, cabinets) are also perturbed when the task goal is fixture-backed, via optional `goal_fixture_*` parameters.
+**Fixture support:** Goal fixtures (drawers, stoves, microwaves, cabinets) participate via the `articulation` axis (`planner/axes.py::plan_articulation`), not via standalone `goal_fixture_*` Scenic parameters (which do not exist).
 
 **Configuration count:** Strictly infinite. Each call to `scenario.generate()` draws a new i.i.d. sample from the continuous 2D uniform. For N objects, the joint configuration space is ∝ (workspace_area)^N minus rejection regions.
 
@@ -233,13 +230,15 @@ For a 200-episode evaluation budget:
 4. **Lighting perturbation** — 5D continuous: intensity, position (x,y,z), ambient level
 5. **Table texture perturbation** — material swap on the workspace surface
 6. **Distractor object injection** — 1–5 foreign objects with spatial plausibility constraints
-7. **Arbitrary axis composability** — any subset of all 6 axes in a single evaluation run
-8. **Auto-generation for any BDDL task** — compiler pipeline generates valid Scenic programs from any BDDL without per-task authoring
-9. **Adversarial CE search** — VerifAI cross-entropy Bayesian optimization concentrates samples on failure-inducing regions
-10. **Gym API for training** — standard `gym.Env` wrapper enables domain-randomized training, not just evaluation
-11. **Task reversal** — BDDL goal/initial state inversion doubles the evaluation surface
-12. **Infinite sample pool** — evaluation does not exhaust a fixed set; confidence intervals narrow with N
-13. **Principled constraint calibration** — workspace margins empirically calibrated to zero physics failures (`workspace_margin=0.11 m`, measured at zero hard-failure rate vs. 12.5% before calibration)
+7. **Background perturbation** — wall/floor texture variation via parameters
+8. **Articulation perturbation** — fixture initial-state sampling for drawers, doors, and stoves
+9. **Arbitrary axis composability** — any subset of all 8 axes in a single evaluation run
+10. **Auto-generation for any BDDL task** — compiler pipeline generates valid Scenic programs from any BDDL without per-task authoring
+11. **Adversarial CE search** — VerifAI cross-entropy Bayesian optimization concentrates samples on failure-inducing regions
+12. **Gym API for training** — standard `gym.Env` wrapper enables domain-randomized training, not just evaluation
+13. **Task reversal** — BDDL goal/initial state inversion doubles the evaluation surface
+14. **Infinite sample pool** — evaluation does not exhaust a fixed set; confidence intervals narrow with N
+15. **Principled constraint calibration** — workspace margins empirically calibrated to zero physics failures (`workspace_margin=0.11 m`, measured at zero hard-failure rate vs. 12.5% before calibration)
 
 ---
 
@@ -265,8 +264,8 @@ LIBERO-PRO's P1 explicitly targets "relative arrangements" — moving object A c
 |---------|-----------------|-----------------|
 | **Position perturbation type** | Discrete: ~10 fixed swap pairs | Continuous uniform over workspace |
 | **Position coverage** | ~10 fixed (x,y) per task suite | ℝ² workspace minus rejected regions |
-| **Hard position constraints** | Physical plausibility (by construction) | Rejection sampling: `require dist(A,B) > 0.22 m` |
-| **Soft OOD position bias** | Not present | `require[0.8] dist > 0.15 m` from training pos |
+| **Hard position constraints** | Physical plausibility (by construction) | Rejection sampling: per-axis AABB clearance from object dimensions |
+| **Soft OOD position bias** | Not present | None (intentionally removed; soft `require[p]` caused mid-rollout rejection) |
 | **Object perturbation type** | Pre-defined asset list (2–6 per class) | Stochastic `Uniform` draw per episode |
 | **Object property changed** | Color, texture, size | Mesh + texture (full asset swap) |
 | **Object classes in registry** | Subset of 4 LIBERO task suites | 34 classes, full LIBERO object vocabulary |
@@ -274,8 +273,10 @@ LIBERO-PRO's P1 explicitly targets "relative arrangements" — moving object A c
 | **Lighting perturbation** | None | 5D continuous: intensity ×[0.4,2.0], position ±0.5 m, ambient [0.05,0.6] |
 | **Texture perturbation** | Full scene environment swap (5 variants) | Table surface texture swap |
 | **Distractor objects** | None | 1–5 foreign objects, constrained placement |
+| **Background perturbation** | None | Wall/floor texture swap via params |
+| **Articulation perturbation** | None | Initial fixture joint-state sampling |
 | **Language perturbation** | Yes (paraphrase + task substitution) | Not implemented |
-| **Axis composability** | Single axis only | Any subset of 6 axes simultaneously |
+| **Axis composability** | Single axis only | Any subset of 10 axes simultaneously |
 | **Task coverage** | 4 LIBERO suites (hand-crafted) | Any BDDL task (auto-generated) |
 | **Total evaluation configs** | O(10–20) per task × N_suites | Infinite i.i.d. samples |
 | **Memorization-proof** | No (finite, enumerable) | Yes (continuous distribution, never repeated) |
@@ -294,13 +295,13 @@ LIBERO-PRO P1/P2 and libero-infinity represent different design choices for pert
 
 - **On object variation (P2):** Both systems cover 2–5 variants per class. Key differences: libero-infinity draws stochastically per episode (no deterministic cycling), applies across any BDDL task (not just 4 suites), and can compose object variation with all other axes simultaneously.
 
-- **On axes only libero-infinity covers:** Camera perturbation, lighting perturbation, table texture variation, and distractor injection have no counterpart in LIBERO-PRO. libero-infinity's camera perturbation (cited by LIBERO-Plus as the highest-impact axis) adds an additional evaluation dimension.
+- **On axes only libero-infinity covers:** Camera perturbation, lighting perturbation, table texture variation, distractor injection, background texture perturbation, and articulation perturbation have no counterpart in LIBERO-PRO. libero-infinity's camera perturbation (cited by LIBERO-Plus as the highest-impact axis) adds an additional evaluation dimension.
 
-- **On composability:** LIBERO-PRO tests axes in isolation. libero-infinity can compose all six axes in a single scene, enabling evaluation of compound covariate shift.
+- **On composability:** LIBERO-PRO tests axes in isolation. libero-infinity can compose all eight axes in a single scene, enabling evaluation of compound covariate shift.
 
 **The main gaps** are on the *language* side (instruction paraphrase and task logic substitution) and *full scene environment* switching, where LIBERO-PRO's L and E dimensions have no current counterpart in libero-infinity. These are genuine gaps for language robustness evaluation.
 
-**Bottom line:** For the spatial/visual perturbation axes (position and object appearance), libero-infinity uses continuous Scenic 3 distributions while LIBERO-PRO uses predefined sets — different evaluation philosophies. For camera, lighting, distractor, and composability, libero-infinity provides additional evaluation dimensions. For language robustness and full-scene environment switching, LIBERO-PRO's L and E dimensions address evaluation needs that libero-infinity currently does not cover.
+**Bottom line:** For the spatial/visual perturbation axes (position and object appearance), libero-infinity uses continuous Scenic 3 distributions while LIBERO-PRO uses predefined sets — different evaluation philosophies. For camera, lighting, distractor, background, articulation, and composability, libero-infinity provides additional evaluation dimensions. For language robustness and full-scene environment switching, LIBERO-PRO's L and E dimensions address evaluation needs that libero-infinity currently does not cover.
 
 ---
 
