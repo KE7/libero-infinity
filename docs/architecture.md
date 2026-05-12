@@ -220,7 +220,7 @@ libero-infinity/
 │   │                                   Handles stacking deps (stacked_on field)
 │   │
 │   ├── compiler.py                        Dynamic .scenic program generation
-│   │                                   7 perturbation modes, composable
+│   │                                   9 perturbation axes, composable
 │   │                                   Relative positioning for stacked objects
 │   │
 │   ├── task_reverser.py                 BDDL task reversal: forward -> backward
@@ -240,7 +240,7 @@ libero-infinity/
 │                                        with variant pools, 35 dimension entries
 │
 ├── docs/
-│   ├── scenic_perturbations.md          All 6 perturbation axes in detail
+│   ├── scenic_perturbations.md          All 9 perturbation axes in detail
 │   ├── evaluation_pipeline.md           Eval harness, CLI, adversarial mode
 │   ├── architecture.md                  System diagrams, design decisions, file map
 │   ├── api-reference.md                 Python API for all modules

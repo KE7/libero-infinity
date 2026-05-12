@@ -117,9 +117,14 @@ def plan_perturbations(
     if "robot" in axes:
         plan.robot_plan = plan_robot(graph, axes, diagnostics)
 
-    # Always plan articulation for goal-reachability safety
-    if "articulation" in axes or True:  # noqa: SIM210
-        plan.articulation_plans = plan_articulation(graph, axes, diagnostics)
+    # Articulation is planned unconditionally — even when the caller did not
+    # request the "articulation" axis. Goal predicates frequently reference
+    # fixture joints (drawer open/closed, stove on/off), so leaving fixtures in
+    # their raw BDDL defaults can trivialise or trap the goal. ``plan_articulation``
+    # restricts itself to goal-reachable bands when "articulation" is absent
+    # from ``axes`` and only widens to the full safe band when it is requested.
+    # See docs/scenic_perturbations.md#articulation-perturbation.
+    plan.articulation_plans = plan_articulation(graph, axes, diagnostics)
 
     if "camera" in axes:
         plan.camera_plan = plan_camera(graph, axes, diagnostics)
