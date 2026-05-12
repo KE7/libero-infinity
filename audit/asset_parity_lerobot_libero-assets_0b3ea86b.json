@@ -1,0 +1,21 @@
+{
+  "status": "PASS",
+  "generated_at": "2026-03-11T00:00:10.908976Z",
+  "hf_repo": "lerobot/libero-assets",
+  "hf_revision": "0b3ea86be5fe169d0fd036ae63d1070ec09e90f6",
+  "hf_full_sha": "0b3ea86be5fe169d0fd036ae63d1070ec09e90f6",
+  "local_root": "/home/batman/Documents/research/libero-infinity/libero-pro/libero/libero/assets",
+  "hf_root": "/home/batman/.cache/libero_infinity/assets",
+  "summary": {
+    "local_file_count": 585,
+    "hf_file_count": 585,
+    "files_matching": 585,
+    "files_missing_in_hf": 0,
+    "files_added_in_hf": 0,
+    "files_hash_mismatch": 0
+  },
+  "missing_in_hf": [],
+  "added_in_hf": [],
+  "hash_mismatches": [],
+  "approved_exceptions": []
+}
