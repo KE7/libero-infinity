@@ -33,6 +33,7 @@ JSONL row schema (one row per condition):
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import multiprocessing as mp
 import os
@@ -416,11 +417,20 @@ def run_sweep(
     Returns a summary dict with per-gate pass/fail counts.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    conditions = [
-        (t, axs, s, scenic_only, max_iter)
+    # Round-robin (task-minor) dispatch: interleave one (axis_subset, seed)
+    # condition per task per cycle so a single sick task cannot saturate the
+    # early-window rolling fail-rate and trip the global 5% abort threshold
+    # before the schedule has visited the other tasks. The set of dispatched
+    # conditions is unchanged — only the ORDER is — so honest pass/fail
+    # accounting is preserved and the final aggregate is bit-identical to the
+    # previous task-major ordering.
+    per_task = [
+        [(t, axs, s, scenic_only, max_iter) for axs in subsets for s in seeds]
         for t in tasks
-        for axs in subsets
-        for s in seeds
+    ]
+    conditions = [
+        c for c in itertools.chain.from_iterable(itertools.zip_longest(*per_task))
+        if c is not None
     ]
     total = len(conditions)
     print(f"[sweep] {total} conditions  "
