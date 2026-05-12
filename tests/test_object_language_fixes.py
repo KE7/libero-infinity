@@ -367,10 +367,16 @@ def test_class_provides_contain_region_probe() -> None:
 
 
 def test_plan_object_filters_container_variants_lacking_contain_region() -> None:
-    """A node referenced by an incoming ``contained_in`` edge must only get
-    variants whose MJCF preserves the ``contain_region`` site.  Reproduces
-    the Stage-3 Run-2b ``basket_1_contain_region`` KeyError pre-fix and
-    asserts the planner now refuses the lossy substitution."""
+    """Synthetic-graph variant of the container-affordance filter test.
+
+    Scope: pins ``plan_object``'s filter logic given the production
+    ``goal_target`` edge shape (``dst_id == "<node_id>_<contain_site>"``).
+    Originally constructed against an inert ``contained_in`` edge per PR #7;
+    repaired in ``fix/contain-region-filter-real-graph`` to mirror the real
+    graph builder. The real-BDDL regression lives in
+    ``tests/test_planner_contain_region_real_graph.py``; this one keeps a
+    self-contained unit-level pin on the asset-registry + planner contract.
+    """
     from libero_infinity.ir.nodes import (
         ArticulationModel,
         ObjectNode,
@@ -408,8 +414,11 @@ def test_plan_object_filters_container_variants_lacking_contain_region() -> None
     graph.add_node(basket)
     graph.add_node(soup)
     graph.add_node(cheese)
-    graph.add_edge(SceneEdge(src_id="alphabet_soup_1", dst_id="basket_1", label="contained_in"))
-    graph.add_edge(SceneEdge(src_id="cream_cheese_1", dst_id="basket_1", label="contained_in"))
+    # Real graph shape: BDDL ``(In x basket_1_contain_region)`` is emitted as
+    # a ``goal_target`` edge whose ``dst_id`` is the full site name. See
+    # ``ir/graph_builder.py::build_semantic_scene_graph``.
+    graph.add_edge(SceneEdge(src_id="alphabet_soup_1", dst_id="basket_1_contain_region", label="goal_target"))
+    graph.add_edge(SceneEdge(src_id="cream_cheese_1", dst_id="basket_1_contain_region", label="goal_target"))
 
     diag = PlanDiagnostics()
     plan = plan_object(graph, frozenset(["object"]), diag)
@@ -482,7 +491,8 @@ def test_plan_object_pins_container_when_no_safe_variants() -> None:
         )
         graph.add_node(cont)
         graph.add_node(item)
-        graph.add_edge(SceneEdge(src_id="item_1", dst_id="basket_1", label="contained_in"))
+        # Real graph shape (see note in the sibling test above).
+        graph.add_edge(SceneEdge(src_id="item_1", dst_id="basket_1_contain_region", label="goal_target"))
 
         diag = PlanDiagnostics()
         plan = plan_object(graph, frozenset(["object"]), diag)
