@@ -61,6 +61,29 @@ CANONICAL_AXES: tuple[str, ...] = (
 
 GATES: tuple[str, ...] = ("g0", "g1", "g2", "g3", "g5", "g6")
 
+# Per-worker baseline scene cache keyed by absolute BDDL path. The baseline is
+# the no-axes-active sample needed by the G4 identity hook for cross-axis
+# isolation checks. Caching once per (worker, task) keeps the marginal cost of
+# G4 identity to a single extra Scenic sample per task per worker process.
+_BASELINE_CACHE: dict[str, Any] = {}
+
+
+def _get_baseline_scene(cfg: Any, bddl_key: str, max_iter: int) -> Any:
+    """Return (and memoize) the no-axes-active baseline scene for ``cfg``.
+
+    Re-raises any exception so it can be honestly recorded in the row's
+    ``g4_identity_error`` field — identity-hook failures are NOT silently
+    swallowed.
+    """
+    cached = _BASELINE_CACHE.get(bddl_key)
+    if cached is not None:
+        return cached
+    from libero_infinity.compiler import compile_task_to_scenario
+    scenario = compile_task_to_scenario(cfg, "")
+    scene, _ = scenario.generate(maxIterations=max_iter)
+    _BASELINE_CACHE[bddl_key] = scene
+    return scene
+
 # Directory containing the bundled BDDLs (shipped with the package data tree).
 _PKG_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _BDDL_ROOT = _PKG_ROOT / "data" / "libero_runtime" / "bddl_files"
@@ -188,6 +211,13 @@ def run_condition(
         "traceback": None,
         "duration_s": 0.0,
         "worker_pid": os.getpid(),
+        # G4 invariant family hooks (filled in after G3 / G5):
+        "g4_identity": None,
+        "g4_identity_error": None,
+        "g4_domain": None,
+        "g4_consistency": None,
+        "g4_affordance": None,
+        "g4_domain_error": None,
     }
 
     # Seed Python RNG for determinism on the sampling path.
@@ -246,6 +276,24 @@ def run_condition(
         row["duration_s"] = time.monotonic() - t0
         return row
 
+    # ---- G4 (family A) identity hook ---------------------------------
+    # Compares the perturbed scene to a no-axes baseline; every axis NOT in
+    # ``axis_subset`` must be byte-identical. Errors are recorded honestly
+    # in ``g4_identity_error`` (with traceback) but do not gate the rest of
+    # the pipeline — they're a separate publication-grade assertion family.
+    try:
+        baseline = _get_baseline_scene(cfg, str(bddl_path), max_iter)
+        from libero_infinity.validation.invariants import g4_identity_hook
+        row["g4_identity"] = g4_identity_hook(baseline, scene, axis_subset)
+    except Exception as exc:  # noqa: BLE001 — recorded, not swallowed
+        row["g4_identity"] = None
+        row["g4_identity_error"] = {
+            "error_class": type(exc).__name__,
+            "error_msg": str(exc)[:2000],
+            "error_file_line": _error_file_line(exc),
+            "traceback": "".join(tb_mod.format_exception(type(exc), exc, exc.__traceback__)),
+        }
+
     if scenic_only:
         row["duration_s"] = time.monotonic() - t0
         return row
@@ -262,6 +310,38 @@ def run_condition(
         _record_failure(row, "g5", exc)
         row["duration_s"] = time.monotonic() - t0
         return row
+
+    # ---- G4 (families B/C/D) domain/consistency/affordance hook -------
+    # Runs after G5 env reset. Per-assertion {name: bool} payloads land in the
+    # JSONL row under separate keys so downstream aggregation can compute
+    # marginal fail rates per family / per axis.
+    try:
+        from libero_infinity.validation.invariants import g4_domain_consistency_hook
+        try:
+            from libero_infinity.asset_registry import ASSET_VARIANTS as _registry
+        except Exception:  # noqa: BLE001
+            _registry = None
+        _flat = g4_domain_consistency_hook(scene, env, cfg, registry=_registry)
+        # Bucket by family for compact JSONL rows: family -> {name: passed}
+        dom: dict[str, Any] = {}
+        con: dict[str, Any] = {}
+        aff: dict[str, Any] = {}
+        for k, res in _flat.items():
+            family, _, sub = k.partition(":")
+            target = {"domain": dom, "consistency": con, "affordance": aff}.get(family)
+            if target is None:
+                continue
+            target[sub] = res.passed  # may be True / False / None (honest skip)
+        row["g4_domain"] = dom
+        row["g4_consistency"] = con
+        row["g4_affordance"] = aff
+    except Exception as exc:  # noqa: BLE001 — recorded, not swallowed
+        row["g4_domain_error"] = {
+            "error_class": type(exc).__name__,
+            "error_msg": str(exc)[:2000],
+            "error_file_line": _error_file_line(exc),
+            "traceback": "".join(tb_mod.format_exception(type(exc), exc, exc.__traceback__)),
+        }
 
     # ---- G6: render + 5 noop steps ------------------------------------
     try:
