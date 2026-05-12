@@ -52,7 +52,7 @@ from typing import Any
 _REPO_ROOT = pathlib.Path(__file__).parent.parent.resolve()
 _SRC_PATH = _REPO_ROOT / "src"
 _BDDL_DIR = _REPO_ROOT / "src" / "libero_infinity" / "data" / "libero_runtime" / "bddl_files"
-_SCENIC_GEN_FILE = _REPO_ROOT / "src" / "libero_infinity" / "scenic_generator.py"
+_COMPILER_FILE = _REPO_ROOT / "src" / "libero_infinity" / "compiler.py"
 _SCRIPTS_DIR = _REPO_ROOT / "scripts"
 
 # Ensure src is on the path for all workers too.
@@ -74,7 +74,7 @@ SETTLE_WORKSPACE_MARGIN = 0.03
 DRIFT_TARGET_95PCT = 0.05   # 95th percentile xy drift target (metres)
 HARD_FAILURE_RATE_TARGET = 0.0  # fraction of scenes allowed to hard-fail
 
-# Current (uncalibrated) default values in scenic_generator.py
+# Current (uncalibrated) default values in compiler.py / renderer
 CURRENT_DEFAULTS = {
     "min_clearance": 0.10,
     "workspace_margin": 0.05,
@@ -424,7 +424,7 @@ def _measure_real(
     import mujoco
 
     from libero_infinity.task_config import TaskConfig
-    from libero_infinity.scenic_generator import generate_scenic
+    from libero_infinity.compiler import generate_scenic
     from libero_infinity.simulator import (
         TABLE_X_MIN, TABLE_X_MAX, TABLE_Y_MIN, TABLE_Y_MAX,
         DEFAULT_ORIENTATIONS,
@@ -932,7 +932,7 @@ def _log_step(s: StepSummary, label: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Write-back to scenic_generator.py
+# Write-back to compiler defaults
 # ---------------------------------------------------------------------------
 
 def write_recommended_values(
@@ -940,7 +940,7 @@ def write_recommended_values(
     dry_run: bool = True,
     out_file: pathlib.Path | None = None,
 ) -> None:
-    """Patch the default parameter values in scenic_generator.py.
+    """Patch the default parameter values in the compiler pipeline.
 
     Only ``min_clearance``, ``workspace_margin``, and ``distractor_clearance``
     are patched — these are the default argument values in ``generate_scenic()``.
@@ -948,11 +948,11 @@ def write_recommended_values(
     Args:
         recommendations: Mapping param_name → recommended_value.
         dry_run:          If True, print the diff but do not write.
-        out_file:         Override output path (default: scenic_generator.py).
+        out_file:         Override output path (default: compiler.py).
     """
-    target = out_file or _SCENIC_GEN_FILE
+    target = out_file or _COMPILER_FILE
     if not target.exists():
-        log.warning("scenic_generator.py not found at %s, skipping write-back", target)
+        log.warning("compiler.py not found at %s, skipping write-back", target)
         return
 
     src = target.read_text()
@@ -1109,13 +1109,13 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run",
         action="store_true",
         dest="dry_run",
-        help="Print recommended values but do not write back to scenic_generator.py.",
+        help="Print recommended values but do not write back to compiler.py.",
     )
     parser.add_argument(
         "--write-back",
         action="store_true",
         dest="write_back",
-        help="Write recommended values to scenic_generator.py (default: dry-run only).",
+        help="Write recommended values to compiler.py (default: dry-run only).",
     )
     parser.add_argument(
         "--output",
