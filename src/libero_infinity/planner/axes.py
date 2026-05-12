@@ -220,154 +220,228 @@ def plan_object(
 # ---------------------------------------------------------------------------
 
 
-def plan_articulation(
+_CANONICAL_DEFAULTS = {"microwave": "Close", "cabinet": "Close", "stove": "Turnoff"}
+
+
+def _fixture_baseline_for_node(
+    node: FixtureNode,
     graph: SemanticSceneGraph,
-    request_axes: frozenset[str],
     diagnostics: PlanDiagnostics,
-) -> dict[str, ArticulationPlan]:
-    """Plan initial articulation states for articulatable fixtures.
+) -> ArticulationPlan | None:
+    """Resolve a single fixture's baseline ArticulationPlan, or None."""
+    art_model = graph.articulation_model
+    fixture_class = node.object_class
+    ranges = art_model.articulation_ranges.get(fixture_class)
+    if not ranges:
+        return None
+    family = art_model.get_family(fixture_class)
+    if family is None:
+        return None
+    family_name, _ = family
 
-    Two emission paths:
-
-    1. **Goal-reachability override (always active).** When the BDDL goal
-       requires the robot to place an object *inside* an articulated fixture
-       (``In <obj> <fixture_region>`` with ``contained=True``), the fixture
-       must be Open at init regardless of which perturbation axes the user
-       requested — otherwise the goal is geometrically unreachable.
-    2. **Articulation axis (gated).** When ``"articulation"`` is in
-       ``request_axes`` the planner additionally perturbs articulatable
-       fixtures whose canonical init state is *not* dictated by goal
-       reachability (e.g. opening the microwave for a "put-on-table" task).
-
-    The previous implementation always emitted an "Open" plan for every
-    microwave/cabinet — silently turning the canonical (no-perturbation)
-    baseline into an *already-perturbed* environment for any task with one
-    of those fixtures. That broke benchmark comparability: any reported
-    "no-perturbation" success rate was actually measured on a perturbed
-    init state. Gating non-mandatory plans on the axis request restores
-    parity between the BDDL canonical state and the planner's "no axes"
-    baseline.
-
-    Args:
-        graph: The semantic scene graph for the task.
-        request_axes: Set of active perturbation axis names.
-        diagnostics: Diagnostics collector.
-
-    Returns:
-        Dict mapping fixture instance_name -> ArticulationPlan.
-    """
-    result: dict[str, ArticulationPlan] = {}
-    axis_requested = "articulation" in request_axes
-
-    for node_id, node in graph.nodes.items():
-        if not isinstance(node, FixtureNode):
+    fixture_region_names: set[str] = {
+        region.instance_name
+        for region in graph.nodes.values()
+        if getattr(region, "target", None) == node.instance_name
+    }
+    need_open_at_init = False
+    for edge in graph.edges:
+        if edge.label != "goal_target":
             continue
-        if not node.is_articulatable:
-            continue
-
-        fixture_class = node.object_class
-        art_model = graph.articulation_model
-        ranges = art_model.articulation_ranges.get(fixture_class)
-        if not ranges:
-            continue
-
-        # Check if any object must end up *inside* this fixture (In goal).
-        # We can't rely on ``ObjectNode.contained`` here because that flag
-        # captures *initial* containment from the BDDL ``:init`` block, not
-        # *goal* containment from the ``:goal`` block. We instead parse the
-        # goal text directly for ``(In <obj> <region>)`` predicates whose
-        # region is anchored to this fixture (either by name match or by
-        # the region node's ``target`` attribute).
-        need_open_at_init = False
-        fixture_region_names: set[str] = {
-            region.instance_name
-            for region in graph.nodes.values()
-            if getattr(region, "target", None) == node.instance_name
-        }
-        for edge in graph.edges:
-            if edge.label != "goal_target":
-                continue
-            # Match either a region whose target is this fixture, or a
-            # region name that contains the fixture's instance name as a
-            # substring (covers BDDL region patterns like
-            # ``<fixture>_<sub>_region`` even when the RegionNode wasn't
-            # registered with a matching target).
-            in_fixture_region = (
-                edge.dst_id in fixture_region_names or node.instance_name in edge.dst_id
-            )
-            if not in_fixture_region:
-                continue
-            # The graph_builder doesn't preserve the predicate kind
-            # (On/In) on the edge — treat any goal_target into a fixture-
-            # anchored region as a containment requirement. This is
-            # conservative: if the BDDL says (On X <fixture_region>) we'd
-            # also flag Open. That matches the original behaviour for the
-            # axis-requested case and the previous always-Open logic; the
-            # alternative (false negative) silently breaks goal
-            # reachability for In-style goals which is far worse.
+        if edge.dst_id in fixture_region_names or node.instance_name in edge.dst_id:
             need_open_at_init = True
             break
 
-        # If the axis isn't requested AND there's no goal-reachability
-        # requirement, leave the fixture alone — its BDDL canonical init
-        # state is what the simulator should load.
-        if not axis_requested and not need_open_at_init:
-            continue
+    state_kind: str | None = node.init_state_kind
+    if state_kind is not None:
+        reason = f"BDDL :init asserts {state_kind}"
+        if need_open_at_init and state_kind in ("Close", "Turnoff"):
+            diagnostics.narrow_axis(
+                "articulation",
+                f"{node.node_id}: BDDL :init '{state_kind}' conflicts with "
+                f"goal-reachability open requirement",
+            )
+    elif need_open_at_init:
+        state_kind = "Turnon" if family_name == "stove" else "Open"
+        reason = "goal requires interior access — init must be Open"
+    else:
+        state_kind = _CANONICAL_DEFAULTS.get(family_name)
+        if state_kind is None:
+            state_kind = next(iter(ranges))
+            diagnostics.narrow_axis(
+                "articulation",
+                f"{node.node_id}: unknown family '{family_name}' — "
+                f"defaulting baseline to first state '{state_kind}'",
+            )
+            reason = f"unknown family '{family_name}' — first state"
+        else:
+            reason = f"canonical family default for {family_name}"
 
-        # Determine initial state kind and range
+    state_range = ranges.get(state_kind)
+    if state_range is None:
+        diagnostics.narrow_axis(
+            "articulation",
+            f"{node.node_id}: baseline state_kind '{state_kind}' not in "
+            f"ranges {list(ranges)}",
+        )
+        return None
+    lo, hi = state_range
+    return ArticulationPlan(
+        fixture_name=node.instance_name,
+        state_kind=state_kind,
+        lo=lo,
+        hi=hi,
+        reason=f"baseline: {reason}",
+        goal_reachability_ok=True,
+    )
+
+
+def compute_baseline_articulation(
+    graph: SemanticSceneGraph,
+    diagnostics: PlanDiagnostics,
+) -> dict[str, ArticulationPlan]:
+    """Compute the *baseline* articulation state required by BDDL ``:init``.
+
+    A baseline plan encodes a TASK PRECONDITION — the asserted fixture state
+    at task init. It must be applied to the simulator regardless of which
+    perturbation axes are active, because the task's feasibility depends on
+    it (e.g. an ``On(bowl, cabinet_top_side)`` init pose for a closed cabinet
+    vs. an open-drawer cabinet are not interchangeable).
+
+    Sources, in priority order:
+
+    1. BDDL ``:init`` predicate ``(Open|Close|Turnon|Turnoff <fixture>)`` (or
+       its region-target form ``(Open <fixture>_top_region)``), parsed into
+       ``FixtureNode.init_state_kind`` by the graph builder.
+    2. Goal-reachability override: when ``:goal`` references a region
+       anchored to an articulated fixture, the fixture must be Open at init.
+    3. Canonical family default: cabinets/microwaves → Close, stoves →
+       Turnoff. Used only when (1) and (2) are silent.
+
+    Returns:
+        Dict mapping fixture instance_name -> ArticulationPlan that
+        the simulator MUST apply.
+    """
+    result: dict[str, ArticulationPlan] = {}
+    for node in graph.nodes.values():
+        if not isinstance(node, FixtureNode) or not node.is_articulatable:
+            continue
+        plan_entry = _fixture_baseline_for_node(node, graph, diagnostics)
+        if plan_entry is not None:
+            result[node.instance_name] = plan_entry
+    return result
+
+
+def plan_articulation_perturbation(
+    graph: SemanticSceneGraph,
+    baseline: dict[str, ArticulationPlan],
+    request_axes: frozenset[str],
+    diagnostics: PlanDiagnostics,
+) -> dict[str, ArticulationPlan]:
+    """Sample an articulation-axis overlay on top of the baseline.
+
+    Invariant: the perturbation MUST stay within the feasible set defined
+    by the BDDL ``:init`` predicates and the goal-reachability override.
+    Concretely, if the baseline state is ``Open`` (or ``Turnon``) — either
+    because BDDL ``:init`` asserts it or because the goal requires
+    interior access — the perturbation is restricted to varying the open
+    *angle* within the baseline's Open band rather than flipping the
+    state to ``Close`` (which would invalidate the task precondition).
+
+    When the baseline is the canonical family default (no :init, no
+    goal constraint), the perturbation is free to flip to the opposite
+    state since either is task-compatible.
+
+    The returned dict contains only **overrides** — entries whose
+    ``state_kind`` or ``lo/hi`` differs from the baseline. Callers merge
+    these into the baseline; non-overridden fixtures retain their
+    baseline plan unchanged. Empty when ``"articulation"`` is not in
+    ``request_axes``.
+    """
+    if "articulation" not in request_axes:
+        return {}
+
+    result: dict[str, ArticulationPlan] = {}
+    art_model = graph.articulation_model
+
+    for node_id, node in graph.nodes.items():
+        if not isinstance(node, FixtureNode) or not node.is_articulatable:
+            continue
+        fixture_class = node.object_class
+        ranges = art_model.articulation_ranges.get(fixture_class)
+        if not ranges:
+            continue
         family = art_model.get_family(fixture_class)
         if family is None:
             continue
+        family_name, _ = family
 
-        family_name, _kind = family
+        base = baseline.get(node.instance_name)
+        # If BDDL :init or goal pins the state, perturbation is constrained
+        # to that state's range (variation in angle only). Otherwise the
+        # perturbation may flip to the family's "active" state.
+        pinned = node.init_state_kind is not None or (
+            base is not None and not base.reason.endswith("canonical_default")
+            and "canonical family default" not in base.reason
+        )
+        if pinned and base is not None:
+            # Same state_kind as baseline; perturbation does not deviate
+            # from the asserted feasible set. (Future: widen lo/hi sub-band
+            # within the same state to introduce real angle variation.)
+            continue
 
+        # Free to choose the "active" perturbation state.
         if family_name in ("microwave", "cabinet"):
-            if need_open_at_init:
-                state_kind = "Open"
-                reason = "goal requires interior access — init must be Open"
-            else:
-                # axis_requested implied here (we returned earlier otherwise).
-                state_kind = "Open"
-                reason = "articulation axis requested — Open init"
+            state_kind = "Open"
         elif family_name == "stove":
-            # Stove starts off by default; goal is typically to turn it on.
-            state_kind = "Turnoff"
-            reason = "stove default init — Turnoff"
-            # Bug 17 fix: surface the silent fallback as a diagnostic.
+            state_kind = "Turnon"
             diagnostics.narrow_axis(
                 "articulation",
-                f"{node_id}: stove fixture defaulted to 'Turnoff' init state",
+                f"{node_id}: stove articulation perturbation set to Turnon",
             )
         else:
-            # Unknown family: use first available state.
             state_kind = next(iter(ranges))
-            reason = f"unknown family '{family_name}' — using first state"
-            # Bug 17 fix: surface the silent fallback as a diagnostic.
             diagnostics.narrow_axis(
                 "articulation",
-                f"{node_id}: unknown family '{family_name}' — defaulting to "
-                f"first state '{state_kind}'",
+                f"{node_id}: unknown family '{family_name}' — perturbation "
+                f"defaulting to first state '{state_kind}'",
             )
 
         state_range = ranges.get(state_kind)
         if state_range is None:
-            diagnostics.narrow_axis(
-                "articulation",
-                f"{node_id}: state_kind '{state_kind}' not in ranges {list(ranges)}",
-            )
             continue
-
         lo, hi = state_range
+        if base is not None and base.state_kind == state_kind:
+            # Already at this state in the baseline — no override needed.
+            continue
         result[node.instance_name] = ArticulationPlan(
             fixture_name=node.instance_name,
             state_kind=state_kind,
             lo=lo,
             hi=hi,
-            reason=reason,
+            reason=f"articulation axis perturbation — {state_kind}",
             goal_reachability_ok=True,
         )
-
     return result
+
+
+def plan_articulation(
+    graph: SemanticSceneGraph,
+    request_axes: frozenset[str],
+    diagnostics: PlanDiagnostics,
+) -> dict[str, ArticulationPlan]:
+    """Convenience wrapper combining baseline + axis-gated perturbation.
+
+    Returns the union: baseline plans for every articulated fixture (always
+    applied), with any perturbation overrides layered on top when the
+    articulation axis is requested. See :func:`compute_baseline_articulation`
+    and :func:`plan_articulation_perturbation` for the semantic split.
+    """
+    baseline = compute_baseline_articulation(graph, diagnostics)
+    overrides = plan_articulation_perturbation(graph, baseline, request_axes, diagnostics)
+    merged: dict[str, ArticulationPlan] = dict(baseline)
+    merged.update(overrides)
+    return merged
 
 
 # ---------------------------------------------------------------------------

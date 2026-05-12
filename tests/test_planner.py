@@ -1556,3 +1556,116 @@ def test_check_envelope_quality_keeps_all_valid_envelopes() -> None:
 
     assert len(plan.position_plans) == 3, "_check_envelope_quality must not remove any valid plans"
     assert "position" not in diag.dropped_axes
+
+
+# ---------------------------------------------------------------------------
+# Baseline / perturbation articulation split (PR #6 z-height fix)
+# ---------------------------------------------------------------------------
+
+
+def _build_graph_from(bddl_text: str, tmp_path) -> SemanticSceneGraph:
+    p = tmp_path / "task.bddl"
+    p.write_text(bddl_text)
+    cfg = TaskConfig.from_bddl(p)
+    return build_semantic_scene_graph(cfg)
+
+
+def _stove_bowl_bddl() -> str:
+    """Minimal BDDL where bowl_2 starts On(cabinet_top_side) — no :init Open."""
+    return (
+        "(define (problem demo) (:domain robosuite)\n"
+        "(:language test)\n"
+        "(:regions (top_side (:target wooden_cabinet_1)) "
+        "(plate_region (:target main_table) (:ranges ((0.0 0.0 0.05 0.05)))))\n"
+        "(:fixtures\nmain_table - table\nwooden_cabinet_1 - wooden_cabinet\n)\n"
+        "(:objects akita_black_bowl_1 - akita_black_bowl plate_1 - plate)\n"
+        "(:obj_of_interest akita_black_bowl_1 plate_1)\n"
+        "(:init (On akita_black_bowl_1 wooden_cabinet_1_top_side) "
+        "(On plate_1 main_table_plate_region) "
+        "(On wooden_cabinet_1 main_table))\n"
+        "(:goal (And (On akita_black_bowl_1 plate_1))))"
+    )
+
+
+def _opencabinet_bddl() -> str:
+    """BDDL where :init asserts (Open wooden_cabinet_1_top_region)."""
+    return (
+        "(define (problem demo) (:domain robosuite)\n"
+        "(:language test)\n"
+        "(:regions (top_region (:target wooden_cabinet_1)) "
+        "(table_center (:target main_table) (:ranges ((-0.05 -0.05 0.05 0.05)))))\n"
+        "(:fixtures\nmain_table - table\nwooden_cabinet_1 - wooden_cabinet\n)\n"
+        "(:objects akita_black_bowl_1 - akita_black_bowl)\n"
+        "(:obj_of_interest akita_black_bowl_1)\n"
+        "(:init (On akita_black_bowl_1 main_table_table_center) "
+        "(On wooden_cabinet_1 main_table) "
+        "(Open wooden_cabinet_1_top_region))\n"
+        "(:goal (And (On akita_black_bowl_1 main_table_table_center))))"
+    )
+
+
+def test_baseline_articulation_canonical_default_when_no_init_predicate(tmp_path):
+    """No :init Open/Close → baseline is canonical default (Close for cabinets)."""
+    from libero_infinity.planner.axes import compute_baseline_articulation
+
+    graph = _build_graph_from(_stove_bowl_bddl(), tmp_path)
+    diag = PlanDiagnostics()
+    baseline = compute_baseline_articulation(graph, diag)
+    assert "wooden_cabinet_1" in baseline
+    assert baseline["wooden_cabinet_1"].state_kind == "Close"
+
+
+def test_baseline_articulation_honours_bddl_init_open(tmp_path):
+    """``(Open wooden_cabinet_1_top_region)`` in :init → baseline.state_kind == Open."""
+    from libero_infinity.planner.axes import compute_baseline_articulation
+
+    graph = _build_graph_from(_opencabinet_bddl(), tmp_path)
+    diag = PlanDiagnostics()
+    baseline = compute_baseline_articulation(graph, diag)
+    assert "wooden_cabinet_1" in baseline
+    assert baseline["wooden_cabinet_1"].state_kind == "Open"
+
+
+def test_baseline_articulation_applied_without_articulation_axis(tmp_path):
+    """plan_perturbations with axis={position} must still emit the baseline plan."""
+    graph = _build_graph_from(_opencabinet_bddl(), tmp_path)
+    plan = plan_perturbations(graph, frozenset(["position"]))
+    assert "wooden_cabinet_1" in plan.articulation_plans
+    assert plan.articulation_plans["wooden_cabinet_1"].state_kind == "Open"
+
+
+def test_articulation_perturbation_cannot_close_required_open_fixture(tmp_path):
+    """When :init asserts Open, the articulation axis perturbation must NOT
+    flip the fixture to Close — that would invalidate the task precondition."""
+    from libero_infinity.planner.axes import (
+        compute_baseline_articulation,
+        plan_articulation_perturbation,
+    )
+
+    graph = _build_graph_from(_opencabinet_bddl(), tmp_path)
+    diag = PlanDiagnostics()
+    baseline = compute_baseline_articulation(graph, diag)
+    overrides = plan_articulation_perturbation(
+        graph, baseline, frozenset(["articulation"]), diag
+    )
+    # The pinned fixture must not appear as an override (or, if it does,
+    # must remain in the Open state). Either way: state_kind stays Open.
+    final = dict(baseline)
+    final.update(overrides)
+    assert final["wooden_cabinet_1"].state_kind == "Open"
+
+
+def test_articulation_perturbation_no_axis_returns_empty_overrides(tmp_path):
+    """``"articulation"`` not in request_axes → no override overlay."""
+    from libero_infinity.planner.axes import (
+        compute_baseline_articulation,
+        plan_articulation_perturbation,
+    )
+
+    graph = _build_graph_from(_stove_bowl_bddl(), tmp_path)
+    diag = PlanDiagnostics()
+    baseline = compute_baseline_articulation(graph, diag)
+    overrides = plan_articulation_perturbation(
+        graph, baseline, frozenset(["position"]), diag
+    )
+    assert overrides == {}

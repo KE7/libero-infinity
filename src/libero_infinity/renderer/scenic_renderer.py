@@ -109,6 +109,9 @@ def _collect_support_relations(
         "contained_in": "inside",
         "stacked_on": "stacked",
     }
+    seen: set[tuple[str, str]] = set()
+
+    # 1. Relations implied by the position plan (relative-positioning entries).
     for child_name, pp in plan.position_plans.items():
         if pp is None:
             continue
@@ -123,6 +126,7 @@ def _collect_support_relations(
                 break
         support_node = graph.get_node(pp.support_name)
         is_fixture = isinstance(support_node, FixtureNode)
+        seen.add((child_name, pp.support_name))
         relations.append(
             _SupportRelation(
                 child_var=_to_var(child_name),
@@ -130,6 +134,32 @@ def _collect_support_relations(
                 child_name=child_name,
                 support_name=pp.support_name,
                 kind=kind,
+                support_is_fixture=is_fixture,
+            )
+        )
+
+    # 2. Declared-but-not-relative support edges. The BDDL author asserted
+    # the child rests on / sits inside the support; even if the planner
+    # chose absolute (workspace-coord) sampling for the child, the pair is
+    # still semantically a support relation. We must suppress the
+    # ``distance(child, fixture) > clearance`` constraint for it — that
+    # constraint would forbid the BDDL-declared placement entirely (e.g.
+    # ``On(bowl, cabinet_top_side)`` with bowl sampled near cabinet xy).
+    for edge in graph.edges:
+        if edge.label not in edge_kind_by_label:
+            continue
+        if (edge.src_id, edge.dst_id) in seen:
+            continue
+        support_node = graph.get_node(edge.dst_id)
+        is_fixture = isinstance(support_node, FixtureNode)
+        seen.add((edge.src_id, edge.dst_id))
+        relations.append(
+            _SupportRelation(
+                child_var=_to_var(edge.src_id),
+                support_var=_to_var(edge.dst_id),
+                child_name=edge.src_id,
+                support_name=edge.dst_id,
+                kind=edge_kind_by_label[edge.label],
                 support_is_fixture=is_fixture,
             )
         )
@@ -455,9 +485,17 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         if scenic_class:
             specifiers.append(f"with asset_class {scenic_class}")
         specifiers.append(f'with libero_name "{obj_name}"')
-        # support_parent_name is read by the simulator to skip footprint overlap
-        # validation between an object and the movable surface it sits on.
-        if pos_plan is not None and pos_plan.use_relative_positioning and pos_plan.support_name:
+        # support_parent_name is read by the simulator both to skip
+        # footprint-overlap validation between the object and its declared
+        # support, and (when the object is treated as a "supported child"
+        # in the simulator's z-snap logic) to lift the object above the
+        # support's AABB top. The latter behaviour is gated on the support
+        # NOT being a fixed FixtureNode — see ``simulator.py`` use of
+        # ``support_parent_name``. We emit the property whenever a support
+        # is known so the validator skips the AABB-overlap reject for the
+        # author-declared pair, even when the planner chose absolute (not
+        # relative) sampling for the child.
+        if pos_plan is not None and pos_plan.support_name:
             specifiers.append(f'with support_parent_name "{pos_plan.support_name}"')
 
         lines.append(f"{var_name} = new LIBEROObject " + ", ".join(specifiers))

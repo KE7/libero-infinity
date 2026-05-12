@@ -343,7 +343,19 @@ def _plan_object_position(
             rel_y_lo, rel_y_hi = _clip_relative_to_table(parent_node, rel_y_lo, rel_y_hi, "y")
         return AxisEnvelope(rel_x_lo, rel_x_hi, "x"), AxisEnvelope(rel_y_lo, rel_y_hi, "y")
 
-    # Compute envelope based on support relationship
+    # Compute envelope based on support relationship.
+    #
+    # Note: ``supported_by`` into a fixed FixtureNode (e.g. ``On bowl
+    # cabinet_top_side``) does NOT use relative positioning. The BDDL author
+    # asserted a placement on a fixed-world surface; the position-axis
+    # perturbation must vary the bowl's xy *in absolute workspace
+    # coordinates*, not as an offset that pins the bowl to the cabinet
+    # body. Pinning to the fixture (via ``use_relative_positioning=True``)
+    # was the source of PR #6 z-height regression: it caused the simulator
+    # to lift the bowl to the cabinet's AABB top (~+0.49 m) regardless of
+    # whether the cabinet exterior or workspace top was the intended rest
+    # surface. Relative positioning is reserved for ``stacked_on`` (movable
+    # stack) and ``contained_in`` (fixture/movable interior) edges.
     if is_stacked:
         # Keep stacked objects on a bounded support footprint around the parent
         # anchor. This avoids task-specific fallback constants and prevents
@@ -356,8 +368,22 @@ def _plan_object_position(
         r = _DEFAULT_PERTURB_RADIUS
         x_env = AxisEnvelope(cx - r, cx + r, "x")
         y_env = AxisEnvelope(cy - r, cy + r, "y")
+    elif isinstance(support_node, FixtureNode):
+        # Fixed fixture support (cabinet, stove, …) — the BDDL author placed
+        # the object on the fixture's exterior surface (``cook_region``,
+        # ``top_side``, …), but the position-axis perturbation must NOT
+        # leave the object overlapping the fixture's footprint (the test
+        # ``test_position_perturbation_avoids_fixed_fixture_contacts`` is
+        # the canonical regression for this). We therefore centre the
+        # absolute envelope on the *workspace origin* rather than the
+        # fixture's xy — same anchor pre-c81df1d used implicitly because
+        # the object's ``init_x/y`` were unresolved for unbounded regions
+        # (e.g. ``cook_region``).
+        r = _FIXTURE_PERTURB_RADIUS
+        x_env = AxisEnvelope(-r, r, "x")
+        y_env = AxisEnvelope(-r, r, "y")
     else:
-        # Fixture or movable support: tighter perturbation around init position
+        # Movable support (e.g. cookies box) — keep relative.
         x_env, y_env = _clamped_relative_envelope(support_node, node)
 
     # Range degeneracy guard
@@ -404,7 +430,15 @@ def _plan_object_position(
         x_envelope=x_env,
         y_envelope=y_env,
         support_name=edge.dst_id,
-        use_relative_positioning=is_stacked or not isinstance(support_node, WorkspaceNode),
+        # Only stacked-on movable objects or contained-in fixtures retain
+        # relative positioning. Fixed-fixture exterior supports
+        # (``supported_by``) sample in absolute coords — see note above
+        # in the envelope-selection block.
+        use_relative_positioning=is_stacked
+        or (
+            not isinstance(support_node, WorkspaceNode)
+            and not isinstance(support_node, FixtureNode)
+        ),
         exclusion_zones=exclusion_zones,
         exclusion_min_distance=exclusion_min_distance,
     )

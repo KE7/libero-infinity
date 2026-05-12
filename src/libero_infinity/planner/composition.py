@@ -17,7 +17,8 @@ from libero_infinity.ir.nodes import (
 )
 from libero_infinity.ir.scene_graph import SemanticSceneGraph
 from libero_infinity.planner.axes import (
-    plan_articulation,
+    compute_baseline_articulation,
+    plan_articulation_perturbation,
     plan_background,
     plan_camera,
     plan_distractor,
@@ -117,14 +118,20 @@ def plan_perturbations(
     if "robot" in axes:
         plan.robot_plan = plan_robot(graph, axes, diagnostics)
 
-    # Articulation is planned unconditionally — even when the caller did not
-    # request the "articulation" axis. Goal predicates frequently reference
-    # fixture joints (drawer open/closed, stove on/off), so leaving fixtures in
-    # their raw BDDL defaults can trivialise or trap the goal. ``plan_articulation``
-    # restricts itself to goal-reachable bands when "articulation" is absent
-    # from ``axes`` and only widens to the full safe band when it is requested.
+    # Articulation is composed in two semantic layers (always-on baseline +
+    # axis-gated perturbation overlay). The baseline encodes BDDL :init
+    # predicates and goal-reachability — both are task PRECONDITIONS that
+    # must be applied regardless of which perturbation axes are active. The
+    # overlay is sampled only when ``"articulation"`` is in ``axes`` and is
+    # constrained to remain compatible with the baseline (it cannot close
+    # a fixture that BDDL :init requires Open, etc.).
     # See docs/scenic_perturbations.md#articulation-perturbation.
-    plan.articulation_plans = plan_articulation(graph, axes, diagnostics)
+    baseline_articulation = compute_baseline_articulation(graph, diagnostics)
+    articulation_overrides = plan_articulation_perturbation(
+        graph, baseline_articulation, axes, diagnostics
+    )
+    plan.articulation_plans = dict(baseline_articulation)
+    plan.articulation_plans.update(articulation_overrides)
 
     if "camera" in axes:
         plan.camera_plan = plan_camera(graph, axes, diagnostics)

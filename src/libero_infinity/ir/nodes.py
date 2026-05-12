@@ -76,6 +76,14 @@ class FixtureNode(SceneNode):
     init_y: float | None = None
     init_yaw: float | None = None
     is_articulatable: bool = False
+    # BDDL ``:init`` predicate state for this articulated fixture, if any.
+    # One of {"Open", "Close", "Turnon", "Turnoff"}. ``None`` means the BDDL
+    # author did not assert an articulation state at task init — the planner
+    # falls back to the canonical default (closed cabinets/microwaves, off
+    # stoves). This field encodes a TASK PRECONDITION: it must be applied
+    # to the simulator init regardless of which perturbation axes are
+    # active, since the task's solvability depends on it.
+    init_state_kind: str | None = None
 
     def __post_init__(self) -> None:
         self.node_type = "fixture"

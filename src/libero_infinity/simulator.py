@@ -931,8 +931,26 @@ class LIBEROSimulation(Simulation):
             # support_parent_name is broader: it is also used for ordinary
             # "On" support stacks such as bowl-on-ramekin or bowl-on-stove.
             is_contained = libero_name in contained_object_names
+            # A "supported child" inherits z from its support (e.g. bowl on a
+            # cookies box) and gets lifted above the support's AABB top in
+            # ``_restack_supported_children``. That behaviour is correct for
+            # MOVABLE supports (stack relationships) but incorrect for
+            # FIXED FIXTURE exterior supports — there, the position planner
+            # samples the child's xy in absolute workspace coords and
+            # expects the child to settle on the WORKSPACE (table) surface,
+            # not be teleported to the fixture's AABB top. We treat the
+            # child as "supported" only when its declared support is NOT a
+            # fixed fixture (or it is contained inside one).
+            raw_support_parent = support_parent_names.get(libero_name, "")
+            support_is_fixed_fixture = bool(raw_support_parent) and any(
+                getattr(o, "libero_name", "") == raw_support_parent
+                and getattr(o, "graspable", True) is False
+                for o in self.scene.objects
+            )
             is_supported_child = (
-                bool(support_parent_names.get(libero_name, "")) and not is_contained
+                bool(raw_support_parent)
+                and not is_contained
+                and not support_is_fixed_fixture
             )
             # Use LIBERO's default support height only when the generated
             # Scenic object explicitly opts into it AND the object starts near
@@ -992,8 +1010,25 @@ class LIBEROSimulation(Simulation):
                 mujoco.mj_step(mjmodel, mjdata)
             mjdata.qvel[:] = 0
             mujoco.mj_forward(mjmodel, mjdata)
+            # Restrict the re-stack lift to genuine stack relationships
+            # (movable supports). Fixed-fixture exterior supports such as
+            # ``On(bowl, cabinet_top_side)`` are recorded in
+            # ``support_parent_names`` so the validator skips the AABB
+            # overlap pair-check, but the child is intentionally sampled on
+            # the workspace, not on the fixture's AABB top — lifting it
+            # would re-introduce the PR #6 z-height regression.
+            fixture_support_names = {
+                getattr(o, "libero_name", "")
+                for o in self.scene.objects
+                if getattr(o, "graspable", True) is False
+            }
+            stack_support_parent_names = {
+                child: parent
+                for child, parent in support_parent_names.items()
+                if parent not in fixture_support_names
+            }
             self._restack_supported_children(
-                support_parent_names=support_parent_names,
+                support_parent_names=stack_support_parent_names,
                 contained_object_names=contained_object_names,
             )
             mjdata.qvel[:] = 0
@@ -1551,6 +1586,15 @@ class LIBEROSimulation(Simulation):
                 "light_ambient": np.array(m.light_ambient, dtype=float, copy=True),
                 "mat_texid": np.array(m.mat_texid, dtype=int, copy=True),
                 "headlight_ambient": np.array(m.vis.headlight.ambient, dtype=float, copy=True),
+                # body_pos / body_quat must be snapshotted too: the
+                # ``_inject_object_pose`` and ``_restack_supported_children``
+                # paths write directly to ``sim.model.body_pos[id]`` (and
+                # occasionally body_quat) as a fallback when a body has no
+                # free joint. Without a baseline restore, those writes
+                # persist into subsequent resets and compound across
+                # episodes (RCA: ~/.omar/ea/4/pr6_zheight_rca.md §3).
+                "body_pos": np.array(m.body_pos, dtype=float, copy=True),
+                "body_quat": np.array(m.body_quat, dtype=float, copy=True),
             }
         except Exception as exc:
             log.debug("Model baseline capture failed: %s", exc)
@@ -1578,6 +1622,10 @@ class LIBEROSimulation(Simulation):
             m.light_ambient[:] = baseline["light_ambient"]
             m.mat_texid[:] = baseline["mat_texid"]
             m.vis.headlight.ambient[:] = baseline["headlight_ambient"]
+            if "body_pos" in baseline:
+                m.body_pos[:] = baseline["body_pos"]
+            if "body_quat" in baseline:
+                m.body_quat[:] = baseline["body_quat"]
         except Exception as exc:
             log.debug("Model baseline restore failed: %s", exc)
 
