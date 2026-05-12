@@ -177,6 +177,46 @@ def plan_object(
                         f"{contained_edges[0].dst_id}",
                     )
 
+        # Container-affordance preservation: if any other node in the graph
+        # declares this node as its containment parent (i.e. a goal predicate
+        # references ``<this_instance>_contain_region``), every viable variant
+        # MUST expose a ``contain_region`` site in its MJCF. Otherwise LIBERO's
+        # ``_load_sites_in_arena`` cannot register ``<inst>_contain_region`` in
+        # ``object_states_dict`` and ``_eval_predicate`` raises ``KeyError`` on
+        # the first ``check_success()`` call. See
+        # ``rca/stage3_run2b_contain_region_family.md`` for the failure
+        # signature (basket/tray/caddy family, 29 % G5 fail rate post
+        # round-robin). The canonical class is always safe to keep because the
+        # task BDDL was authored against it; we fall back to the canonical
+        # singleton if no other variant preserves the affordance.
+        incoming_contained_edges = [
+            e for e in graph.edges if e.label == "contained_in" and e.dst_id == node_id
+        ]
+        if incoming_contained_edges:
+            from libero_infinity.asset_registry import contain_region_sites
+
+            required_sites = contain_region_sites(obj_class)
+            # A variant is safe iff it exposes every contain_region site that
+            # the canonical class does. This catches both the basket / wooden
+            # tray case (single ``contain_region``) and the desk_caddy case
+            # (four directional ``*_contain_region`` sites). If the canonical
+            # class itself has no contain_region sites we leave the pool
+            # untouched — the goal must reference a non-containment region.
+            if required_sites:
+                filtered = [
+                    v for v in variants if contain_region_sites(v) >= required_sites
+                ]
+                if filtered:
+                    variants = filtered
+                else:
+                    variants = [obj_class]
+                    diagnostics.narrow_axis(
+                        "object",
+                        f"{node_id}: no variants preserve contain_region sites "
+                        f"{sorted(required_sites)!r} required by goal predicate; "
+                        f"pinning to canonical {obj_class!r}",
+                    )
+
         # Stacking dimensional check: variant footprint must fit on support.
         # The previous 20% over-footprint tolerance silently allowed stacks
         # whose centre of mass projected outside the support surface (e.g. a
