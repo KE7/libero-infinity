@@ -17,13 +17,15 @@ from libero_infinity.ir.nodes import (
 )
 from libero_infinity.ir.scene_graph import SemanticSceneGraph
 from libero_infinity.planner.axes import (
-    plan_articulation,
+    compute_baseline_articulation,
+    plan_articulation_perturbation,
     plan_background,
     plan_camera,
     plan_distractor,
     plan_lighting,
     plan_object,
     plan_robot,
+    plan_sensor_noise,
     plan_texture,
 )
 from libero_infinity.planner.position import (
@@ -52,6 +54,7 @@ AXIS_PRESETS: dict[str, frozenset[str]] = {
             "articulation",
             "background",
             "robot",
+            "sensor_noise",
         ]
     ),
 }
@@ -115,9 +118,20 @@ def plan_perturbations(
     if "robot" in axes:
         plan.robot_plan = plan_robot(graph, axes, diagnostics)
 
-    # Always plan articulation for goal-reachability safety
-    if "articulation" in axes or True:  # noqa: SIM210
-        plan.articulation_plans = plan_articulation(graph, axes, diagnostics)
+    # Articulation is composed in two semantic layers (always-on baseline +
+    # axis-gated perturbation overlay). The baseline encodes BDDL :init
+    # predicates and goal-reachability — both are task PRECONDITIONS that
+    # must be applied regardless of which perturbation axes are active. The
+    # overlay is sampled only when ``"articulation"`` is in ``axes`` and is
+    # constrained to remain compatible with the baseline (it cannot close
+    # a fixture that BDDL :init requires Open, etc.).
+    # See docs/scenic_perturbations.md#articulation-perturbation.
+    baseline_articulation = compute_baseline_articulation(graph, diagnostics)
+    articulation_overrides = plan_articulation_perturbation(
+        graph, baseline_articulation, axes, diagnostics
+    )
+    plan.articulation_plans = dict(baseline_articulation)
+    plan.articulation_plans.update(articulation_overrides)
 
     if "camera" in axes:
         plan.camera_plan = plan_camera(graph, axes, diagnostics)
@@ -129,10 +143,22 @@ def plan_perturbations(
         plan.texture_plan = plan_texture(graph, axes, diagnostics)
 
     if "distractor" in axes:
-        plan.distractor_budget, plan.distractor_classes = plan_distractor(graph, axes, diagnostics)
+        # Pass the in-progress position + object plans so the distractor
+        # planner can compute the actual remaining free area instead of
+        # relying on a global default + composition fudge factor.
+        plan.distractor_budget, plan.distractor_classes = plan_distractor(
+            graph,
+            axes,
+            diagnostics,
+            position_plans=plan.position_plans,
+            object_substitutions=plan.object_substitutions,
+        )
 
     if "background" in axes:
         plan.background_plan = plan_background(graph, axes, diagnostics)
+
+    if "sensor_noise" in axes:
+        plan.sensor_noise_plan = plan_sensor_noise(graph, axes, diagnostics)
 
     # STEP 2: Single-pass validation (7 fixed steps)
     _validate_plan(plan, graph, diagnostics)

@@ -30,6 +30,7 @@ Public API
 from __future__ import annotations
 
 import hashlib
+import os
 import pathlib
 import tempfile
 
@@ -81,6 +82,34 @@ def compile_task_to_scenic(
     graph = build_semantic_scene_graph(cfg)
     plan = plan_perturbations(graph, request)
     return render_scenic(plan, graph)
+
+
+def _planner_source_fingerprint() -> str:
+    """Hash planner/compiler source files so stale .scenic caches refresh on source edits."""
+    package_root = pathlib.Path(__file__).resolve().parent
+    source_files = [
+        package_root / "planner" / "position.py",
+        package_root / "planner" / "composition.py",
+        package_root / "renderer" / "scenic_renderer.py",
+        package_root / "compiler.py",
+    ]
+    payload = []
+    for source in source_files:
+        try:
+            payload.append(f"{source}:{source.stat().st_mtime_ns}:{source.stat().st_size}")
+            # Reading body is cheap at startup; include hash for robust change detection.
+            payload.append(hashlib.sha256(source.read_bytes()).hexdigest())
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+
+    if payload:
+        return hashlib.sha1("|".join(payload).encode("utf-8")).hexdigest()
+
+    # Fallback in odd packaging states.
+    py_path = os.environ.get("PYTHONPATH", "")
+    return hashlib.sha1(f"{package_root}:{py_path}".encode("utf-8")).hexdigest()
 
 
 def compile_task_to_scenario(
@@ -190,7 +219,10 @@ def generate_scenic_file(
     scenic_src = compile_task_to_scenic(cfg, perturbation)
 
     task_slug = _sanitize(cfg.language.lower().replace(" ", "_"))
-    path_digest = hashlib.sha1(cfg.bddl_path.encode("utf-8")).hexdigest()[:8]
+    planner_digest = _planner_source_fingerprint()
+    path_digest = hashlib.sha1(
+        f"{cfg.bddl_path}:{planner_digest}:{perturbation}".encode("utf-8")
+    ).hexdigest()[:8]
     out_path = out_dir / f"_gen_{task_slug}_{path_digest}_{perturbation}.scenic"
     out_path.write_text(scenic_src, encoding="utf-8")
     return str(out_path.resolve())

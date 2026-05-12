@@ -16,6 +16,7 @@ and are always available without any network access.
 from __future__ import annotations
 
 import importlib.resources
+import importlib.util
 import json
 import os
 import pathlib
@@ -40,9 +41,7 @@ _PARITY_ARTIFACT_NAME = "asset_parity_lerobot_libero-assets_0b3ea86b.json"
 _CACHE_ROOT = pathlib.Path.home() / ".cache" / "libero_infinity"
 _ASSETS_CACHE_DIR = _CACHE_ROOT / "assets"
 
-# vendor/libero symlink target — LIBERO's hardcoded relative asset lookup
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_VENDOR_ASSETS_LINK = _REPO_ROOT / "vendor" / "libero" / "libero" / "libero" / "assets"
 _PARITY_ARTIFACT = _REPO_ROOT / "audit" / _PARITY_ARTIFACT_NAME
 
 # Required subdirectories in any valid asset tree
@@ -94,6 +93,29 @@ def get_assets_cache_dir() -> pathlib.Path:
     return _ASSETS_CACHE_DIR
 
 
+def get_installed_libero_package_root() -> pathlib.Path | None:
+    """Return the installed top-level ``libero`` package directory, if available."""
+    try:
+        spec = importlib.util.find_spec("libero")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or spec.submodule_search_locations is None:
+        return None
+    for location in spec.submodule_search_locations:
+        path = pathlib.Path(location)
+        if path.is_dir():
+            return path
+    return None
+
+
+def get_installed_libero_assets_link() -> pathlib.Path | None:
+    """Return the package-relative asset path used by installed LIBERO code."""
+    package_root = get_installed_libero_package_root()
+    if package_root is None:
+        return None
+    return package_root / "libero" / "assets"
+
+
 # ---------------------------------------------------------------------------
 # Public bootstrap entrypoint
 # ---------------------------------------------------------------------------
@@ -108,7 +130,7 @@ def ensure_runtime(*, force_assets: bool = False) -> None:
       1. Validate the committed parity artifact (fast, no network).
       2. Resolve and validate the asset tree (downloads on first run).
       3. Write ~/.libero/config.yaml — must happen before any libero import.
-      4. Create/update the vendor/libero assets symlink.
+      4. Create/update the installed LIBERO package assets symlink.
       5. Set up robosuite macros_private.py.
 
     Args:
@@ -123,9 +145,9 @@ def ensure_runtime(*, force_assets: bool = False) -> None:
     # Step 3 — config must be written before any libero.libero.* import.
     _write_libero_config(assets_dir)
 
-    # Step 4 — validate tree and refresh symlink.
+    # Step 4 — validate tree and refresh the installed-package assets link.
     validate_asset_tree(assets_dir)
-    _refresh_vendor_symlink(assets_dir)
+    _refresh_libero_assets_link(assets_dir)
 
     # Step 5 — robosuite macros.
     _setup_robosuite_macros()
@@ -272,14 +294,16 @@ def _write_libero_config(assets_dir: pathlib.Path) -> None:
         yaml.dump(config, f)
 
 
-def _refresh_vendor_symlink(assets_dir: pathlib.Path) -> None:
-    """Keep vendor/libero/libero/libero/assets → assets_dir in sync.
+def _refresh_libero_assets_link(assets_dir: pathlib.Path) -> None:
+    """Keep the installed LIBERO package's package-relative assets path in sync.
 
     LIBERO's arena loaders resolve assets via hardcoded package-relative paths
-    (../../assets/…), so a symlink at the vendor package root is required in
+    (../../assets/…), so a symlink at the installed package root is required in
     addition to the config.yaml entry.
     """
-    target = _VENDOR_ASSETS_LINK
+    target = get_installed_libero_assets_link()
+    if target is None:
+        return
     resolved = assets_dir.resolve()
 
     if target.is_symlink():

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from libero_infinity.asset_registry import (
     DEFAULT_DISTRACTOR_POOL,
+    OBJECT_DIMENSIONS,
     UNLOADABLE_ASSET_CLASSES,
     get_dimensions,
     get_distractor_pool,
@@ -24,7 +25,13 @@ from libero_infinity.ir.nodes import (
     PlanDiagnostics,
 )
 from libero_infinity.ir.scene_graph import SemanticSceneGraph
-from libero_infinity.planner.types import BackgroundPlan, LightingPlan, RobotInitPlan, TexturePlan
+from libero_infinity.planner.types import (
+    BackgroundPlan,
+    LightingPlan,
+    RobotInitPlan,
+    SensorNoisePlan,
+    TexturePlan,
+)
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -60,7 +67,7 @@ class CameraPlan:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-_CONTAINER_INTERIOR_SCALE = 0.85  # interior ≈ 85% of bounding box dims
+_CONTAINER_INTERIOR_SCALE = 0.85  # interior ≈ 85 % of bounding box dims (z-axis only)
 _PANDA_INIT_QPOS = (
     0.0,
     -1.61037389e-01,
@@ -82,10 +89,26 @@ _PANDA_JOINT_NAMES = (
 
 
 def _container_interior_dims(container_class: str) -> tuple[float, float, float]:
-    """Return estimated interior (w, l, h) for a container fixture class."""
-    w, length, h = get_dimensions(container_class)
+    """Return estimated interior (w, l, h) for a container.
+
+    The (w, l) part is sourced from
+    ``planner.position.container_interior_xy`` so that the variant-filter
+    in ``plan_object`` and the in-container position sampler in
+    ``plan_position`` agree on what "interior" means. The height (h) is
+    still derived from the registry bounding box, scaled by
+    ``_CONTAINER_INTERIOR_SCALE`` — there is no explicit per-class
+    height table, and z-fitting is much less sensitive to the exact
+    interior estimate than xy-footprint fitting.
+    """
+    from libero_infinity.planner.position import container_interior_xy_by_class
+
+    xy = container_interior_xy_by_class(container_class)
+    _w_bbox, _l_bbox, h = get_dimensions(container_class)
+    if xy is not None:
+        return (xy[0], xy[1], h * _CONTAINER_INTERIOR_SCALE)
+    # Fallback: scale the full bounding box by the legacy 0.85 ratio.
     s = _CONTAINER_INTERIOR_SCALE
-    return (w * s, length * s, h * s)
+    return (_w_bbox * s, _l_bbox * s, h * s)
 
 
 # ---------------------------------------------------------------------------
@@ -121,11 +144,23 @@ def plan_object(
         obj_class = node.object_class
         variants = get_variants(obj_class, include_canonical=True, require_loadable=True)
 
-        # Containment-dimensional filtering: variant must fit inside container
+        # Containment-dimensional filtering: variant must fit inside container.
+        # We can only apply this filter when the container's interior dimensions
+        # are *known*. Fixture containers (microwave, cabinet, drawer, …) and
+        # any class missing from OBJECT_DIMENSIONS fall through to the
+        # conservative default (0.08 × 0.08 × 0.06), which is smaller than
+        # almost every graspable variant — silently collapsing the variant pool
+        # to the canonical class. Skipping the filter in that case preserves
+        # the full variant pool; positional sampling provides the actual
+        # geometric feasibility guard.
         contained_edges = [e for e in graph.edges_from(node_id) if e.label == "contained_in"]
         if contained_edges:
             container_node = graph.get_node(contained_edges[0].dst_id)
-            if container_node is not None:
+            if (
+                container_node is not None
+                and not isinstance(container_node, FixtureNode)
+                and container_node.object_class in OBJECT_DIMENSIONS
+            ):
                 iw, il, ih = _container_interior_dims(container_node.object_class)
                 filtered = []
                 for v in variants:
@@ -142,7 +177,12 @@ def plan_object(
                         f"{contained_edges[0].dst_id}",
                     )
 
-        # Stacking dimensional check: variant footprint must fit on support
+        # Stacking dimensional check: variant footprint must fit on support.
+        # The previous 20% over-footprint tolerance silently allowed stacks
+        # whose centre of mass projected outside the support surface (e.g. a
+        # plate that overhangs by 10% on each side). Tightened to a small
+        # 5% tolerance — enough to absorb measurement noise on hand-edited
+        # bounding-box JSON entries without admitting visibly unstable stacks.
         stacked_edges = [e for e in graph.edges_from(node_id) if e.label == "stacked_on"]
         if stacked_edges:
             support_node = graph.get_node(stacked_edges[0].dst_id)
@@ -151,8 +191,7 @@ def plan_object(
                 filtered = []
                 for v in variants:
                     vw, vl, _ = get_dimensions(v)
-                    # Allow 20% tolerance beyond support surface
-                    if vw <= sw * 1.2 and vl <= sl * 1.2:
+                    if vw <= sw * 1.05 and vl <= sl * 1.05:
                         filtered.append(v)
                 if filtered:
                     variants = filtered
@@ -181,90 +220,228 @@ def plan_object(
 # ---------------------------------------------------------------------------
 
 
-def plan_articulation(
+_CANONICAL_DEFAULTS = {"microwave": "Close", "cabinet": "Close", "stove": "Turnoff"}
+
+
+def _fixture_baseline_for_node(
+    node: FixtureNode,
     graph: SemanticSceneGraph,
+    diagnostics: PlanDiagnostics,
+) -> ArticulationPlan | None:
+    """Resolve a single fixture's baseline ArticulationPlan, or None."""
+    art_model = graph.articulation_model
+    fixture_class = node.object_class
+    ranges = art_model.articulation_ranges.get(fixture_class)
+    if not ranges:
+        return None
+    family = art_model.get_family(fixture_class)
+    if family is None:
+        return None
+    family_name, _ = family
+
+    fixture_region_names: set[str] = {
+        region.instance_name
+        for region in graph.nodes.values()
+        if getattr(region, "target", None) == node.instance_name
+    }
+    need_open_at_init = False
+    for edge in graph.edges:
+        if edge.label != "goal_target":
+            continue
+        if edge.dst_id in fixture_region_names or node.instance_name in edge.dst_id:
+            need_open_at_init = True
+            break
+
+    state_kind: str | None = node.init_state_kind
+    if state_kind is not None:
+        reason = f"BDDL :init asserts {state_kind}"
+        if need_open_at_init and state_kind in ("Close", "Turnoff"):
+            diagnostics.narrow_axis(
+                "articulation",
+                f"{node.node_id}: BDDL :init '{state_kind}' conflicts with "
+                f"goal-reachability open requirement",
+            )
+    elif need_open_at_init:
+        state_kind = "Turnon" if family_name == "stove" else "Open"
+        reason = "goal requires interior access — init must be Open"
+    else:
+        state_kind = _CANONICAL_DEFAULTS.get(family_name)
+        if state_kind is None:
+            state_kind = next(iter(ranges))
+            diagnostics.narrow_axis(
+                "articulation",
+                f"{node.node_id}: unknown family '{family_name}' — "
+                f"defaulting baseline to first state '{state_kind}'",
+            )
+            reason = f"unknown family '{family_name}' — first state"
+        else:
+            reason = f"canonical family default for {family_name}"
+
+    state_range = ranges.get(state_kind)
+    if state_range is None:
+        diagnostics.narrow_axis(
+            "articulation",
+            f"{node.node_id}: baseline state_kind '{state_kind}' not in "
+            f"ranges {list(ranges)}",
+        )
+        return None
+    lo, hi = state_range
+    return ArticulationPlan(
+        fixture_name=node.instance_name,
+        state_kind=state_kind,
+        lo=lo,
+        hi=hi,
+        reason=f"baseline: {reason}",
+        goal_reachability_ok=True,
+    )
+
+
+def compute_baseline_articulation(
+    graph: SemanticSceneGraph,
+    diagnostics: PlanDiagnostics,
+) -> dict[str, ArticulationPlan]:
+    """Compute the *baseline* articulation state required by BDDL ``:init``.
+
+    A baseline plan encodes a TASK PRECONDITION — the asserted fixture state
+    at task init. It must be applied to the simulator regardless of which
+    perturbation axes are active, because the task's feasibility depends on
+    it (e.g. an ``On(bowl, cabinet_top_side)`` init pose for a closed cabinet
+    vs. an open-drawer cabinet are not interchangeable).
+
+    Sources, in priority order:
+
+    1. BDDL ``:init`` predicate ``(Open|Close|Turnon|Turnoff <fixture>)`` (or
+       its region-target form ``(Open <fixture>_top_region)``), parsed into
+       ``FixtureNode.init_state_kind`` by the graph builder.
+    2. Goal-reachability override: when ``:goal`` references a region
+       anchored to an articulated fixture, the fixture must be Open at init.
+    3. Canonical family default: cabinets/microwaves → Close, stoves →
+       Turnoff. Used only when (1) and (2) are silent.
+
+    Returns:
+        Dict mapping fixture instance_name -> ArticulationPlan that
+        the simulator MUST apply.
+    """
+    result: dict[str, ArticulationPlan] = {}
+    for node in graph.nodes.values():
+        if not isinstance(node, FixtureNode) or not node.is_articulatable:
+            continue
+        plan_entry = _fixture_baseline_for_node(node, graph, diagnostics)
+        if plan_entry is not None:
+            result[node.instance_name] = plan_entry
+    return result
+
+
+def plan_articulation_perturbation(
+    graph: SemanticSceneGraph,
+    baseline: dict[str, ArticulationPlan],
     request_axes: frozenset[str],
     diagnostics: PlanDiagnostics,
 ) -> dict[str, ArticulationPlan]:
-    """Plan initial articulation states for articulatable fixtures.
+    """Sample an articulation-axis overlay on top of the baseline.
 
-    Always runs for articulatable fixtures regardless of request_axes, to
-    ensure goal-reachability is never violated.
+    Invariant: the perturbation MUST stay within the feasible set defined
+    by the BDDL ``:init`` predicates and the goal-reachability override.
+    Concretely, if the baseline state is ``Open`` (or ``Turnon``) — either
+    because BDDL ``:init`` asserts it or because the goal requires
+    interior access — the perturbation is restricted to varying the open
+    *angle* within the baseline's Open band rather than flipping the
+    state to ``Close`` (which would invalidate the task precondition).
 
-    Args:
-        graph: The semantic scene graph for the task.
-        request_axes: Set of active perturbation axis names (informational only).
-        diagnostics: Diagnostics collector.
+    When the baseline is the canonical family default (no :init, no
+    goal constraint), the perturbation is free to flip to the opposite
+    state since either is task-compatible.
 
-    Returns:
-        Dict mapping fixture instance_name -> ArticulationPlan.
+    The returned dict contains only **overrides** — entries whose
+    ``state_kind`` or ``lo/hi`` differs from the baseline. Callers merge
+    these into the baseline; non-overridden fixtures retain their
+    baseline plan unchanged. Empty when ``"articulation"`` is not in
+    ``request_axes``.
     """
+    if "articulation" not in request_axes:
+        return {}
+
     result: dict[str, ArticulationPlan] = {}
+    art_model = graph.articulation_model
 
     for node_id, node in graph.nodes.items():
-        if not isinstance(node, FixtureNode):
+        if not isinstance(node, FixtureNode) or not node.is_articulatable:
             continue
-        if not node.is_articulatable:
-            continue
-
         fixture_class = node.object_class
-        art_model = graph.articulation_model
         ranges = art_model.articulation_ranges.get(fixture_class)
         if not ranges:
             continue
-
-        # Check if any object must end up inside this fixture (In goal)
-        need_open_at_init = False
-        for edge in graph.edges_to(node_id):
-            if edge.label == "goal_target":
-                src_node = graph.get_node(edge.src_id)
-                if isinstance(src_node, ObjectNode) and src_node.contained:
-                    need_open_at_init = True
-                    break
-
-        # Determine initial state kind and range
         family = art_model.get_family(fixture_class)
         if family is None:
             continue
+        family_name, _ = family
 
-        family_name, _kind = family
+        base = baseline.get(node.instance_name)
+        # If BDDL :init or goal pins the state, perturbation is constrained
+        # to that state's range (variation in angle only). Otherwise the
+        # perturbation may flip to the family's "active" state.
+        pinned = node.init_state_kind is not None or (
+            base is not None and not base.reason.endswith("canonical_default")
+            and "canonical family default" not in base.reason
+        )
+        if pinned and base is not None:
+            # Same state_kind as baseline; perturbation does not deviate
+            # from the asserted feasible set. (Future: widen lo/hi sub-band
+            # within the same state to introduce real angle variation.)
+            continue
 
+        # Free to choose the "active" perturbation state.
         if family_name in ("microwave", "cabinet"):
-            if need_open_at_init:
-                state_kind = "Open"
-                reason = "goal requires interior access — init must be Open"
-            else:
-                # Default: start Open (robot can work with fixture)
-                state_kind = "Open"
-                reason = "default articulation perturbation — Open init"
+            state_kind = "Open"
         elif family_name == "stove":
-            # Stove starts off by default; goal is typically to turn it on
-            state_kind = "Turnoff"
-            reason = "stove default init — Turnoff"
+            state_kind = "Turnon"
+            diagnostics.narrow_axis(
+                "articulation",
+                f"{node_id}: stove articulation perturbation set to Turnon",
+            )
         else:
-            # Unknown family: use first available state
             state_kind = next(iter(ranges))
-            reason = f"unknown family '{family_name}' — using first state"
+            diagnostics.narrow_axis(
+                "articulation",
+                f"{node_id}: unknown family '{family_name}' — perturbation "
+                f"defaulting to first state '{state_kind}'",
+            )
 
         state_range = ranges.get(state_kind)
         if state_range is None:
-            diagnostics.narrow_axis(
-                "articulation",
-                f"{node_id}: state_kind '{state_kind}' not in ranges {list(ranges)}",
-            )
             continue
-
         lo, hi = state_range
+        if base is not None and base.state_kind == state_kind:
+            # Already at this state in the baseline — no override needed.
+            continue
         result[node.instance_name] = ArticulationPlan(
             fixture_name=node.instance_name,
             state_kind=state_kind,
             lo=lo,
             hi=hi,
-            reason=reason,
+            reason=f"articulation axis perturbation — {state_kind}",
             goal_reachability_ok=True,
         )
-
     return result
+
+
+def plan_articulation(
+    graph: SemanticSceneGraph,
+    request_axes: frozenset[str],
+    diagnostics: PlanDiagnostics,
+) -> dict[str, ArticulationPlan]:
+    """Convenience wrapper combining baseline + axis-gated perturbation.
+
+    Returns the union: baseline plans for every articulated fixture (always
+    applied), with any perturbation overrides layered on top when the
+    articulation axis is requested. See :func:`compute_baseline_articulation`
+    and :func:`plan_articulation_perturbation` for the semantic split.
+    """
+    baseline = compute_baseline_articulation(graph, diagnostics)
+    overrides = plan_articulation_perturbation(graph, baseline, request_axes, diagnostics)
+    merged: dict[str, ArticulationPlan] = dict(baseline)
+    merged.update(overrides)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -431,17 +608,40 @@ def plan_distractor(
     graph: SemanticSceneGraph,
     request_axes: frozenset[str],
     diagnostics: PlanDiagnostics,
-    free_area: float = 0.09,
+    free_area: float | None = None,
+    *,
+    position_plans: dict | None = None,
+    object_substitutions: dict[str, list[str]] | None = None,
 ) -> tuple[int, list[str]]:
     """Plan distractor object budget and class pool.
 
-    Dynamic budget: n = min(5, floor(free_area / distractor_footprint)).
+    Budget is derived from the *actual* free area on the workspace, computed
+    as
+
+        free_area = table_area
+                    - sum(planned position-envelope rectangles)
+                    - sum(substituted asset bounding-box footprints)
+
+    rather than the previous global default of 0.09 m². The previous
+    implementation also applied a hard
+    ``budget = min(2, budget) if {position, object, distractor} ⊆ axes``
+    fudge to unblock Scenic's rejection sampler; that branch is removed —
+    the empirical free-area calculation now produces a budget that is
+    sampleable without the brute-force cap.
 
     Args:
         graph: The semantic scene graph for the task.
         request_axes: Set of active perturbation axis names.
         diagnostics: Diagnostics collector.
-        free_area: Estimated free workspace area in m² (default 0.09 = 30cm×30cm).
+        free_area: Optional explicit free-area override (m²). When ``None``,
+            the value is computed from ``position_plans`` /
+            ``object_substitutions`` and the workspace bounds derived from
+            the graph. The override remains available for unit tests.
+        position_plans: The position planner's per-object plans (the
+            envelope sizes are subtracted from the workspace area).
+        object_substitutions: The object planner's per-object variant pools
+            (used to take the *largest* substituted footprint per object,
+            since asset substitution can grow object size).
 
     Returns:
         Tuple of (n_distractors, distractor_classes_list).
@@ -450,23 +650,86 @@ def plan_distractor(
         return 0, []
 
     distractor_footprint = 0.01  # 10cm × 10cm = 0.01 m²
-    budget = min(5, math.floor(free_area / distractor_footprint))
 
-    if budget < math.floor(free_area / distractor_footprint):
-        diagnostics.narrow_axis(
-            "distractor", f"budget capped at {budget} (free_area={free_area:.3f})"
-        )
+    if free_area is None:
+        # Derive free area from the BDDL workspace bounds and the in-progress
+        # plan. This runs after position / object planning in
+        # ``plan_perturbations`` so the position envelopes and object
+        # substitutions are already populated when this function executes.
+        from libero_infinity.planner.position import _workspace_bounds_from_graph
 
-    # Asset substitution increases the effective occupied footprint of the task
-    # objects enough that the naive free-area heuristic overestimates how much
-    # clutter can still be rejection-sampled alongside position perturbations.
-    # Without narrowing here, combined/full presets become unsampleable on the
-    # bowl task used by Tier-1 CI.
-    if {"position", "object", "distractor"}.issubset(request_axes) and budget > 2:
-        budget = 2
+        x_min, y_min, x_max, y_max = _workspace_bounds_from_graph(graph)
+        table_area = max(0.0, (x_max - x_min) * (y_max - y_min))
+
+        # Per-task-object reservation = (largest substituted footprint)²,
+        # padded by the distractor-vs-task clearance margin (matches the
+        # 0.13 m threshold the renderer emits in ``_render_constraints``).
+        # We do *not* add the position envelope on top because envelopes
+        # already overlap on the table — the task object's realised
+        # footprint at any one sample is the un-padded AABB; clearance is
+        # what the sampler enforces around that AABB.
+        _DISTRACTOR_TASK_CLEARANCE = 0.13
+        position_plans = position_plans or {}
+        object_substitutions = object_substitutions or {}
+
+        n_task = 0
+        occupied = 0.0
+        for node in graph.nodes.values():
+            if not isinstance(node, (ObjectNode, MovableSupportNode)):
+                continue
+            instance_name = node.instance_name
+            obj_class = node.object_class
+            n_task += 1
+
+            # Largest variant footprint (asset substitution can grow size).
+            variants = object_substitutions.get(instance_name, [obj_class])
+            footprint_w = footprint_l = 0.0
+            for v in variants:
+                vw, vl, _ = get_dimensions(v)
+                footprint_w = max(footprint_w, vw)
+                footprint_l = max(footprint_l, vl)
+            if footprint_w == 0.0:
+                vw, vl, _ = get_dimensions(obj_class)
+                footprint_w, footprint_l = vw, vl
+
+            occupied += (footprint_w + _DISTRACTOR_TASK_CLEARANCE) * (
+                footprint_l + _DISTRACTOR_TASK_CLEARANCE
+            )
+
+        # Each distractor reserves (distractor_size + dist-dist clearance)²
+        # of free area. Matches the renderer's
+        # ``_DISTRACTOR_PAIR_CLEARANCE`` plus the distractor AABB side. Keep
+        # the constants in sync with ``renderer/scenic_renderer.py`` (audit
+        # E2): the renderer authors a 0.08 m AABB cube and emits a diagonal
+        # clearance of ``sqrt(2 * 0.08²) ≈ 0.1131`` m between distractors.
+        _DISTRACTOR_AABB_SIDE = 0.08
+        _DISTRACTOR_PAIR_CLEARANCE = math.sqrt(2.0) * _DISTRACTOR_AABB_SIDE
+        per_distractor_area = (_DISTRACTOR_AABB_SIDE + _DISTRACTOR_PAIR_CLEARANCE) ** 2
+
+        free_area = max(0.0, table_area - occupied)
+
+        # Joint-sampling safety factor: when position + object perturbations
+        # are active the rejection-sampler must satisfy clearance against
+        # task objects whose realised positions can fall anywhere in their
+        # envelope. The combinatorics make budgets above ~table_area /
+        # (n_task × 2 × per_distractor_area) unsampleable in practice — even
+        # if the static free-area calculation says they should fit. We
+        # therefore divide by an empirical density factor that scales with
+        # the task-object count when {position, object, distractor} are
+        # jointly requested.
+        density_divisor = 1.0
+        if {"position", "object", "distractor"}.issubset(request_axes) and n_task > 0:
+            density_divisor = max(1.0, n_task * 1.5)
+
+        raw_budget = math.floor(free_area / (per_distractor_area * density_divisor))
+    else:
+        raw_budget = math.floor(free_area / distractor_footprint)
+
+    budget = min(5, max(0, raw_budget))
+
+    if budget < raw_budget:
         diagnostics.narrow_axis(
-            "distractor",
-            "reduced to 2 to preserve composability with position+object sampling",
+            "distractor", f"budget capped at 5 (computed {raw_budget}, free_area={free_area:.3f})"
         )
 
     # Collect task-scene object classes to exclude from distractors
@@ -601,3 +864,40 @@ def plan_background(
         floor_texture="random",
         texture_candidates=candidates,
     )
+
+
+# ---------------------------------------------------------------------------
+# plan_sensor_noise
+# ---------------------------------------------------------------------------
+
+
+def plan_sensor_noise(
+    graph: SemanticSceneGraph,
+    request_axes: frozenset[str],
+    diagnostics: PlanDiagnostics,
+) -> SensorNoisePlan | None:
+    """Plan sensor / image-noise perturbation.
+
+    The plan exposes a (kinds, severity_range) pair that the renderer
+    converts to two Scenic params:
+
+        param sensor_noise_kind = Uniform("none", "gaussian_noise", …)
+        param sensor_noise_severity = DiscreteRange(severity_lo, severity_hi)
+
+    The simulator's ``_apply_sensor_noise`` post-processes
+    ``obs["agentview_image"]`` (and the eye-in-hand camera, when present)
+    at every ``step()`` by dispatching on the sampled kind.
+
+    Args:
+        graph: The semantic scene graph (unused; kept for API consistency).
+        request_axes: Set of active perturbation axis names.
+        diagnostics: Diagnostics collector.
+
+    Returns:
+        A SensorNoisePlan, or None if ``"sensor_noise"`` is not in
+        ``request_axes``.
+    """
+    del graph, diagnostics
+    if "sensor_noise" not in request_axes:
+        return None
+    return SensorNoisePlan()

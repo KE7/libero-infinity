@@ -16,7 +16,6 @@ from conftest import (
     DRAWER_PICK_BOWL_BDDL,
     FLOOR_BASKET_BDDL,
     MICROWAVE_BDDL,
-    SCENIC_DIR,
     STOVE_BDDL,
     requires_libero,
 )
@@ -70,14 +69,14 @@ class TestLIBEROSimulatorIntegration:
     @pytest.fixture(scope="class")
     def scenic_scene(self):
         import scenic as sc
+        from libero_infinity.compiler import generate_scenic_file
+        from libero_infinity.task_config import TaskConfig
 
-        path = SCENIC_DIR / "position_perturbation.scenic"
+        cfg = TaskConfig.from_bddl(str(BOWL_BDDL))
+        path = generate_scenic_file(cfg, perturbation="position")
         scenario = sc.scenarioFromFile(
             str(path),
-            params={
-                "task": "put_the_bowl_on_the_plate",
-                "bddl_path": str(BOWL_BDDL),
-            },
+            params={"bddl_path": str(BOWL_BDDL)},
         )
         scene, _ = scenario.generate(maxIterations=2000, verbosity=0)
         return scene
@@ -177,33 +176,12 @@ class TestScenicSafetyInvariants:
     """Settled scenes should remain on-workspace across existing Scenic programs."""
 
     @pytest.mark.parametrize(
-        ("scenic_file", "params"),
-        [
-            (
-                "position_perturbation.scenic",
-                {
-                    "task": "put_the_bowl_on_the_plate",
-                    "bddl_path": str(BOWL_BDDL),
-                },
-            ),
-            (
-                "combined_perturbation.scenic",
-                {
-                    "task": "put_the_bowl_on_the_plate",
-                    "bddl_path": str(BOWL_BDDL),
-                    "perturb_class": "akita_black_bowl",
-                },
-            ),
-            (
-                "distractor_perturbation.scenic",
-                {
-                    "bddl_path": str(BOWL_BDDL),
-                },
-            ),
-        ],
+        "perturbation",
+        ["position", "combined", "distractor"],
     )
-    def test_settled_objects_stay_safe(self, scenic_file, params):
+    def test_settled_objects_stay_safe(self, perturbation):
         import scenic as sc
+        from libero_infinity.compiler import generate_scenic_file
         from libero_infinity.simulator import (
             MIN_SETTLED_Z,
             TABLE_X_MAX,
@@ -212,8 +190,11 @@ class TestScenicSafetyInvariants:
             TABLE_Y_MIN,
             LIBEROSimulator,
         )
+        from libero_infinity.task_config import TaskConfig
 
-        scenario = sc.scenarioFromFile(str(SCENIC_DIR / scenic_file), params=params)
+        cfg = TaskConfig.from_bddl(str(BOWL_BDDL))
+        scenic_path = generate_scenic_file(cfg, perturbation=perturbation)
+        scenario = sc.scenarioFromFile(scenic_path, params={"bddl_path": str(BOWL_BDDL)})
         sim, scene = _setup_with_visibility_retry(
             lambda s: LIBEROSimulator(bddl_path=str(BOWL_BDDL)).createSimulation(
                 s,
@@ -248,7 +229,8 @@ class TestScenicSafetyInvariants:
                 assert pos[2] >= MIN_SETTLED_Z
                 checked += 1
 
-            assert checked >= 2, f"No settled task objects were verified for {scenic_file}"
+            msg = f"No settled task objects were verified for perturbation={perturbation}"
+            assert checked >= 2, msg
         finally:
             sim.destroy()
 
@@ -447,17 +429,13 @@ class TestCameraPerturb:
 
     def test_camera_position_changes(self):
         import scenic as sc
+        from libero_infinity.compiler import generate_scenic_file
         from libero_infinity.simulator import LIBEROSimulator
+        from libero_infinity.task_config import TaskConfig
 
-        path = SCENIC_DIR / "camera_perturbation.scenic"
-        scenario = sc.scenarioFromFile(
-            str(path),
-            params={
-                "bddl_path": str(BOWL_BDDL),
-                "camera_x_range": 0.15,
-                "camera_z_range": 0.10,
-            },
-        )
+        cfg = TaskConfig.from_bddl(str(BOWL_BDDL))
+        path = generate_scenic_file(cfg, perturbation="camera")
+        scenario = sc.scenarioFromFile(path, params={"bddl_path": str(BOWL_BDDL)})
         sim, scene = _setup_with_visibility_retry(
             lambda s: LIBEROSimulator(bddl_path=str(BOWL_BDDL)).createSimulation(
                 s,
@@ -482,17 +460,13 @@ class TestLightingPerturb:
 
     def test_lighting_applied(self):
         import scenic as sc
+        from libero_infinity.compiler import generate_scenic_file
         from libero_infinity.simulator import LIBEROSimulator
+        from libero_infinity.task_config import TaskConfig
 
-        path = SCENIC_DIR / "lighting_perturbation.scenic"
-        scenario = sc.scenarioFromFile(
-            str(path),
-            params={
-                "bddl_path": str(BOWL_BDDL),
-                "intensity_min": 0.5,
-                "intensity_max": 1.5,
-            },
-        )
+        cfg = TaskConfig.from_bddl(str(BOWL_BDDL))
+        path = generate_scenic_file(cfg, perturbation="lighting")
+        scenario = sc.scenarioFromFile(path, params={"bddl_path": str(BOWL_BDDL)})
         sim, scene = _setup_with_visibility_retry(
             lambda s: LIBEROSimulator(bddl_path=str(BOWL_BDDL)).createSimulation(
                 s,
@@ -516,15 +490,13 @@ class TestRobotPerturb:
 
     def test_robot_init_qpos_applied(self):
         import scenic as sc
+        from libero_infinity.compiler import generate_scenic_file
         from libero_infinity.simulator import LIBEROSimulator
+        from libero_infinity.task_config import TaskConfig
 
-        path = SCENIC_DIR / "robot_perturbation.scenic"
-        scenario = sc.scenarioFromFile(
-            str(path),
-            params={
-                "bddl_path": str(BOWL_BDDL),
-            },
-        )
+        cfg = TaskConfig.from_bddl(str(BOWL_BDDL))
+        path = generate_scenic_file(cfg, perturbation="robot")
+        scenario = sc.scenarioFromFile(path, params={"bddl_path": str(BOWL_BDDL)})
         sim, scene = _setup_with_visibility_retry(
             lambda s: LIBEROSimulator(bddl_path=str(BOWL_BDDL)).createSimulation(
                 s,
@@ -746,6 +718,47 @@ class TestAutoGeneratedScenic:
 
         assert checked == 3
 
+    def test_position_axis_does_not_perturb_articulation(self):
+        """Regression: position-axis perturbation must NOT alter articulation.
+
+        Pre-fix behaviour gated *all* articulation planning behind
+        ``"articulation" in axes``, which meant a BDDL ``:init`` predicate
+        like ``(Open wooden_cabinet_1_top_region)`` was silently dropped
+        when the user only requested position perturbation — opening a
+        task precondition that the canonical (no-axis) baseline must
+        always honour.
+        """
+        from libero_infinity.compiler import compile_task_to_scenario
+        from libero_infinity.simulator import LIBEROSimulator
+        from libero_infinity.task_config import TaskConfig
+
+        bddl = (
+            BDDL_DIR
+            / "libero_90"
+            / "KITCHEN_SCENE10_close_the_top_drawer_of_the_cabinet_and_put_the_black_bowl_on_top_of_it.bddl"
+        )
+        if not bddl.exists():
+            pytest.skip(f"BDDL not present at {bddl}")
+        cfg = TaskConfig.from_bddl(bddl)
+        scenario = compile_task_to_scenario(cfg, "position")
+        sim, scene = _setup_with_visibility_retry(
+            lambda s: LIBEROSimulator(bddl_path=str(bddl)).createSimulation(
+                s, maxSteps=10, timestep=0.05, verbosity=0
+            ),
+            scenario,
+        )
+        try:
+            # Articulation params reflect the BDDL :init Open predicate
+            # even though the active axis is "position".
+            params = getattr(scene, "params", {})
+            state_key = "articulation_wooden_cabinet_1_state"
+            assert params.get(state_key) == "Open", (
+                f"baseline articulation honouring :init was dropped "
+                f"(state={params.get(state_key)!r})"
+            )
+        finally:
+            sim.destroy()
+
     def test_floor_scene_position_perturbation_setup_succeeds(self):
         from libero_infinity.compiler import compile_task_to_scenario
         from libero_infinity.simulator import LIBEROSimulator
@@ -815,11 +828,14 @@ class TestDistractorLIBEROIntegration:
 
     def test_distractor_appears_in_mujoco(self):
         import scenic as sc
+        from libero_infinity.compiler import generate_scenic_file
         from libero_infinity.simulator import MIN_SETTLED_Z, LIBEROSimulator
+        from libero_infinity.task_config import TaskConfig
 
-        path = SCENIC_DIR / "distractor_perturbation.scenic"
+        cfg = TaskConfig.from_bddl(str(BOWL_BDDL))
+        path = generate_scenic_file(cfg, perturbation="distractor")
         scenario = sc.scenarioFromFile(
-            str(path),
+            path,
             params={"bddl_path": str(BOWL_BDDL)},
         )
         sim, scene = _setup_with_visibility_retry(

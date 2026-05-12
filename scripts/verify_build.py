@@ -161,11 +161,12 @@ def test_libero_simulation():
     from libero_infinity.simulator import LIBEROSimulator
 
     bddl = _require_bddl()
-    path = SCENIC_DIR / "position_perturbation.scenic"
-    scenario = sc.scenarioFromFile(
-        str(path),
-        params={"bddl_path": bddl, "task": "put_the_bowl_on_the_plate"},
-    )
+    from libero_infinity.compiler import generate_scenic_file
+    from libero_infinity.task_config import TaskConfig
+
+    cfg = TaskConfig.from_bddl(bddl)
+    path = generate_scenic_file(cfg, perturbation="position")
+    scenario = sc.scenarioFromFile(path, params={"bddl_path": bddl})
     scene, _ = scenario.generate(maxIterations=50)
 
     simulator = LIBEROSimulator(bddl_path=bddl)

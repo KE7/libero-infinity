@@ -13,15 +13,16 @@ Usage
         --bddl pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate \\
         --perturbation position
 
-    # Use a hand-written Scenic program from scenic/
+    # Pass an explicit Scenic file (advanced — must match the BDDL's
+    # libero_name vocabulary; the validator will reject mismatches):
     python scripts/viewer.py \\
         --suite libero_spatial \\
         --bddl pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate \\
-        --scenic position_perturbation
+        --scenic /path/to/custom.scenic
 
-    # Or pass a full BDDL path directly:
+    # Or pass a full BDDL path directly (path shortened here for layout):
     python scripts/viewer.py \\
-        --bddl src/libero_infinity/data/libero_runtime/bddl_files/libero_spatial/pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate.bddl \\
+        --bddl <BDDL_DIR>/libero_spatial/pick_up_the_black_bowl.bddl \\
         --perturbation combined
 
 Requirements
@@ -53,9 +54,7 @@ import textwrap
 # Repository root — make src/ importable when running as a plain script
 # ---------------------------------------------------------------------------
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-_BDDL_ROOT = (
-    _REPO_ROOT / "src" / "libero_infinity" / "data" / "libero_runtime" / "bddl_files"
-)
+_BDDL_ROOT = _REPO_ROOT / "src" / "libero_infinity" / "data" / "libero_runtime" / "bddl_files"
 _SCENIC_ROOT = _REPO_ROOT / "scenic"
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
@@ -71,10 +70,12 @@ PERTURBATION_CHOICES = [
     "full",
 ]
 
-_VIEWER_SCENIC_OVERRIDES = {
-    # The simulator's camera perturbation hook consumes offset-style params
-    # emitted by the hand-written Scenic file, not the compiler's cam_* schema.
-    "camera": _SCENIC_ROOT / "camera_perturbation.scenic",
+_VIEWER_SCENIC_OVERRIDES: dict[str, pathlib.Path] = {
+    # No more handwritten Scenic overrides: the renderer-emitted Scenic
+    # programs (compile_task / generate_scenic_file) cover every axis
+    # (camera, lighting, distractor, …) for every BDDL task. The legacy
+    # handwritten files in scenic/ have been deleted; any external caller
+    # may still pass an explicit --scenic <path> argument.
 }
 
 # ---------------------------------------------------------------------------
@@ -92,9 +93,7 @@ except Exception as _exc:
 def _require_viewer() -> None:
     """Abort with a helpful message if mujoco.viewer is not importable."""
     if _VIEWER_IMPORT_ERROR is not None:
-        sys.exit(
-            textwrap.dedent(
-                f"""
+        sys.exit(textwrap.dedent(f"""
                 ERROR: Interactive viewer requires a display.
 
                 mujoco.viewer could not be imported:
@@ -111,9 +110,7 @@ def _require_viewer() -> None:
                            MUJOCO_GL=egl libero-eval --bddl ... --n-scenes 1 --watch cv2
                   3. On macOS the viewer requires mjpython:
                        mjpython scripts/viewer.py ...
-                """
-            ).strip()
-        )
+                """).strip())
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +275,6 @@ class SceneSession:
     def _compile(self) -> None:
         """Compile the Scenic scenario (one-time cost, ~2-5 s)."""
         import scenic
-
         from libero_infinity.compiler import generate_scenic_file
         from libero_infinity.task_config import TaskConfig
 
@@ -405,9 +401,9 @@ def run_viewer(session: SceneSession) -> None:
         """mujoco.viewer key callback (called on the viewer thread)."""
         # GLFW key codes:
         #   R = 82, Space = 32, Enter = 257, Q = 81
-        if keycode in (82, 32, 257):   # R, Space, Enter
+        if keycode in (82, 32, 257):  # R, Space, Enter
             _state["resample"] = True
-        elif keycode == 81:             # Q
+        elif keycode == 81:  # Q
             _state["quit"] = True
 
     scene_index = 0
@@ -645,7 +641,9 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     bddl_path = _resolve_bddl(args.bddl, args.suite)
-    scenic_path = _resolve_scenic(args.scenic) if args.scenic else _viewer_default_scenic(args.perturbation)
+    scenic_path = (
+        _resolve_scenic(args.scenic) if args.scenic else _viewer_default_scenic(args.perturbation)
+    )
     print(f"\nBDDL:          {bddl_path}")
     if scenic_path is not None:
         print(f"Scenic:        {scenic_path}")
@@ -653,6 +651,7 @@ def main(argv: list[str] | None = None) -> None:
     # Bootstrap LIBERO runtime paths (downloads assets to ~/.libero if needed).
     try:
         from libero_infinity.runtime import ensure_runtime
+
         ensure_runtime()
     except ImportError:
         pass  # older installations without runtime module

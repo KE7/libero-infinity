@@ -62,6 +62,54 @@ def test_camera_consumer_still_applies_legacy_offset_params() -> None:
     np.testing.assert_allclose(model.cam_pos[0], [0.6, -0.2, 1.65])
 
 
+def test_camera_tilt_rotates_about_camera_local_x_axis() -> None:
+    """Bug 15 regression: ``camera_tilt`` must rotate the camera about its
+    *local* x-axis, not world-x.
+
+    MuJoCo's ``cam_quat`` is a body-to-world rotation. Composing
+    ``r_current * R_x(tilt)`` therefore yields a body-to-world rotation
+    whose x-axis (in body frame) has been tilted *first*, then mapped to
+    world — i.e. the realised tilt is around the camera's local x-axis,
+    which is what a "tilt" semantically means. We verify this by computing
+    the camera-frame x-axis in world coordinates before and after tilt
+    and asserting that the rotation between them matches the tilt angle
+    around the *original* camera-frame x-axis.
+    """
+    from scipy.spatial.transform import Rotation as _Rotation
+
+    tilt_deg = 15.0
+    li_sim, model = _fake_camera_sim({"camera_tilt": tilt_deg})
+    base_quat_wxyz = model.cam_quat[0].copy()
+
+    li_sim._apply_camera_perturbation()
+
+    new_quat_wxyz = model.cam_quat[0].copy()
+
+    # Body-frame x-axis in world coordinates, before / after tilt.
+    def _local_x_in_world(q_wxyz: np.ndarray) -> np.ndarray:
+        rot = _Rotation.from_quat([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]])
+        return rot.apply(np.array([1.0, 0.0, 0.0]))
+
+    x_before = _local_x_in_world(base_quat_wxyz)
+    x_after = _local_x_in_world(new_quat_wxyz)
+    # A tilt about the camera-local x-axis should leave the local x-axis
+    # itself invariant in world coordinates.
+    np.testing.assert_allclose(x_after, x_before, atol=1e-9)
+
+    # Body-frame y/z axes should be rotated by exactly tilt_deg about
+    # x_before. Confirm by comparing the world-frame angle between the
+    # before/after y-axis to tilt_deg.
+    def _local_y_in_world(q_wxyz: np.ndarray) -> np.ndarray:
+        rot = _Rotation.from_quat([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]])
+        return rot.apply(np.array([0.0, 1.0, 0.0]))
+
+    y_before = _local_y_in_world(base_quat_wxyz)
+    y_after = _local_y_in_world(new_quat_wxyz)
+    cos_theta = float(np.clip(np.dot(y_before, y_after), -1.0, 1.0))
+    realized_angle_rad = float(np.arccos(cos_theta))
+    np.testing.assert_allclose(np.degrees(realized_angle_rad), tilt_deg, atol=1e-6)
+
+
 def test_articulation_consumer_skips_state_metadata_suffix() -> None:
     calls: list[float] = []
     state = SimpleNamespace(set_joint=lambda value: calls.append(value))

@@ -139,12 +139,14 @@ def test_reload_viewer_handle_uses_hidden_simulate_reload():
     assert calls == [("model", "data", "")]
 
 
-def test_resolve_scenic_shorthand_uses_repo_scenic_dir():
+def test_resolve_scenic_shorthand_resolves_libero_model():
     viewer = _load_viewer_module()
 
-    path = viewer._resolve_scenic("position_perturbation")
+    # libero_model.scenic is the only handwritten file we still ship; the
+    # rest were deleted in favour of the renderer-emitted programs.
+    path = viewer._resolve_scenic("libero_model")
 
-    assert path == (viewer._SCENIC_ROOT / "position_perturbation.scenic").resolve()
+    assert path == (viewer._SCENIC_ROOT / "libero_model.scenic").resolve()
 
 
 def test_main_passes_explicit_scenic_path_to_session(monkeypatch, tmp_path):
@@ -172,7 +174,11 @@ def test_main_passes_explicit_scenic_path_to_session(monkeypatch, tmp_path):
     assert calls == [(tmp_path / "task.bddl", "position", scenic_path.resolve())]
 
 
-def test_main_uses_handwritten_camera_scenic_for_camera_mode(monkeypatch, tmp_path):
+def test_main_camera_mode_uses_renderer_emitted_scenic(monkeypatch, tmp_path):
+    """With the legacy handwritten camera_perturbation.scenic deleted, camera
+    mode must fall through to the renderer-emitted Scenic (compile_task)
+    rather than a static handwritten file. SceneSession receives
+    ``scenic_path=None`` to signal "auto-generate"."""
     viewer = _load_viewer_module()
     calls = []
 
@@ -192,13 +198,7 @@ def test_main_uses_handwritten_camera_scenic_for_camera_mode(monkeypatch, tmp_pa
 
     viewer.main(["--bddl", "task", "--suite", "libero_spatial", "--perturbation", "camera"])
 
-    assert calls == [
-        (
-            tmp_path / "task.bddl",
-            "camera",
-            (viewer._SCENIC_ROOT / "camera_perturbation.scenic").resolve(),
-        )
-    ]
+    assert calls == [(tmp_path / "task.bddl", "camera", None)]
 
 
 def test_main_warns_when_scenic_and_perturbation_are_both_provided(monkeypatch, tmp_path, capsys):
@@ -230,9 +230,17 @@ def test_main_warns_when_scenic_and_perturbation_are_both_provided(monkeypatch, 
     assert "--perturbation is ignored when --scenic is provided" in captured.err
 
 
-def test_validate_scenic_bddl_compatibility_rejects_mismatch():
+def test_validate_scenic_bddl_compatibility_rejects_mismatch(tmp_path):
+    """A custom Scenic file that names objects not in the BDDL must be rejected."""
     viewer = _load_viewer_module()
-    scenic_path = (viewer._SCENIC_ROOT / "position_perturbation.scenic").resolve()
+
+    scenic_path = tmp_path / "wrong_task.scenic"
+    # Hard-code a libero_name that does not exist in the
+    # open_the_middle_drawer_of_the_cabinet task — pick a fictional name so
+    # the test is independent of which BDDL files happen to share objects.
+    scenic_path.write_text(
+        'model libero_model\nnew LIBEROObject with libero_name "nonexistent_widget_42"\n'
+    )
     mismatched_bddl = (
         REPO_ROOT
         / "src"
@@ -248,8 +256,12 @@ def test_validate_scenic_bddl_compatibility_rejects_mismatch():
         viewer._validate_scenic_bddl_compatibility(scenic_path, mismatched_bddl)
 
 
-def test_validate_scenic_bddl_compatibility_allows_camera_file_for_any_task():
+def test_validate_scenic_bddl_compatibility_allows_axis_only_file(tmp_path):
+    """An axis-only Scenic file (no libero_name references) passes regardless of task."""
     viewer = _load_viewer_module()
-    scenic_path = (viewer._SCENIC_ROOT / "camera_perturbation.scenic").resolve()
+    scenic_path = tmp_path / "axis_only.scenic"
+    # No `with libero_name "…"` clauses → static extraction returns empty set
+    # → validator returns early without checking against the BDDL.
+    scenic_path.write_text("model libero_model\nparam camera_x_offset = Range(-0.05, 0.05)\n")
 
     viewer._validate_scenic_bddl_compatibility(scenic_path, BOWL_BDDL)

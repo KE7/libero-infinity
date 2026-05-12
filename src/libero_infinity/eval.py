@@ -21,10 +21,15 @@ CLI usage
 
 To evaluate a VLA policy, use the Python API::
 
+    from libero_infinity.compiler import generate_scenic_file
+    from libero_infinity.task_config import TaskConfig
     from libero_infinity.eval import evaluate
+
+    cfg = TaskConfig.from_bddl("path/to/task.bddl")
+    scenic_path = generate_scenic_file(cfg, perturbation="combined")
     results = evaluate(
-        scenic_path="scenic/position_perturbation.scenic",
-        bddl_path="...",
+        scenic_path=scenic_path,
+        bddl_path="path/to/task.bddl",
         policy=my_policy_fn,   # callable: obs_dict -> action_array (7,)
         n_scenes=100,
     )
