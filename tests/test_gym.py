@@ -149,3 +149,30 @@ class TestGymWrapper:
         ) as env:
             obs = env.reset()
             assert isinstance(obs, dict)
+
+
+@requires_libero
+class TestMakeEnvHelper:
+    """Tests for the single-condition ``make_env`` sweep-harness helper."""
+
+    BDDL = str(BOWL_BDDL)
+
+    def test_make_env_returns_libero_scenic_env_with_bddl_path(self):
+        """``make_env(scene, bddl_path=...)`` honours the sweep contract.
+
+        Asserts the helper returns a real ``LIBEROScenicEnv`` whose
+        ``_bddl_path`` reflects the requested BDDL. A sentinel scene
+        is passed positionally and stored on the env for later consumption
+        by the next ``reset()``; we verify the storage path without
+        triggering a full reset (which would need MuJoCo).
+        """
+        from libero_infinity.gym_env import LIBEROScenicEnv, make_env
+
+        sentinel_scene = object()
+        env = make_env(sentinel_scene, bddl_path=self.BDDL)
+        try:
+            assert isinstance(env, LIBEROScenicEnv)
+            assert env._bddl_path.endswith("put_the_bowl_on_the_plate.bddl")
+            assert env._preset_scene is sentinel_scene
+        finally:
+            env.close()

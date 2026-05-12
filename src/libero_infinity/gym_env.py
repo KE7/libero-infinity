@@ -114,10 +114,17 @@ class LIBEROScenicEnv(gym.Env):
         scenic_params: dict[str, Any] | None = None,
         env_kwargs: dict[str, Any] | None = None,
         scenic_generate_kwargs: dict[str, Any] | None = None,
+        scene: Any = None,
     ):
         super().__init__()
 
         self._bddl_path = str(pathlib.Path(bddl_path).resolve())
+        # Optional pre-sampled Scenic scene. When provided (e.g. by the
+        # validation sweep harness via ``make_env``), the next ``reset()``
+        # call will use this scene instead of generating a fresh one. This
+        # lets G5 exercise the exact scene that earlier G-gates validated.
+        # Consumed on first use; subsequent resets resample as usual.
+        self._preset_scene: Any = scene
         self._perturbation = perturbation
         self._resolution = resolution
         self._max_steps = max_steps
@@ -211,10 +218,18 @@ class LIBEROScenicEnv(gym.Env):
             # Use 5000 iterations: radial footprint-clearance constraints
             # (task objects vs fixtures) are tighter than the old AABB form
             # and may need more rejection-sampling attempts.
-            scene, _n_iters = self._scenario.generate(
-                maxIterations=5000,
-                verbosity=0,
-            )
+            #
+            # If a preset scene was injected (sweep harness contract via
+            # ``make_env``), consume it on the first attempt of the first
+            # reset; on retries (settle rejection) fall back to resampling.
+            if self._preset_scene is not None and attempt == 0:
+                scene = self._preset_scene
+                self._preset_scene = None  # consume once
+            else:
+                scene, _n_iters = self._scenario.generate(
+                    maxIterations=5000,
+                    verbosity=0,
+                )
 
             # Resolve BDDL substitutions (asset swaps) via proper context manager.
             self._per_reset_stack = contextlib.ExitStack()
@@ -437,6 +452,23 @@ class LIBEROScenicEnv(gym.Env):
                         dtype=np.float32,
                     )
         self.observation_space = spaces.Dict(obs_dict)
+
+
+# ---------------------------------------------------------------------------
+# Single-condition environment factory (sweep harness contract)
+# ---------------------------------------------------------------------------
+
+
+def make_env(scene: Any, *, bddl_path: str) -> "LIBEROScenicEnv":
+    """Construct a single-condition env matching the sweep harness contract.
+
+    Sweep-driven counterpart to :func:`make_vec_env`: returns one
+    ``LIBEROScenicEnv`` initialised with a pre-sampled Scenic ``scene`` so the
+    next ``reset()`` exercises exactly the scene that the upstream G-gates
+    validated, rather than resampling a fresh one. Used by the validation
+    sweep at G5 (env create + reset).
+    """
+    return LIBEROScenicEnv(scene=scene, bddl_path=bddl_path)
 
 
 # ---------------------------------------------------------------------------
