@@ -81,6 +81,45 @@ class BackgroundPlan:
 
 
 @dataclass
+class SensorNoisePlan:
+    """Sensor / image-noise perturbation plan.
+
+    The noise is applied to the rendered ``agentview_image`` (and in the
+    future ``eye_in_hand_image``) at every ``step()`` — it does not
+    affect physics, just the observation pipeline. The corruption family
+    follows the *Common Image Corruptions* benchmark (Hendrycks &
+    Dietterich, 2019).
+
+    Attributes:
+        kinds: Pool of corruption names sampled at scene-generation time.
+            Each scene picks one kind via Scenic ``Uniform(*kinds)`` and
+            applies it to every observation. Supported names match the
+            transforms implemented in ``simulator._apply_sensor_noise``:
+            ``"none"``, ``"gaussian_noise"``, ``"shot_noise"``,
+            ``"impulse_noise"``, ``"gaussian_blur"``, ``"motion_blur"``,
+            ``"defocus_blur"``, ``"jpeg_compression"``,
+            ``"brightness_jitter"``, ``"contrast_jitter"``,
+            ``"saturation_jitter"``.
+        severity_lo / severity_hi: Discrete severity levels in {1..5}
+            (matching the C-level severity convention used in image-
+            corruption benchmarks). Scenic samples
+            ``DiscreteRange(severity_lo, severity_hi)`` per scene.
+    """
+
+    kinds: tuple[str, ...] = (
+        "none",
+        "gaussian_noise",
+        "gaussian_blur",
+        "motion_blur",
+        "jpeg_compression",
+        "brightness_jitter",
+        "contrast_jitter",
+    )
+    severity_lo: int = 1
+    severity_hi: int = 5
+
+
+@dataclass
 class RobotInitPlan:
     """Robot initialization perturbation plan in joint space."""
 
@@ -140,6 +179,8 @@ class PerturbationPlan:
     # Distractor axis (filled by planner-axes)
     distractor_budget: int = 0
     distractor_classes: list[str] = field(default_factory=list)
+    # Sensor-noise axis (filled by planner-axes)
+    sensor_noise_plan: SensorNoisePlan | None = None
     # Active axes
     active_axes: frozenset[str] = field(default_factory=frozenset)
     # Diagnostics

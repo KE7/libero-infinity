@@ -57,6 +57,7 @@ from scenic.core.vectors import Vector
 from scipy.spatial.transform import Rotation as _Rotation
 
 from libero_infinity.asset_registry import get_dimensions
+from libero_infinity.planner.axes import LIBERO_BACKGROUND_TEXTURES
 from libero_infinity.validation_errors import (  # noqa: F401 — re-exported for callers
     MAX_VISIBILITY_RETRIES,
     RECOVERY_STRATEGY,
@@ -152,6 +153,22 @@ def _surface_spawn_z(surface_z: float, asset_class: str) -> float:
     return surface_z + max(float(h) / 2.0, 0.01) + 1e-3
 
 
+def _bddl_contained_object_names(bddl_path: str) -> set[str]:
+    """Return objects whose authored initial relation is true containment."""
+    try:
+        from libero_infinity.task_config import TaskConfig
+
+        cfg = TaskConfig.from_bddl(bddl_path)
+    except Exception:
+        log.debug(
+            "Could not parse BDDL containment metadata from %s",
+            bddl_path,
+            exc_info=True,
+        )
+        return set()
+    return {obj.instance_name for obj in cfg.movable_objects if obj.contained}
+
+
 def _infer_root_surface_z(scene_objects, default_pose: dict[str, np.ndarray]) -> float:
     """Infer the canonical root support height from default LIBERO placements."""
     surface_candidates: list[float] = []
@@ -185,6 +202,111 @@ def _visibility_anchor_points(
         np.array((0.0, 0.0, half_z), dtype=float),
     ]
     return [center + offset for offset in offsets]
+
+
+def _geom_world_aabb(sim, geom_id: int) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return a world-frame AABB for a MuJoCo geom when enough data is exposed."""
+    model = sim.model
+    data = sim.data
+    try:
+        center = np.array(data.geom_xpos[geom_id], dtype=float)
+        rot = np.array(data.geom_xmat[geom_id], dtype=float).reshape(3, 3)
+    except Exception:
+        return None
+
+    try:
+        import mujoco
+
+        mesh_type = int(mujoco.mjtGeom.mjGEOM_MESH)
+    except Exception:
+        mesh_type = 7
+
+    geom_type = int(model.geom_type[geom_id])
+    if geom_type == mesh_type and int(model.geom_dataid[geom_id]) >= 0:
+        mesh_id = int(model.geom_dataid[geom_id])
+        vert_adr = int(model.mesh_vertadr[mesh_id])
+        vert_num = int(model.mesh_vertnum[mesh_id])
+        if vert_num > 0:
+            verts = np.array(model.mesh_vert[vert_adr : vert_adr + vert_num], dtype=float)
+            points = center + verts @ rot.T
+            return points.min(axis=0), points.max(axis=0)
+
+    try:
+        radius = float(model.geom_rbound[geom_id])
+    except Exception:
+        return None
+    extent = np.array((radius, radius, radius), dtype=float)
+    return center - extent, center + extent
+
+
+def _body_world_aabb(sim, object_name: str) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return a live world-frame AABB for an object/fixture body prefix."""
+    mins: list[np.ndarray] = []
+    maxs: list[np.ndarray] = []
+    for geom_id in range(int(sim.model.ngeom)):
+        body_name = sim.model.body_id2name(sim.model.geom_bodyid[geom_id]) or ""
+        if body_name != object_name and not body_name.startswith(f"{object_name}_"):
+            continue
+        aabb = _geom_world_aabb(sim, geom_id)
+        if aabb is None:
+            continue
+        geom_min, geom_max = aabb
+        mins.append(geom_min)
+        maxs.append(geom_max)
+    if not mins:
+        return None
+    return np.min(mins, axis=0), np.max(maxs, axis=0)
+
+
+def _visibility_anchor_points_for_body(
+    *,
+    sim,
+    object_name: str,
+    center: np.ndarray,
+    dims: tuple[float, float, float],
+) -> list[np.ndarray]:
+    """Anchor visibility checks on the live object surface instead of its interior."""
+    aabb = _body_world_aabb(sim, object_name)
+    if aabb is None:
+        return _visibility_anchor_points(center, dims)
+
+    min_corner, max_corner = aabb
+    if not np.all(np.isfinite(min_corner)) or not np.all(np.isfinite(max_corner)):
+        return _visibility_anchor_points(center, dims)
+    if np.any(max_corner <= min_corner):
+        return _visibility_anchor_points(center, dims)
+
+    mid = (min_corner + max_corner) / 2.0
+    xs = (float(min_corner[0]), float(mid[0]), float(max_corner[0]))
+    ys = (float(min_corner[1]), float(mid[1]), float(max_corner[1]))
+    top_z = float(max_corner[2])
+    mid_z = float(mid[2])
+
+    anchors = [np.array((x, y, top_z), dtype=float) for x in xs for y in ys]
+    anchors.extend(
+        np.array((x, y, mid_z), dtype=float)
+        for x in (float(min_corner[0]), float(max_corner[0]))
+        for y in (float(min_corner[1]), float(max_corner[1]))
+    )
+    return anchors
+
+
+def _visibility_depth_tolerance(
+    *,
+    sim,
+    object_name: str,
+    base_tolerance: float = 0.05,
+) -> float:
+    """Depth slack for anchors lying behind the visible front surface."""
+    aabb = _body_world_aabb(sim, object_name)
+    if aabb is None:
+        return base_tolerance
+    min_corner, max_corner = aabb
+    if not np.all(np.isfinite(min_corner)) or not np.all(np.isfinite(max_corner)):
+        return base_tolerance
+    extent = np.maximum(max_corner - min_corner, 0.0)
+    front_surface_slack = min(0.20, max(0.02, float(np.max(extent)) * 1.5))
+    return base_tolerance + front_surface_slack
 
 
 def _anchor_visible(
@@ -260,13 +382,152 @@ def _camera_transforms(
     return world_to_pixel, world_to_camera
 
 
+_NOISE_KIND_OFFSETS: dict[str, int] = {
+    "gaussian_noise": 0,
+    "shot_noise": 1,
+    "impulse_noise": 2,
+    "brightness_jitter": 3,
+    "contrast_jitter": 4,
+}
+
+
+def _apply_image_corruption(
+    image: np.ndarray,
+    kind: str,
+    severity: int,
+    *,
+    seed: int | None = None,
+) -> np.ndarray:
+    """Apply a sensor-noise corruption to a single RGB image.
+
+    Severity follows the *Common Image Corruptions* convention (1..5).
+    All transforms preserve dtype (uint8 in, uint8 out) and shape (H, W, 3).
+    Implementations are deliberately lightweight and dependency-free —
+    we use only numpy here to avoid pulling in scipy.ndimage / opencv at
+    the simulator-import level. The corruption family follows the
+    *Common Image Corruptions* taxonomy (Hendrycks & Dietterich, 2019)
+    so users can swap in the higher-fidelity ``imagecorruptions``
+    package later if needed.
+    """
+    if image.ndim != 3 or image.shape[-1] not in (3, 4) or image.dtype != np.uint8:
+        return image
+    img = image[..., :3].astype(np.float32)
+
+    def _rng(kind_offset: int) -> np.random.Generator:
+        # Combine the optional per-scene ``seed`` with kind/severity so the
+        # realised noise pattern varies across scenes when a non-None seed
+        # is supplied (E5 audit fix). With ``seed=None`` the legacy
+        # severity-only seeding is preserved for backward compatibility.
+        if seed is None:
+            return np.random.default_rng(severity + kind_offset)
+        return np.random.default_rng((int(seed), int(severity), int(kind_offset)))
+
+    if kind == "gaussian_noise":
+        sigma = [4.0, 8.0, 16.0, 24.0, 32.0][severity - 1]
+        rng = _rng(_NOISE_KIND_OFFSETS["gaussian_noise"])
+        noise = rng.normal(0.0, sigma, size=img.shape).astype(np.float32)
+        out = img + noise
+    elif kind == "shot_noise":
+        scale = [60.0, 25.0, 12.0, 5.0, 3.0][severity - 1]
+        rng = _rng(_NOISE_KIND_OFFSETS["shot_noise"])
+        out = rng.poisson(np.clip(img, 0, 255) / 255.0 * scale) / scale * 255.0
+    elif kind == "impulse_noise":
+        prob = [0.01, 0.02, 0.04, 0.08, 0.15][severity - 1]
+        rng = _rng(_NOISE_KIND_OFFSETS["impulse_noise"])
+        mask = rng.random(img.shape[:2])
+        out = img.copy()
+        out[mask < prob / 2.0] = 0.0
+        out[mask > 1.0 - prob / 2.0] = 255.0
+    elif kind == "gaussian_blur":
+        sigma = [0.6, 1.0, 1.5, 2.5, 4.0][severity - 1]
+        out = _gaussian_blur(img, sigma)
+    elif kind == "motion_blur":
+        # Approximate motion blur as a horizontal moving-average box.
+        radius = [2, 3, 5, 8, 12][severity - 1]
+        out = _moving_average(img, radius=radius, axis=1)
+    elif kind == "defocus_blur":
+        sigma = [0.8, 1.2, 1.8, 2.6, 4.0][severity - 1]
+        out = _gaussian_blur(img, sigma)
+    elif kind == "jpeg_compression":
+        # Severity-driven coarse quantisation in YCbCr-ish space; cheap
+        # standin for a real JPEG round-trip without bringing in PIL.
+        steps = [4, 8, 16, 32, 48][severity - 1]
+        out = (np.round(img / steps) * steps).astype(np.float32)
+    elif kind == "brightness_jitter":
+        delta = [10, 25, 45, 70, 100][severity - 1]
+        rng = _rng(_NOISE_KIND_OFFSETS["brightness_jitter"])
+        shift = rng.uniform(-delta, delta)
+        out = img + shift
+    elif kind == "contrast_jitter":
+        gain = [0.95, 0.9, 0.8, 0.65, 0.5][severity - 1]
+        rng = _rng(_NOISE_KIND_OFFSETS["contrast_jitter"])
+        scale = rng.uniform(gain, 1.0 / gain)
+        mean = float(img.mean())
+        out = (img - mean) * scale + mean
+    elif kind == "saturation_jitter":
+        gain = [0.9, 0.75, 0.5, 0.25, 0.1][severity - 1]
+        gray = img.mean(axis=-1, keepdims=True)
+        out = gray + (img - gray) * gain
+    else:
+        return image  # unknown kind; pass-through
+    out = np.clip(out, 0.0, 255.0).astype(np.uint8)
+    if image.shape[-1] == 4:
+        out_rgba = image.copy()
+        out_rgba[..., :3] = out
+        return out_rgba
+    return out
+
+
+def _gaussian_blur(img: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian blur using a numpy 1-D convolution."""
+    radius = max(1, int(round(3.0 * sigma)))
+    x = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-(x**2) / (2.0 * max(sigma, 1e-6) ** 2))
+    kernel /= kernel.sum()
+    out = img.copy()
+    for axis in (0, 1):
+        out = np.apply_along_axis(
+            lambda v: np.convolve(v, kernel, mode="same"),
+            axis=axis,
+            arr=out,
+        )
+    return out
+
+
+def _moving_average(img: np.ndarray, radius: int, axis: int) -> np.ndarray:
+    """Approximate motion-blur kernel along a single axis."""
+    width = 2 * radius + 1
+    kernel = np.ones(width, dtype=np.float32) / float(width)
+    return np.apply_along_axis(
+        lambda v: np.convolve(v, kernel, mode="same"),
+        axis=axis,
+        arr=img,
+    )
+
+
 def _real_depth_map(sim, depth_map: np.ndarray) -> np.ndarray:
-    """Convert MuJoCo's normalized depth image to metric depth."""
-    assert np.all(depth_map >= 0.0) and np.all(depth_map <= 1.0)
+    """Convert MuJoCo's normalized depth image to metric depth.
+
+    Defensively sanitises the input rather than ``assert``-ing — NaN
+    or out-of-range pixels (occasionally produced by EGL drivers on
+    edge cases) would otherwise crash the rollout. Anomalous values
+    are clipped into ``[0, 1]`` and NaNs replaced with ``1.0`` (far
+    plane) so downstream consumers see a finite metric depth.
+    """
+    arr = np.asarray(depth_map, dtype=float)
+    if not np.all(np.isfinite(arr)):
+        arr = np.nan_to_num(arr, nan=1.0, posinf=1.0, neginf=0.0)
+    if arr.min() < 0.0 or arr.max() > 1.0:
+        log.debug(
+            "depth_map out of [0,1] (min=%.4f max=%.4f); clipping",
+            float(arr.min()),
+            float(arr.max()),
+        )
+        arr = np.clip(arr, 0.0, 1.0)
     extent = float(sim.model.stat.extent)
     far = float(sim.model.vis.map.zfar) * extent
     near = float(sim.model.vis.map.znear) * extent
-    return near / (1.0 - depth_map * (1.0 - near / far))
+    return near / (1.0 - arr * (1.0 - near / far))
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +739,14 @@ class LIBEROSimulation(Simulation):
         self._done: bool = False
         self._max_steps = int(kwargs.get("maxSteps") or 500)
 
+        # Snapshot of model arrays taken at env-creation time so the
+        # ``_apply_*_perturbation`` passes can restore the canonical baseline
+        # before each application. This prevents the cumulative-mutation bug
+        # where additive writes (cam_pos += dx, light_diffuse *=
+        # intensity, mat_texid = tex_id) drift the model further from baseline
+        # on every reuse of the same env.
+        self._model_baseline: dict | None = None
+
     # ------------------------------------------------------------------
     # setup — called once before stepping begins
     # ------------------------------------------------------------------
@@ -575,6 +844,12 @@ class LIBEROSimulation(Simulation):
         self.libero_env = OffScreenRenderEnv(**env_cfg)
         self._last_obs = self.libero_env.reset()
 
+        # Snapshot canonical model arrays before any perturbation runs so the
+        # apply pass below — and any future re-application — always starts
+        # from the XML-loaded baseline rather than a previously-perturbed
+        # state. See ``_capture_model_baseline`` docstring.
+        self._capture_model_baseline()
+
         # ── capture LIBERO's default pose for each object / fixture ────
         # After env.reset(), LIBERO places objects at correct z heights
         # via its region samplers.  We preserve those z values and only
@@ -621,6 +896,7 @@ class LIBEROSimulation(Simulation):
 
         self._canonical_rot = dict(default_rot)
         root_surface_z = _infer_root_surface_z(self.scene.objects, default_pose)
+        contained_object_names = _bddl_contained_object_names(effective_bddl)
         self._apply_robot_perturbation()
 
         # ── inject Scenic-sampled positions ───────────────────────────────
@@ -649,23 +925,45 @@ class LIBEROSimulation(Simulation):
                     continue
             pos = np.array(obj.position, dtype=float)  # (x, y, z) MuJoCo frame
             preserve_default_z = bool(getattr(obj, "preserve_default_z", True))
-            # Contained objects (support_parent_name is set) must stay at their
-            # init height inside the container, regardless of ELEVATED_Z_THRESHOLD.
-            # This handles bowls inside cabinet drawers, which sit above the normal
-            # table surface but must not be relocated to table-surface z.
-            is_contained = bool(support_parent_names.get(libero_name, ""))
+            # True containment comes from authored BDDL "(In ...)" relations.
+            # support_parent_name is broader: it is also used for ordinary
+            # "On" support stacks such as bowl-on-ramekin or bowl-on-stove.
+            is_contained = libero_name in contained_object_names
+            # A "supported child" inherits z from its support (e.g. bowl on a
+            # cookies box) and gets lifted above the support's AABB top in
+            # ``_restack_supported_children``. That behaviour is correct for
+            # MOVABLE supports (stack relationships) but incorrect for
+            # FIXED FIXTURE exterior supports — there, the position planner
+            # samples the child's xy in absolute workspace coords and
+            # expects the child to settle on the WORKSPACE (table) surface,
+            # not be teleported to the fixture's AABB top. We treat the
+            # child as "supported" only when its declared support is NOT a
+            # fixed fixture (or it is contained inside one).
+            raw_support_parent = support_parent_names.get(libero_name, "")
+            support_is_fixed_fixture = bool(raw_support_parent) and any(
+                getattr(o, "libero_name", "") == raw_support_parent
+                and getattr(o, "graspable", True) is False
+                for o in self.scene.objects
+            )
+            is_supported_child = (
+                bool(raw_support_parent) and not is_contained and not support_is_fixed_fixture
+            )
             # Use LIBERO's default support height only when the generated
             # Scenic object explicitly opts into it AND the object starts near
             # the table surface (or is inside a container at any height).
             # Objects with elevated default_z (e.g. starting on a stove or
             # cabinet shelf that the robot placed them on) should be placed at
             # table-surface z when their XY position is being perturbed to the
-            # table area — but contained objects are the exception since their
-            # fixture holds them at the correct height.
+            # table area. Contained objects and supported children are the
+            # exceptions: both derive their z from an authored support relation.
             if (
                 preserve_default_z
                 and libero_name in default_pose
-                and (default_pose[libero_name][2] <= ELEVATED_Z_THRESHOLD or is_contained)
+                and (
+                    default_pose[libero_name][2] <= ELEVATED_Z_THRESHOLD
+                    or is_contained
+                    or is_supported_child
+                )
             ):
                 pos[2] = default_pose[libero_name][2]
             else:
@@ -682,6 +980,10 @@ class LIBEROSimulation(Simulation):
         self._apply_articulation_perturbation()
 
         # ── apply environment perturbations from Scenic params ──────────
+        # Restore the canonical XML-loaded model state before each apply pass
+        # so additive (`+=`) and multiplicative (`*=`) writes inside the
+        # _apply_* helpers never accumulate across reuse of the env.
+        self._restore_model_baseline()
         self._apply_camera_perturbation()
         self._apply_lighting_perturbation()
         self._apply_texture_perturbation()
@@ -702,6 +1004,29 @@ class LIBEROSimulation(Simulation):
             # the policy starts from a quiescent state.
             for _ in range(50):
                 mujoco.mj_step(mjmodel, mjdata)
+            mjdata.qvel[:] = 0
+            mujoco.mj_forward(mjmodel, mjdata)
+            # Restrict the re-stack lift to genuine stack relationships
+            # (movable supports). Fixed-fixture exterior supports such as
+            # ``On(bowl, cabinet_top_side)`` are recorded in
+            # ``support_parent_names`` so the validator skips the AABB
+            # overlap pair-check, but the child is intentionally sampled on
+            # the workspace, not on the fixture's AABB top — lifting it
+            # would re-introduce the PR #6 z-height regression.
+            fixture_support_names = {
+                getattr(o, "libero_name", "")
+                for o in self.scene.objects
+                if getattr(o, "graspable", True) is False
+            }
+            stack_support_parent_names = {
+                child: parent
+                for child, parent in support_parent_names.items()
+                if parent not in fixture_support_names
+            }
+            self._restack_supported_children(
+                support_parent_names=stack_support_parent_names,
+                contained_object_names=contained_object_names,
+            )
             mjdata.qvel[:] = 0
             mujoco.mj_forward(mjmodel, mjdata)
 
@@ -780,6 +1105,7 @@ class LIBEROSimulation(Simulation):
             return
 
         obs, _reward, done, _info = self.libero_env.step(self._zero_action)
+        obs = self._apply_sensor_noise(obs)
         self._last_obs = obs
         self._done = bool(done)
 
@@ -882,6 +1208,7 @@ class LIBEROSimulation(Simulation):
         if self.libero_env is None:
             raise RuntimeError("Call setup() before step_with_action()")
         obs, reward, done, info = self.libero_env.step(action)
+        obs = self._apply_sensor_noise(obs)
         self._last_obs = obs
         self._done = bool(done)
         return obs, reward, done, info
@@ -989,6 +1316,68 @@ class LIBEROSimulation(Simulation):
                 pass
 
         log.warning("Could not inject pose for %s: not found as joint or body", libero_name)
+
+    def _restack_supported_children(
+        self,
+        *,
+        support_parent_names: dict[str, str],
+        contained_object_names: set[str],
+    ) -> None:
+        """Lift supported children that settled into their parent support."""
+        if self.libero_env is None:
+            return
+
+        sim = self.libero_env.env.sim
+        for child_name, parent_name in support_parent_names.items():
+            if not parent_name or child_name in contained_object_names:
+                continue
+
+            child_aabb = _body_world_aabb(sim, child_name)
+            parent_aabb = _body_world_aabb(sim, parent_name)
+            if child_aabb is None or parent_aabb is None:
+                continue
+
+            child_min, child_max = child_aabb
+            _parent_min, parent_max = parent_aabb
+            if not np.all(np.isfinite(child_min)) or not np.all(np.isfinite(parent_max)):
+                continue
+
+            child_height = max(float(child_max[2] - child_min[2]), 0.0)
+            clearance = max(0.003, min(0.010, child_height * 0.05))
+            min_child_bottom_z = float(parent_max[2]) + clearance
+            current_child_bottom_z = float(child_min[2])
+            if current_child_bottom_z >= min_child_bottom_z:
+                continue
+
+            dz = min_child_bottom_z - current_child_bottom_z
+            joint_name = f"{child_name}_joint0"
+            try:
+                qpos = sim.data.get_joint_qpos(joint_name).copy()
+                qpos[2] = float(qpos[2]) + dz
+                sim.data.set_joint_qpos(joint_name, qpos)
+                log.debug(
+                    "Lifted supported child %s by %.4f m above %s",
+                    child_name,
+                    dz,
+                    parent_name,
+                )
+                continue
+            except Exception:
+                pass
+
+            for body_name in (child_name, child_name + "_main"):
+                try:
+                    body_id = sim.model.body_name2id(body_name)
+                    sim.model.body_pos[body_id][2] = float(sim.model.body_pos[body_id][2]) + dz
+                    log.debug(
+                        "Lifted supported child body %s by %.4f m above %s",
+                        body_name,
+                        dz,
+                        parent_name,
+                    )
+                    break
+                except Exception:
+                    continue
 
     def _validate_settled_positions(
         self,
@@ -1163,6 +1552,79 @@ class LIBEROSimulation(Simulation):
             )
         )
 
+    # ------------------------------------------------------------------
+    # Model state snapshot / restore (Bug 1 fix)
+    # ------------------------------------------------------------------
+
+    def _capture_model_baseline(self) -> None:
+        """Snapshot the MuJoCo model arrays mutated by ``_apply_*_perturbation``.
+
+        Called once per env, immediately after ``OffScreenRenderEnv`` is
+        constructed. Stores deep copies of the canonical (XML-loaded) values so
+        ``_restore_model_baseline`` can return the model to that baseline before
+        each apply pass. This makes the perturbation pipeline idempotent under
+        repeated application — without it, additive writes to cam_pos /
+        light_pos and multiplicative writes to light_diffuse / light_specular
+        accumulate every time the apply functions run, silently mutating the
+        realised perturbation envelope.
+        """
+        if self.libero_env is None:
+            return
+        sim = self.libero_env.env.sim
+        m = sim.model
+        try:
+            self._model_baseline = {
+                "cam_pos": np.array(m.cam_pos, dtype=float, copy=True),
+                "cam_quat": np.array(m.cam_quat, dtype=float, copy=True),
+                "light_pos": np.array(m.light_pos, dtype=float, copy=True),
+                "light_diffuse": np.array(m.light_diffuse, dtype=float, copy=True),
+                "light_specular": np.array(m.light_specular, dtype=float, copy=True),
+                "light_ambient": np.array(m.light_ambient, dtype=float, copy=True),
+                "mat_texid": np.array(m.mat_texid, dtype=int, copy=True),
+                "headlight_ambient": np.array(m.vis.headlight.ambient, dtype=float, copy=True),
+                # body_pos / body_quat must be snapshotted too: the
+                # ``_inject_object_pose`` and ``_restack_supported_children``
+                # paths write directly to ``sim.model.body_pos[id]`` (and
+                # occasionally body_quat) as a fallback when a body has no
+                # free joint. Without a baseline restore, those writes
+                # persist into subsequent resets and compound across
+                # episodes (RCA: ~/.omar/ea/4/pr6_zheight_rca.md §3).
+                "body_pos": np.array(m.body_pos, dtype=float, copy=True),
+                "body_quat": np.array(m.body_quat, dtype=float, copy=True),
+            }
+        except Exception as exc:
+            log.debug("Model baseline capture failed: %s", exc)
+            self._model_baseline = None
+
+    def _restore_model_baseline(self) -> None:
+        """Restore the snapshotted MuJoCo model arrays.
+
+        Called before each apply pass so that perturbations always start from
+        the canonical XML-loaded state, never from a previously-perturbed
+        state. No-op if no snapshot has been captured (e.g. baseline capture
+        failed).
+        """
+        if self.libero_env is None or self._model_baseline is None:
+            return
+        sim = self.libero_env.env.sim
+        m = sim.model
+        baseline = self._model_baseline
+        try:
+            m.cam_pos[:] = baseline["cam_pos"]
+            m.cam_quat[:] = baseline["cam_quat"]
+            m.light_pos[:] = baseline["light_pos"]
+            m.light_diffuse[:] = baseline["light_diffuse"]
+            m.light_specular[:] = baseline["light_specular"]
+            m.light_ambient[:] = baseline["light_ambient"]
+            m.mat_texid[:] = baseline["mat_texid"]
+            m.vis.headlight.ambient[:] = baseline["headlight_ambient"]
+            if "body_pos" in baseline:
+                m.body_pos[:] = baseline["body_pos"]
+            if "body_quat" in baseline:
+                m.body_quat[:] = baseline["body_quat"]
+        except Exception as exc:
+            log.debug("Model baseline restore failed: %s", exc)
+
     def _has_robot_perturbation(self) -> bool:
         """True if Scenic sampled a robot init-qpos vector for this scene."""
         if self.scene is None:
@@ -1324,9 +1786,19 @@ class LIBEROSimulation(Simulation):
                 continue
             center = np.array(sim.data.body_xpos[body_id][:3], dtype=float)
             dims = object_dimensions.get(target_name, (0.06, 0.06, 0.06))
+            anchor_points = _visibility_anchor_points_for_body(
+                sim=sim,
+                object_name=target_name,
+                center=center,
+                dims=dims,
+            )
+            depth_tolerance = _visibility_depth_tolerance(
+                sim=sim,
+                object_name=target_name,
+            )
             visible = 0
             anchors = 0
-            for point in _visibility_anchor_points(center, dims):
+            for point in anchor_points:
                 anchors += 1
                 visible += int(
                     _anchor_visible(
@@ -1336,11 +1808,12 @@ class LIBEROSimulation(Simulation):
                         depth_map=depth_map,
                         image_height=height,
                         image_width=width,
+                        depth_tolerance=depth_tolerance,
                     )
                 )
             if visible == 0:
                 failures.append(f"{target_name} is out of frame or fully occluded")
-            elif visible < max(1, anchors // 3):
+            elif visible < max(1, min(3, anchors // 4)):
                 failures.append(f"{target_name} is only weakly visible in agentview")
 
         if failures:
@@ -1527,8 +2000,18 @@ class LIBEROSimulation(Simulation):
                 sim.model.light_diffuse[i] *= float(intensity)
                 sim.model.light_specular[i] *= float(intensity)
 
+            # Apply ambient to each declared light, not just the headlight.
+            # MuJoCo's headlight is only active when the model declares no
+            # other lights — most LIBERO scenes do declare lights, so writing
+            # only to vis.headlight.ambient was a no-op for the rendered
+            # frame. Per-light ``light_ambient[i]`` is the channel that
+            # actually contributes to scene shading.
+            if ambient is not None:
+                sim.model.light_ambient[i][:] = float(ambient)
+
         if ambient is not None:
-            # Set global ambient light (headlight ambient in MuJoCo model)
+            # Also set the global headlight ambient as a belt-and-braces
+            # fallback for any scenes that *don't* declare lights.
             sim.model.vis.headlight.ambient[:] = float(ambient)
             log.debug("  ambient level: %.2f", ambient)
 
@@ -1539,6 +2022,27 @@ class LIBEROSimulation(Simulation):
             ldy,
             ldz,
         )
+
+    def _curated_loaded_tex_ids(self, sim) -> list[int]:
+        """Return texture IDs whose names appear in the curated background pool.
+
+        This is the intersection of ``LIBERO_BACKGROUND_TEXTURES`` (the
+        curated wall/floor/table-looking texture names the planner draws over)
+        with the textures actually loaded into the current MuJoCo model. It is
+        used by the ``"random"`` resolution path so that a "random table /
+        background texture" cannot pick a robot, gripper, or character mesh
+        texture that just happens to be loaded.
+        """
+        n_tex = int(getattr(sim.model, "ntex", 0))
+        if n_tex <= 0:
+            return []
+        curated: list[int] = []
+        for name in LIBERO_BACKGROUND_TEXTURES:
+            try:
+                curated.append(int(sim.model.texture_name2id(name)))
+            except Exception:
+                continue
+        return curated
 
     def _apply_texture_perturbation(self) -> None:
         """Perturb table texture from Scenic params.
@@ -1571,12 +2075,22 @@ class LIBEROSimulation(Simulation):
             return
 
         if texture_name == "random":
-            # Pick a random texture from available textures
-            n_tex = sim.model.ntex
-            if n_tex > 0:
-                tex_id = np.random.randint(0, n_tex)
+            # Pick a random texture from the *curated* loaded subset so the
+            # table cannot accidentally adopt a robot/gripper/character mesh
+            # texture that happens to be loaded in the model.
+            curated = self._curated_loaded_tex_ids(sim)
+            if curated:
+                tex_id = int(curated[np.random.randint(0, len(curated))])
             else:
-                return
+                # Fall back to any loaded texture only if no curated entries
+                # are present in the model (e.g. minimal arenas).
+                n_tex = sim.model.ntex
+                if n_tex <= 0:
+                    return
+                tex_id = int(np.random.randint(0, n_tex))
+                log.debug(
+                    "  texture: no curated textures loaded; falling back to any-texture random"
+                )
         else:
             # Look up by name
             try:
@@ -1593,6 +2107,54 @@ class LIBEROSimulation(Simulation):
                     sim.model.mat_texid[mat_id] = tex_id
                     log.debug("  table texture: geom %d → tex %d", geom_id, tex_id)
 
+    def _apply_sensor_noise(self, obs: dict | None) -> dict | None:
+        """Post-process visual observations with the sampled corruption.
+
+        Reads ``sensor_noise_kind`` and ``sensor_noise_severity`` from
+        ``scene.params`` and applies the corresponding image transform to
+        every key in ``obs`` whose name ends in ``"_image"`` (RGB only;
+        depth and segmentation channels are left untouched). The
+        transform is a deterministic function of (kind, severity) so the
+        same scene + step yields the same corrupted image.
+
+        Severity follows the C-level convention from the *Common Image
+        Corruptions* benchmark — ``1`` = barely visible, ``5`` = severe.
+        """
+        if not isinstance(obs, dict) or self.scene is None:
+            return obs
+        params = getattr(self.scene, "params", {}) or {}
+        kind = params.get("sensor_noise_kind")
+        if not kind or kind == "none":
+            return obs
+        severity = int(params.get("sensor_noise_severity") or 1)
+        severity = max(1, min(5, severity))
+
+        # Per-scene seed: combine any explicit ``scenic_seed`` (set by the
+        # planner) with the step counter so identical (kind, severity) pairs
+        # still produce *different* noise patterns across scenes (E5 fix).
+        seed_source = params.get("scenic_seed")
+        if seed_source is None:
+            seed_source = params.get("seed")
+        if seed_source is None:
+            # Fall back to id(self.scene) for at-least-per-episode variation.
+            seed_source = id(self.scene)
+        try:
+            scene_seed = int(seed_source) & 0x7FFFFFFF
+        except (TypeError, ValueError):
+            scene_seed = abs(hash(seed_source)) & 0x7FFFFFFF
+
+        out = dict(obs)
+        for key, value in obs.items():
+            if not (isinstance(key, str) and key.endswith("_image")):
+                continue
+            if not isinstance(value, np.ndarray):
+                continue
+            try:
+                out[key] = _apply_image_corruption(value, kind, severity, seed=scene_seed)
+            except Exception as exc:
+                log.debug("Sensor-noise transform '%s' failed: %s", kind, exc)
+        return out
+
     def _apply_background_perturbation(self) -> None:
         """Perturb wall and floor textures from Scenic params.
 
@@ -1603,8 +2165,8 @@ class LIBEROSimulation(Simulation):
                            or ``"random"`` to pick any loaded texture.
 
         Material names (``walls_mat`` and ``floorplane``) are the names used
-        across all LIBERO scene XMLs — confirmed by inspecting every style XML
-        in vendor/libero/libero/libero/assets/scenes/.  Missing material or
+        across all LIBERO scene XMLs — confirmed by inspecting the installed
+        LIBERO scene assets. Missing material or
         texture names are handled gracefully so that scenes without these
         materials (e.g. custom arenas) are unaffected.
         """
@@ -1623,22 +2185,36 @@ class LIBEROSimulation(Simulation):
         def _resolve_tex_id(texture_name: str) -> int | None:
             """Resolve a texture name to a loaded MuJoCo texture ID.
 
+            "random" and named-but-not-loaded fallbacks both go through the
+            curated wall/floor texture subset rather than ``randint(0, ntex)``,
+            which would otherwise pick robot/gripper/object mesh textures.
+
             Returns:
                 Integer texture ID, or None if the model has no textures.
             """
             n_tex = sim.model.ntex
             if n_tex <= 0:
                 return None
+            curated = self._curated_loaded_tex_ids(sim)
             if texture_name == "random":
+                if curated:
+                    return int(curated[np.random.randint(0, len(curated))])
+                log.debug(
+                    "  background: no curated textures loaded; falling back to any-texture random"
+                )
                 return int(np.random.randint(0, n_tex))
             try:
                 return int(sim.model.texture_name2id(texture_name))
             except Exception:
-                # Named texture not loaded in this model — fall back to random
+                # Named texture not loaded in this model — fall back to a
+                # random *curated* texture so the realised distribution stays
+                # close to the marketed pool.
                 log.debug(
-                    "  background: texture '%s' not in model; using random",
+                    "  background: texture '%s' not in model; using curated random",
                     texture_name,
                 )
+                if curated:
+                    return int(curated[np.random.randint(0, len(curated))])
                 return int(np.random.randint(0, n_tex))
 
         def _apply_mat_texture(mat_name: str, texture_name: str) -> None:

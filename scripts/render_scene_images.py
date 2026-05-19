@@ -28,7 +28,7 @@ Environment
 -----------
     PKG_CONFIG_PATH=/home/batman/.micromamba/envs/libero_libs/lib/pkgconfig
 
-Requires:  mujoco, libero (via vendor/libero symlink), Pillow
+Requires:  mujoco, libero, Pillow
 If mujoco is not available the script prints a diagnostic and exits with
 status 2 so callers can detect the missing-dependency case cleanly.
 """
@@ -66,13 +66,11 @@ def _check_deps() -> tuple[bool, str]:
             "from an environment where 'import mujoco' succeeds."
         )
     try:
-        sys.path.insert(0, str(_REPO_ROOT / "vendor" / "libero"))
         from libero.libero.envs.env_wrapper import OffScreenRenderEnv  # noqa: F401
     except ImportError as exc:
         return False, (
             f"Could not import libero: {exc}\n"
-            "Make sure the vendor/libero symlink is in place and libero's "
-            "dependencies are installed."
+            "Make sure the LIBERO package and its dependencies are installed."
         )
     try:
         from libero_infinity.runtime import ensure_runtime
@@ -87,8 +85,8 @@ def _check_deps() -> tuple[bool, str]:
 def render_one(bddl_path: pathlib.Path, out_path: pathlib.Path, resolution: int) -> None:
     """Render a single task and save the agentview PNG."""
     import numpy as np
-    from PIL import Image
     from libero.libero.envs.env_wrapper import OffScreenRenderEnv
+    from PIL import Image
 
     env = OffScreenRenderEnv(
         bddl_file_name=str(bddl_path),

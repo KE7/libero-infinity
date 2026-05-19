@@ -342,7 +342,7 @@ effective_max = min(max_distractors, 6 - n_task_objects)
 ## Background Perturbation
 
 Swaps the wall and floor textures in MuJoCo to test appearance-invariance. The planner
-discovers available textures from `vendor/libero/libero/libero/assets/textures/` at runtime
+discovers available textures from the installed `libero` package's `assets/textures/` tree at runtime
 (35 PNG assets) and emits a `Uniform(...)` Scenic distribution so every generated episode
 carries a specific, reproducible texture name. If the named texture is not loaded in the
 current MuJoCo model the simulator falls back to a randomly loaded texture rather than

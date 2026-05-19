@@ -17,7 +17,7 @@ from libero_infinity.ir.graph_builder import build_semantic_scene_graph
 from libero_infinity.ir.nodes import ArticulationModel
 from libero_infinity.ir.scene_graph import SemanticSceneGraph
 from libero_infinity.planner.composition import plan_perturbations
-from libero_infinity.planner.types import PerturbationPlan
+from libero_infinity.planner.types import AxisEnvelope, PerturbationPlan, PositionPlan
 from libero_infinity.renderer.scenic_renderer import render_scenic
 from libero_infinity.task_config import TaskConfig
 
@@ -471,6 +471,73 @@ def test_stacked_object_uses_offset_by_syntax() -> None:
     assert "offset by Vector(Range(" in output, (
         "Stacked objects must emit 'offset by Vector(Range(...)' relative positioning syntax\n"
         f"Output was:\n{output}"
+    )
+
+
+def test_contained_siblings_skip_pairwise_aabb_clearance() -> None:
+    """Contained siblings sharing a declared container must not get mutual AABB clearance."""
+    from libero_infinity.ir.nodes import (
+        MovableSupportNode,
+        ObjectNode,
+        PlanDiagnostics,
+        SceneEdge,
+    )
+
+    graph = SemanticSceneGraph(
+        task_language="put both objects in basket",
+        bddl_path="<test>",
+        articulation_model=ArticulationModel.canonical(),
+    )
+    graph.add_node(
+        ObjectNode(
+            node_id="basket_1",
+            node_type="object",
+            instance_name="basket_1",
+            object_class="basket",
+            init_x=0.0,
+            init_y=0.0,
+        )
+    )
+    for name, obj_class in [
+        ("alphabet_soup_1", "alphabet_soup"),
+        ("tomato_sauce_1", "tomato_sauce"),
+    ]:
+        graph.add_node(
+            MovableSupportNode(
+                node_id=name,
+                node_type="movable_support",
+                instance_name=name,
+                object_class=obj_class,
+            )
+        )
+        graph.add_edge(SceneEdge(src_id=name, dst_id="basket_1", label="contained_in"))
+
+    plan = PerturbationPlan(
+        active_axes=frozenset(["position"]),
+        diagnostics=PlanDiagnostics(),
+        position_plans={
+            "alphabet_soup_1": PositionPlan(
+                object_name="alphabet_soup_1",
+                x_envelope=AxisEnvelope(lo=-0.04, hi=-0.03, axis="x"),
+                y_envelope=AxisEnvelope(lo=-0.01, hi=0.01, axis="y"),
+                support_name="basket_1",
+                use_relative_positioning=True,
+            ),
+            "tomato_sauce_1": PositionPlan(
+                object_name="tomato_sauce_1",
+                x_envelope=AxisEnvelope(lo=0.03, hi=0.04, axis="x"),
+                y_envelope=AxisEnvelope(lo=-0.01, hi=0.01, axis="y"),
+                support_name="basket_1",
+                use_relative_positioning=True,
+            ),
+        },
+    )
+
+    output = render_scenic(plan, graph)
+    pairwise_lines = [ln for ln in output.splitlines() if ln.strip().startswith("require (abs(")]
+
+    assert not any(
+        "alphabet_soup_1" in line and "tomato_sauce_1" in line for line in pairwise_lines
     )
 
 

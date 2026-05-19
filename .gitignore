@@ -92,6 +92,16 @@ scenic/_gen_*.scenic
 # Internal audit scripts
 scripts/audit_position_perturbations.py
 
+# Internal VLM research scaffolding (not for publication)
+src/libero_infinity/_vision_audit.py
+tests/test_viewer.py
+tests/test_vision_validation.py
+scripts/render_and_validate.py
+
+# Audit report artifacts (re-runnable; only the asset-parity manifest is tracked)
+audit/*.json
+!audit/asset_parity_lerobot_libero-assets_0b3ea86b.json
+
 # Test artifacts
 /tmp/
 

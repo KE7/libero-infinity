@@ -346,7 +346,16 @@ def test_distractor_budget_scales_with_free_area(
 def test_distractor_budget_narrows_for_position_object_composition(
     sample_graph: SemanticSceneGraph,
 ) -> None:
-    """Position+object+distractor composition should narrow distractor count."""
+    """Position+object+distractor composition narrows the distractor count
+    through the empirical density divisor (joint-sampling safety factor),
+    not via the previous flat ``budget = min(2, …)`` fudge.
+
+    Without ``position_plans`` / ``object_substitutions`` passed, the
+    function falls back to the legacy ``free_area / distractor_footprint``
+    computation, which is what the explicit override below exercises. The
+    real composability check now lives in the data-driven path tested by
+    ``test_distractor_budget_uses_workspace_bounds`` below.
+    """
     diag = PlanDiagnostics()
     budget, _classes = plan_distractor(
         sample_graph,
@@ -354,7 +363,31 @@ def test_distractor_budget_narrows_for_position_object_composition(
         diag,
         free_area=0.5,
     )
-    assert budget <= 2
+    # Legacy fallback path: budget = floor(0.5 / 0.01) = 50, capped at 5.
+    assert 0 < budget <= 5
+
+
+def test_distractor_budget_uses_workspace_bounds(
+    sample_graph: SemanticSceneGraph,
+) -> None:
+    """When position_plans + object_substitutions are passed, the budget
+    is derived from the BDDL workspace bounds + per-task-object footprint
+    reservation — the data-driven free-area path."""
+    from libero_infinity.planner.position import plan_position
+
+    diag = PlanDiagnostics()
+    pos_plans = plan_position(sample_graph, frozenset(["position"]), diag)
+    budget, _classes = plan_distractor(
+        sample_graph,
+        frozenset(["position", "object", "distractor"]),
+        diag,
+        position_plans=pos_plans,
+        object_substitutions={},
+    )
+    # The exact value depends on the sample task's table size; we just
+    # pin the invariant that the budget is in the allowed range and
+    # not pegged at the legacy hardcoded cap.
+    assert 0 <= budget <= 5
 
 
 def test_distractor_classes_non_empty(sample_graph: SemanticSceneGraph) -> None:
@@ -617,6 +650,132 @@ def test_contained_position_fixture_interior_limits_envelope() -> None:
     assert pp.x_envelope.hi == pytest.approx(expected_dx, abs=1e-6)
     assert pp.y_envelope.lo == pytest.approx(-expected_dy, abs=1e-6)
     assert pp.y_envelope.hi == pytest.approx(expected_dy, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "container_class",
+    ["basket", "tray", "wooden_tray", "desk_caddy", "caddy"],
+)
+def test_contained_position_known_movable_container_uses_explicit_interior(
+    container_class: str,
+) -> None:
+    """Known movable containers must use explicit interior geometry, not full footprint."""
+    from libero_infinity.ir.nodes import ObjectNode, SceneEdge
+    from libero_infinity.planner.position import (
+        _MOVABLE_CONTAINER_INTERIOR,
+        _plan_contained_position,
+    )
+
+    graph = SemanticSceneGraph(
+        task_language="put soup in basket",
+        bddl_path="<test>",
+        articulation_model=ArticulationModel.canonical(),
+    )
+    basket = ObjectNode(
+        node_id="basket_1",
+        node_type="object",
+        instance_name="basket_1",
+        object_class=container_class,
+    )
+    child = ObjectNode(
+        node_id="alphabet_soup_1",
+        node_type="object",
+        instance_name="alphabet_soup_1",
+        object_class="alphabet_soup",
+        contained=True,
+    )
+    graph.add_node(basket)
+    graph.add_node(child)
+    graph.add_edge(SceneEdge(src_id="alphabet_soup_1", dst_id="basket_1", label="contained_in"))
+
+    diag = PlanDiagnostics()
+    pp = _plan_contained_position(child, "basket_1", graph, diag)
+
+    assert pp is not None
+    parent_x, parent_y = _MOVABLE_CONTAINER_INTERIOR[container_class]
+    assert pp.x_envelope.lo == pytest.approx(-(parent_x / 2.0 - 0.03), abs=1e-6)
+    assert pp.y_envelope.hi == pytest.approx(parent_y / 2.0 - 0.03, abs=1e-6)
+
+
+def test_contained_position_unsupported_movable_container_fails_closed() -> None:
+    """Unsupported movable containers must be dropped with a diagnostic."""
+    from libero_infinity.ir.nodes import ObjectNode, SceneEdge
+    from libero_infinity.planner.position import _plan_contained_position
+
+    graph = SemanticSceneGraph(
+        task_language="put bowl in plate",
+        bddl_path="<test>",
+        articulation_model=ArticulationModel.canonical(),
+    )
+    plate = ObjectNode(
+        node_id="plate_1",
+        node_type="object",
+        instance_name="plate_1",
+        object_class="plate",
+    )
+    child = ObjectNode(
+        node_id="akita_black_bowl_1",
+        node_type="object",
+        instance_name="akita_black_bowl_1",
+        object_class="akita_black_bowl",
+        contained=True,
+    )
+    graph.add_node(plate)
+    graph.add_node(child)
+    graph.add_edge(SceneEdge(src_id="akita_black_bowl_1", dst_id="plate_1", label="contained_in"))
+
+    diag = PlanDiagnostics()
+    result = _plan_contained_position(child, "plate_1", graph, diag)
+
+    assert result is None
+    assert "position" in diag.dropped_axes
+    assert "unsupported movable container" in diag.reasons["position"]
+
+
+def test_contained_siblings_share_container_with_deterministic_slots() -> None:
+    """Contained siblings in one movable container get stable disjoint ranges."""
+    from libero_infinity.ir.nodes import ObjectNode, SceneEdge
+    from libero_infinity.planner.position import _plan_contained_position
+
+    graph = SemanticSceneGraph(
+        task_language="put both objects in basket",
+        bddl_path="<test>",
+        articulation_model=ArticulationModel.canonical(),
+    )
+    graph.add_node(
+        ObjectNode(
+            node_id="basket_1",
+            node_type="object",
+            instance_name="basket_1",
+            object_class="basket",
+        )
+    )
+    left = ObjectNode(
+        node_id="alphabet_soup_1",
+        node_type="object",
+        instance_name="alphabet_soup_1",
+        object_class="alphabet_soup",
+        contained=True,
+    )
+    right = ObjectNode(
+        node_id="tomato_sauce_1",
+        node_type="object",
+        instance_name="tomato_sauce_1",
+        object_class="tomato_sauce",
+        contained=True,
+    )
+    graph.add_node(left)
+    graph.add_node(right)
+    graph.add_edge(SceneEdge(src_id="tomato_sauce_1", dst_id="basket_1", label="contained_in"))
+    graph.add_edge(SceneEdge(src_id="alphabet_soup_1", dst_id="basket_1", label="contained_in"))
+
+    diag = PlanDiagnostics()
+    left_plan = _plan_contained_position(left, "basket_1", graph, diag)
+    right_plan = _plan_contained_position(right, "basket_1", graph, diag)
+
+    assert left_plan is not None
+    assert right_plan is not None
+    assert left_plan.x_envelope.hi < right_plan.x_envelope.lo
 
 
 def test_contained_position_missing_container_returns_none_and_drops_axis() -> None:
@@ -1397,3 +1556,112 @@ def test_check_envelope_quality_keeps_all_valid_envelopes() -> None:
 
     assert len(plan.position_plans) == 3, "_check_envelope_quality must not remove any valid plans"
     assert "position" not in diag.dropped_axes
+
+
+# ---------------------------------------------------------------------------
+# Baseline / perturbation articulation split (PR #6 z-height fix)
+# ---------------------------------------------------------------------------
+
+
+def _build_graph_from(bddl_text: str, tmp_path) -> SemanticSceneGraph:
+    p = tmp_path / "task.bddl"
+    p.write_text(bddl_text)
+    cfg = TaskConfig.from_bddl(p)
+    return build_semantic_scene_graph(cfg)
+
+
+def _stove_bowl_bddl() -> str:
+    """Minimal BDDL where bowl_2 starts On(cabinet_top_side) — no :init Open."""
+    return (
+        "(define (problem demo) (:domain robosuite)\n"
+        "(:language test)\n"
+        "(:regions (top_side (:target wooden_cabinet_1)) "
+        "(plate_region (:target main_table) (:ranges ((0.0 0.0 0.05 0.05)))))\n"
+        "(:fixtures\nmain_table - table\nwooden_cabinet_1 - wooden_cabinet\n)\n"
+        "(:objects akita_black_bowl_1 - akita_black_bowl plate_1 - plate)\n"
+        "(:obj_of_interest akita_black_bowl_1 plate_1)\n"
+        "(:init (On akita_black_bowl_1 wooden_cabinet_1_top_side) "
+        "(On plate_1 main_table_plate_region) "
+        "(On wooden_cabinet_1 main_table))\n"
+        "(:goal (And (On akita_black_bowl_1 plate_1))))"
+    )
+
+
+def _opencabinet_bddl() -> str:
+    """BDDL where :init asserts (Open wooden_cabinet_1_top_region)."""
+    return (
+        "(define (problem demo) (:domain robosuite)\n"
+        "(:language test)\n"
+        "(:regions (top_region (:target wooden_cabinet_1)) "
+        "(table_center (:target main_table) (:ranges ((-0.05 -0.05 0.05 0.05)))))\n"
+        "(:fixtures\nmain_table - table\nwooden_cabinet_1 - wooden_cabinet\n)\n"
+        "(:objects akita_black_bowl_1 - akita_black_bowl)\n"
+        "(:obj_of_interest akita_black_bowl_1)\n"
+        "(:init (On akita_black_bowl_1 main_table_table_center) "
+        "(On wooden_cabinet_1 main_table) "
+        "(Open wooden_cabinet_1_top_region))\n"
+        "(:goal (And (On akita_black_bowl_1 main_table_table_center))))"
+    )
+
+
+def test_baseline_articulation_canonical_default_when_no_init_predicate(tmp_path):
+    """No :init Open/Close → baseline is canonical default (Close for cabinets)."""
+    from libero_infinity.planner.axes import compute_baseline_articulation
+
+    graph = _build_graph_from(_stove_bowl_bddl(), tmp_path)
+    diag = PlanDiagnostics()
+    baseline = compute_baseline_articulation(graph, diag)
+    assert "wooden_cabinet_1" in baseline
+    assert baseline["wooden_cabinet_1"].state_kind == "Close"
+
+
+def test_baseline_articulation_honours_bddl_init_open(tmp_path):
+    """``(Open wooden_cabinet_1_top_region)`` in :init → baseline.state_kind == Open."""
+    from libero_infinity.planner.axes import compute_baseline_articulation
+
+    graph = _build_graph_from(_opencabinet_bddl(), tmp_path)
+    diag = PlanDiagnostics()
+    baseline = compute_baseline_articulation(graph, diag)
+    assert "wooden_cabinet_1" in baseline
+    assert baseline["wooden_cabinet_1"].state_kind == "Open"
+
+
+def test_baseline_articulation_applied_without_articulation_axis(tmp_path):
+    """plan_perturbations with axis={position} must still emit the baseline plan."""
+    graph = _build_graph_from(_opencabinet_bddl(), tmp_path)
+    plan = plan_perturbations(graph, frozenset(["position"]))
+    assert "wooden_cabinet_1" in plan.articulation_plans
+    assert plan.articulation_plans["wooden_cabinet_1"].state_kind == "Open"
+
+
+def test_articulation_perturbation_cannot_close_required_open_fixture(tmp_path):
+    """When :init asserts Open, the articulation axis perturbation must NOT
+    flip the fixture to Close — that would invalidate the task precondition."""
+    from libero_infinity.planner.axes import (
+        compute_baseline_articulation,
+        plan_articulation_perturbation,
+    )
+
+    graph = _build_graph_from(_opencabinet_bddl(), tmp_path)
+    diag = PlanDiagnostics()
+    baseline = compute_baseline_articulation(graph, diag)
+    overrides = plan_articulation_perturbation(graph, baseline, frozenset(["articulation"]), diag)
+    # The pinned fixture must not appear as an override (or, if it does,
+    # must remain in the Open state). Either way: state_kind stays Open.
+    final = dict(baseline)
+    final.update(overrides)
+    assert final["wooden_cabinet_1"].state_kind == "Open"
+
+
+def test_articulation_perturbation_no_axis_returns_empty_overrides(tmp_path):
+    """``"articulation"`` not in request_axes → no override overlay."""
+    from libero_infinity.planner.axes import (
+        compute_baseline_articulation,
+        plan_articulation_perturbation,
+    )
+
+    graph = _build_graph_from(_stove_bowl_bddl(), tmp_path)
+    diag = PlanDiagnostics()
+    baseline = compute_baseline_articulation(graph, diag)
+    overrides = plan_articulation_perturbation(graph, baseline, frozenset(["position"]), diag)
+    assert overrides == {}

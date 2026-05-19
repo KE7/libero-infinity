@@ -23,10 +23,8 @@ from conftest import (
     OPEN_DRAWER_BDDL,
     OPEN_MICROWAVE_BDDL,
     REPO_ROOT,
-    SCENIC_DIR,
     STOVE_BDDL,
     STUDY_SHELF_BDDL,
-    assert_pairwise_clearance,
 )
 
 from libero_infinity.perturbation_audit import (
@@ -38,136 +36,24 @@ from libero_infinity.perturbation_audit import (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scenic program compilation
+# Legacy handwritten Scenic program tests REMOVED.
+#
+# The handwritten scenic/{position,object,combined,camera,lighting,robot,
+# distractor,background,verifai_position}_perturbation.scenic files have been
+# deleted in favour of the renderer-emitted (compile_task / generate_scenic /
+# render_scenic) path, which is task-general and is the production path used
+# by gym_env.py. Coverage of the renderer-emitted programs lives in
+# TestPositionPerturbationAudit and TestScenicGenerator below; the
+# constraint-satisfaction tests previously gated on the legacy files are
+# subsumed by TestPositionPerturbationAudit's structural assertions and
+# TestScenicGenerator's compile-and-sample tests.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class TestScenicCompilation:
-    """Each .scenic file should compile without syntax errors."""
-
-    @pytest.mark.parametrize(
-        "scenic_file",
-        [
-            "position_perturbation.scenic",
-            "object_perturbation.scenic",
-            "combined_perturbation.scenic",
-            "robot_perturbation.scenic",
-        ],
-    )
-    def test_compiles(self, scenic_file):
-        import scenic as sc
-
-        path = SCENIC_DIR / scenic_file
-        assert path.exists(), f"{scenic_file} not found at {path}"
-
-        scenario = sc.scenarioFromFile(
-            str(path),
-            params={
-                "bddl_path": str(BOWL_BDDL) if BOWL_BDDL else "",
-                "task": "put_the_bowl_on_the_plate",
-            },
-        )
-        assert scenario is not None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Position perturbation
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestPositionPerturbation:
-    """position_perturbation.scenic: constraint verification across N samples."""
-
-    @pytest.fixture(scope="class")
-    def scenario(self):
-        import scenic as sc
-
-        path = SCENIC_DIR / "position_perturbation.scenic"
-        return sc.scenarioFromFile(
-            str(path),
-            params={
-                "task": "put_the_bowl_on_the_plate",
-                "bddl_path": str(BOWL_BDDL) if BOWL_BDDL else "",
-                "min_clearance": 0.12,
-            },
-        )
-
-    @pytest.fixture(scope="class")
-    def scenes(self, scenario):
-        return [scenario.generate(maxIterations=2000, verbosity=0) for _ in range(20)]
-
-    def test_objects_present(self, scenes):
-        for scene, _ in scenes:
-            libero_names = [getattr(o, "libero_name", "") for o in scene.objects]
-            assert "akita_black_bowl_1" in libero_names
-            assert "plate_1" in libero_names
-
-    def test_positions_on_table(self, scenes):
-        TABLE_Z = 0.82
-        for scene, _ in scenes:
-            for obj in scene.objects:
-                if not getattr(obj, "libero_name", ""):
-                    continue
-                z = obj.position.z
-                assert abs(z - TABLE_Z) < 0.05, f"{obj.libero_name} z={z:.3f} not on table"
-
-    def test_within_workspace(self, scenes):
-        X_MIN, X_MAX = -0.40, 0.40
-        Y_MIN, Y_MAX = -0.30, 0.30
-        for scene, _ in scenes:
-            for obj in scene.objects:
-                if not getattr(obj, "libero_name", ""):
-                    continue
-                x, y = obj.position.x, obj.position.y
-                assert X_MIN - 0.01 <= x <= X_MAX + 0.01, f"{obj.libero_name} x={x:.3f} out of workspace"  # fmt: skip  # noqa: E501
-                assert Y_MIN - 0.01 <= y <= Y_MAX + 0.01, f"{obj.libero_name} y={y:.3f} out of workspace"  # fmt: skip  # noqa: E501
-
-    def test_pairwise_clearance(self, scenes):
-        for scene, _ in scenes:
-            assert_pairwise_clearance(scene, min_clearance=0.12)
-
-    def test_positions_vary(self, scenes):
-        bowl_xs = []
-        for scene, _ in scenes:
-            for obj in scene.objects:
-                if getattr(obj, "libero_name", "") == "akita_black_bowl_1":
-                    bowl_xs.append(obj.position.x)
-        assert len(bowl_xs) >= 2
-        assert np.std(bowl_xs) > 0.02, f"Bowl x too uniform: std={np.std(bowl_xs):.4f}"
-
-    def test_optional_goal_fixture_can_move(self):
-        import scenic as sc
-
-        path = SCENIC_DIR / "position_perturbation.scenic"
-        scenario = sc.scenarioFromFile(
-            str(path),
-            params={
-                "task": "put_both_moka_pots_on_the_stove",
-                "bddl_path": str(STOVE_BDDL) if STOVE_BDDL else "",
-                "goal_fixture_name": "flat_stove_1",
-                "goal_fixture_class": "flat_stove",
-                "goal_fixture_width": 0.24,
-                "goal_fixture_length": 0.18,
-                "goal_fixture_height": 0.08,
-                "goal_fixture_train_x": 0.05,
-                "goal_fixture_train_y": -0.05,
-            },
-        )
-
-        scene, _ = scenario.generate(maxIterations=2000, verbosity=0)
-        stove = next(
-            obj for obj in scene.objects if getattr(obj, "libero_name", "") == "flat_stove_1"
-        )
-
-        assert getattr(stove, "asset_class", "") == "flat_stove"
-        assert -0.40 <= stove.position.x <= 0.40
-        assert -0.30 <= stove.position.y <= 0.30
-        assert abs(stove.position.x - 0.05) > 1e-6 or abs(stove.position.y + 0.05) > 1e-6
-
-    def test_rejection_count_reasonable(self, scenes):
-        iters = [n for _, n in scenes]
-        median_iters = sorted(iters)[len(iters) // 2]
-        assert median_iters < 500
+class TestRendererPositionConstraints:
+    """Renderer-emitted position-perturbation programs use pairwise AABB
+    clearance constraints. Pins the constraint shape so we don't silently
+    regress to the old (deleted) handwritten templates."""
 
     def test_generated_task_uses_pairwise_axis_clearance(self):
         from libero_infinity.compiler import generate_scenic
@@ -221,7 +107,12 @@ class TestPositionPerturbationAudit:
         stacked_cfg = TaskConfig.from_bddl(str(stacked_bddl))
         moving_fixtures, movable_supports, _parent_map = moving_support_names(stacked_cfg)
         assert "cookies_1" in movable_supports
-        assert not moving_fixtures
+        # The cookie-box-and-plate BDDL also declares a wooden_cabinet_1
+        # fixture that supports akita_black_bowl_2; that fixture is therefore
+        # a legitimate "moving support fixture" too. (Earlier revisions of
+        # this test asserted ``not moving_fixtures``, inconsistent with the
+        # BDDL's actual (:fixtures ...) block.)
+        assert "wooden_cabinet_1" in moving_fixtures
 
         drawer_cfg = TaskConfig.from_bddl(str(DRAWER_PICK_BOWL_BDDL))
         moving_fixtures, movable_supports, _parent_map = moving_support_names(drawer_cfg)
@@ -298,235 +189,16 @@ class TestPositionPerturbationAudit:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class TestObjectPerturbation:
-    """object_perturbation.scenic: asset sampling from ASSET_VARIANTS."""
-
-    @pytest.fixture(scope="class")
-    def scenario(self):
-        import scenic as sc
-
-        path = SCENIC_DIR / "object_perturbation.scenic"
-        return sc.scenarioFromFile(
-            str(path),
-            params={
-                "perturb_class": "akita_black_bowl",
-                "bddl_path": str(BOWL_BDDL) if BOWL_BDDL else "",
-                "include_canonical": True,
-            },
-        )
-
-    @pytest.fixture(scope="class")
-    def scenes(self, scenario):
-        return [scenario.generate(maxIterations=100, verbosity=0) for _ in range(30)]
-
-    def test_chosen_asset_in_params(self, scenes):
-        for scene, _ in scenes:
-            assert "chosen_asset" in scene.params
-
-    def test_chosen_asset_is_valid(self, scenes):
-        from libero_infinity.asset_registry import ASSET_VARIANTS
-
-        valid = set(ASSET_VARIANTS["akita_black_bowl"])
-        for scene, _ in scenes:
-            assert scene.params["chosen_asset"] in valid
-
-    def test_asset_distribution_covers_variants(self, scenes):
-        seen = {scene.params["chosen_asset"] for scene, _ in scenes}
-        assert len(seen) >= 2
-
-    def test_object_has_chosen_asset_class(self, scenes):
-        for scene, _ in scenes:
-            chosen = scene.params["chosen_asset"]
-            bowl_assets = [
-                getattr(o, "asset_class", None)
-                for o in scene.objects
-                if getattr(o, "libero_name", "") == "akita_black_bowl_1"
-            ]
-            assert any(a == chosen for a in bowl_assets)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Combined perturbation
+# TestObjectPerturbation, TestCombinedPerturbation, TestNewScenicPrograms,
+# TestDistractorPerturbation removed: every assertion in those classes was
+# gated on a handwritten scenic/{object,combined,camera,lighting,robot,
+# verifai_position,distractor}_perturbation.scenic file. Those files have
+# been deleted in favour of the renderer-emitted (compile_task) path which
+# is task-general and is the production path used by gym_env.py. The
+# axis-output coverage that those classes provided is preserved by the
+# renderer-side tests in tests/test_renderer.py and tests/test_planner.py.
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestCombinedPerturbation:
-    """combined_perturbation.scenic: joint position + object distribution."""
-
-    @pytest.fixture(scope="class")
-    def scenario(self):
-        import scenic as sc
-
-        path = SCENIC_DIR / "combined_perturbation.scenic"
-        return sc.scenarioFromFile(
-            str(path),
-            params={
-                "task": "put_the_bowl_on_the_plate",
-                "bddl_path": str(BOWL_BDDL) if BOWL_BDDL else "",
-                "perturb_class": "akita_black_bowl",
-                "min_clearance": 0.12,
-            },
-        )
-
-    @pytest.fixture(scope="class")
-    def scenes(self, scenario):
-        return [scenario.generate(maxIterations=2000, verbosity=0) for _ in range(15)]
-
-    def test_positions_and_assets_both_vary(self, scenes):
-        bowl_xs = []
-        bowl_assets = []
-        for scene, _ in scenes:
-            for obj in scene.objects:
-                if getattr(obj, "libero_name", "") == "akita_black_bowl_1":
-                    bowl_xs.append(obj.position.x)
-                    bowl_assets.append(getattr(obj, "asset_class", ""))
-        assert np.std(bowl_xs) > 0.02, "Bowl x positions don't vary"
-        assert len(set(bowl_assets)) >= 2, "Bowl assets don't vary"
-
-    def test_clearance_still_satisfied(self, scenes):
-        for scene, _ in scenes:
-            assert_pairwise_clearance(scene, min_clearance=0.12)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# New scenic programs (camera, lighting, verifai)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestNewScenicPrograms:
-    """New .scenic files must compile and generate valid scenes."""
-
-    @pytest.mark.parametrize(
-        "scenic_file",
-        [
-            "camera_perturbation.scenic",
-            "lighting_perturbation.scenic",
-            "robot_perturbation.scenic",
-            "verifai_position.scenic",
-        ],
-    )
-    def test_compiles(self, scenic_file):
-        import scenic as sc
-
-        path = SCENIC_DIR / scenic_file
-        assert path.exists(), f"{scenic_file} not found"
-
-        scenario = sc.scenarioFromFile(
-            str(path),
-            params={"bddl_path": str(BOWL_BDDL) if BOWL_BDDL else ""},
-        )
-        scene, _ = scenario.generate(maxIterations=200, verbosity=0)
-        assert scene is not None
-
-    def test_camera_params_sampled(self):
-        import scenic as sc
-
-        path = SCENIC_DIR / "camera_perturbation.scenic"
-        scenario = sc.scenarioFromFile(str(path), params={"bddl_path": ""})
-        scene, _ = scenario.generate(maxIterations=100, verbosity=0)
-        assert "camera_x_offset" in scene.params
-        assert "camera_y_offset" in scene.params
-        assert "camera_z_offset" in scene.params
-        assert "camera_tilt" in scene.params
-        assert -0.11 <= scene.params["camera_x_offset"] <= 0.11
-        assert -0.11 <= scene.params["camera_y_offset"] <= 0.11
-
-    def test_lighting_params_sampled(self):
-        import scenic as sc
-
-        path = SCENIC_DIR / "lighting_perturbation.scenic"
-        scenario = sc.scenarioFromFile(str(path), params={"bddl_path": ""})
-        scene, _ = scenario.generate(maxIterations=100, verbosity=0)
-        assert "light_intensity" in scene.params
-        assert 0.39 <= scene.params["light_intensity"] <= 2.01
-
-    def test_robot_params_sampled(self):
-        import scenic as sc
-
-        path = SCENIC_DIR / "robot_perturbation.scenic"
-        scenario = sc.scenarioFromFile(str(path), params={"bddl_path": ""})
-        scene, _ = scenario.generate(maxIterations=100, verbosity=0)
-        assert "robot_init_radius" in scene.params
-        assert 0.1 <= scene.params["robot_init_radius"] <= 0.5
-        qpos = scene.params["robot_init_qpos"]
-        assert len(qpos) == 7
-        assert all(np.isfinite(qpos))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Distractor perturbation (scenic-only)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class TestDistractorPerturbation:
-    """distractor_perturbation.scenic: distractor slot pattern."""
-
-    @pytest.fixture(scope="class")
-    def scenario(self):
-        import scenic as sc
-
-        path = SCENIC_DIR / "distractor_perturbation.scenic"
-        return sc.scenarioFromFile(
-            str(path),
-            params={"bddl_path": str(BOWL_BDDL) if BOWL_BDDL else ""},
-        )
-
-    @pytest.fixture(scope="class")
-    def scenes(self, scenario):
-        return [scenario.generate(maxIterations=2000, verbosity=0) for _ in range(15)]
-
-    def test_n_distractors_in_params(self, scenes):
-        for scene, _ in scenes:
-            n = scene.params.get("n_distractors")
-            assert n is not None
-            assert 1 <= int(n) <= 5
-
-    def test_all_distractor_slots_present(self, scenes):
-        for scene, _ in scenes:
-            dist_names = [
-                getattr(o, "libero_name", "")
-                for o in scene.objects
-                if getattr(o, "libero_name", "").startswith("distractor_")
-            ]
-            assert len(dist_names) == 5
-
-    def test_distractor_classes_valid(self, scenes):
-        from libero_infinity.asset_registry import DEFAULT_DISTRACTOR_POOL
-
-        for scene, _ in scenes:
-            for i in range(5):
-                cls = scene.params.get(f"distractor_{i}_class")
-                assert cls in DEFAULT_DISTRACTOR_POOL, f"Unexpected class: {cls}"
-
-    def test_distractor_clearance(self, scenes):
-        for scene, _ in scenes:
-            n = int(scene.params["n_distractors"])
-            active_names = {
-                "akita_black_bowl_1",
-                "plate_1",
-                "cream_cheese_1",
-                "wine_bottle_1",
-                *(f"distractor_{i}" for i in range(n)),
-            }
-            filtered = [
-                obj for obj in scene.objects if getattr(obj, "libero_name", "") in active_names
-            ]
-            for i, a in enumerate(filtered):
-                for b in filtered[i + 1 :]:
-                    pa = np.array([a.position.x, a.position.y])
-                    pb = np.array([b.position.x, b.position.y])
-                    dist = np.linalg.norm(pa - pb)
-                    assert dist >= 0.049, (
-                        f"Clearance violation: {a.libero_name} ↔ {b.libero_name} "
-                        f"dist={dist:.3f} < 0.05"
-                    )
-
-    def test_distractor_class_diversity(self, scenes):
-        all_classes = set()
-        for scene, _ in scenes:
-            for i in range(5):
-                all_classes.add(scene.params.get(f"distractor_{i}_class"))
-        assert len(all_classes) >= 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -799,8 +471,20 @@ class TestScenicGenerator:
             os.unlink(path)
 
     def test_combined_mode_compiles(self, bowl_config):
+        import random
+
+        import numpy as np
+
         import scenic as sc
         from libero_infinity.compiler import generate_scenic_file
+
+        # Pin the RNGs so Scenic's rejection sampler is deterministic — same
+        # rationale as test_full_mode_compiles below: tight radial
+        # footprint-clearance constraints make pass/fail probabilistic even
+        # at maxIterations=10000 without a fixed seed, causing intermittent
+        # flakes in CI.
+        random.seed(0)
+        np.random.seed(0)
 
         path = generate_scenic_file(bowl_config, perturbation="combined")
         try:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import numpy as np
+
 _SUPPORT_SCALE_BY_CLASS: dict[str, tuple[float, float]] = {
     "plate": (0.55, 0.55),
     "tray": (0.65, 0.65),
@@ -75,7 +77,17 @@ def yaw_bounds(
     span = _YAW_SPAN_BY_CLASS.get(key)
     if span is None:
         span = 0.30 if _looks_round(asset_class) else 0.18
-    return (centre - span, centre + span)
+    # Defensive: span must be a finite, strictly-positive number so callers
+    # always see ``lo < hi`` (audit F2). A zero / negative entry sneaking
+    # into ``_YAW_SPAN_BY_CLASS`` would otherwise silently disable yaw
+    # perturbation by collapsing the interval.
+    span = float(span)
+    if not (span > 0.0) or not np.isfinite(span):
+        return None
+    lo, hi = centre - span, centre + span
+    if not (lo < hi):
+        return None
+    return (lo, hi)
 
 
 def coordinated_group_offset(

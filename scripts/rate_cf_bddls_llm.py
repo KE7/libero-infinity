@@ -319,6 +319,51 @@ async def score_one_ollama(
             await asyncio.sleep(5 * (attempt + 1))
 
 
+async def score_one_litellm(
+    variant: dict, model: str, sem: asyncio.Semaphore
+) -> dict:
+    """Score a single variant using litellm (supports Vertex AI, etc.)."""
+    try:
+        import litellm
+    except ImportError:
+        raise RuntimeError("litellm not installed. Run: uv pip install 'litellm[google]'")
+
+    scene_url = get_scene_image_url(variant["source_task"], variant["suite"])
+
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": scene_url},
+                },
+                {
+                    "type": "text",
+                    "text": _variant_text(variant),
+                },
+            ],
+        },
+    ]
+
+    for attempt in range(3):
+        try:
+            async with sem:
+                response = await litellm.acompletion(
+                    model=model,
+                    messages=messages,
+                    temperature=0.1,
+                    timeout=120,
+                )
+            content = response.choices[0].message.content
+            return _parse_one(content, variant)
+        except Exception as exc:
+            if attempt == 2:
+                return _parse_one(f"REQUEST_ERROR: {exc}", variant)
+            await asyncio.sleep(5 * (attempt + 1))
+
+
 def _parse_one(response: str, variant: dict) -> dict:
     response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
     m = re.search(r"\{.*\}", response, re.DOTALL)
@@ -462,6 +507,8 @@ async def run(args: argparse.Namespace) -> None:
         async with aiohttp.ClientSession() as session:
             if args.backend == "openrouter":
                 tasks = [score_one_openrouter(session, v, args.model, sem) for v in variants]
+            elif args.backend == "litellm":
+                tasks = [score_one_litellm(v, args.model, sem) for v in variants]
             else:
                 tasks = [score_one_ollama(session, v, args.model, sem) for v in variants]
 
@@ -544,7 +591,7 @@ async def run(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model",        default="qwen/qwen3-vl-235b-a22b-thinking")
-    parser.add_argument("--backend",      choices=["openrouter", "ollama"], default="openrouter")
+    parser.add_argument("--backend",      choices=["openrouter", "ollama", "litellm"], default="openrouter")
     parser.add_argument("--concurrency",  type=int, default=10,
                         help="Max simultaneous requests (default 10)")
     parser.add_argument("--max-variants", type=int, default=None)

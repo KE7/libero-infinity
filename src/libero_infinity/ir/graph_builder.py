@@ -24,6 +24,34 @@ from libero_infinity.ir.scene_graph import SemanticSceneGraph
 from libero_infinity.task_config import TaskConfig
 
 _GOAL_PRED_RE = re.compile(r"\((?:On|In)\s+(\w+)\s+(\w+)\)")
+_INIT_ARTIC_RE = re.compile(r"\((Open|Close|Turnon|Turnoff)\s+([^\s()]+)\)")
+
+
+def _resolve_articulation_init_states(cfg: TaskConfig) -> dict[str, str]:
+    """Parse BDDL ``:init`` articulation predicates and bind them to fixtures.
+
+    BDDL allows articulation predicates to target either a fixture instance
+    directly (``(Open wooden_cabinet_1)``) or one of its sub-regions
+    (``(Open wooden_cabinet_1_top_region)``). Both forms encode the same
+    task precondition — the fixture must be in the asserted state at init.
+    This helper normalises them to a ``{fixture_instance_name: state_kind}``
+    mapping by matching region names against the declared fixtures.
+    """
+    fixture_names = {f.instance_name for f in cfg.fixtures}
+    init_states: dict[str, str] = {}
+    for match in _INIT_ARTIC_RE.finditer(cfg.init_text or ""):
+        state, target = match.group(1), match.group(2)
+        if target in fixture_names:
+            init_states[target] = state
+            continue
+        # Region-style target: find longest fixture prefix that matches.
+        owner = None
+        for fname in fixture_names:
+            if target.startswith(fname + "_") and (owner is None or len(fname) > len(owner)):
+                owner = fname
+        if owner is not None:
+            init_states[owner] = state
+    return init_states
 
 
 def build_semantic_scene_graph(cfg: TaskConfig) -> SemanticSceneGraph:
@@ -50,6 +78,9 @@ def build_semantic_scene_graph(cfg: TaskConfig) -> SemanticSceneGraph:
     for obj in cfg.movable_objects:
         if obj.stacked_on:
             movable_support_targets.add(obj.stacked_on)
+
+    # BDDL :init articulation predicates, normalised to {fixture: state}.
+    init_articulation_states = _resolve_articulation_init_states(cfg)
 
     # ------------------------------------------------------------------
     # Fixture nodes
@@ -78,6 +109,7 @@ def build_semantic_scene_graph(cfg: TaskConfig) -> SemanticSceneGraph:
                 init_y=fixture.init_y,
                 init_yaw=fixture.init_yaw,
                 is_articulatable=is_artic,
+                init_state_kind=init_articulation_states.get(fixture.instance_name),
             )
             graph.add_node(fnode)
 
