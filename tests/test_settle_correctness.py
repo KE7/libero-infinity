@@ -1,3 +1,7 @@
+# BDDL filenames inline in T6's parametrize tuples are unavoidably long; relax
+# E501 file-wide rather than mutate canonical filenames or hide them behind
+# constants that obscure the regression mapping.
+# ruff: noqa: E501
 """
 Tests for settling correctness and retry-loop elimination.
 T1: SettleUnsafeError never raised in src/
@@ -9,6 +13,8 @@ T5: Single-object settle stability
 
 import subprocess
 from pathlib import Path
+
+import pytest
 
 SRC_DIR = Path(__file__).parent.parent / "src"
 
@@ -88,9 +94,6 @@ def test_validation_errors_constants():
 # parent is a movable scene object (graspable=True). This test asserts the
 # parameterised LR_SCENE1 basket task — the canonical reproducer for the
 # bug — resets successfully under position-axis perturbation.
-import pytest
-import pathlib as _pathlib
-
 
 # 16 (task, seed) tuples from ~/.omar/ea/4/validation_run/logs/failures_live_full.jsonl
 # matching axis_subset==["position"], error_class=="RuntimeError",
@@ -98,9 +101,18 @@ import pathlib as _pathlib
 # precise rows the run-2b RCA pins as "settle-retry exhaustion via
 # visibility check".  Each row must now reset() without raising.
 _VISIBILITY_RETRY_REGRESSION_TUPLES = [
-    ("libero_10/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket.bddl", 0),
-    ("libero_10/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket.bddl", 0),
-    ("libero_10/LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket.bddl", 0),
+    (
+        "libero_10/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket.bddl",
+        0,
+    ),
+    (
+        "libero_10/LIVING_ROOM_SCENE2_put_both_the_cream_cheese_box_and_the_butter_in_the_basket.bddl",
+        0,
+    ),
+    (
+        "libero_10/LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket.bddl",
+        0,
+    ),
     ("libero_90/LIVING_ROOM_SCENE1_pick_up_the_alphabet_soup_and_put_it_in_the_basket.bddl", 0),
     ("libero_90/LIVING_ROOM_SCENE1_pick_up_the_cream_cheese_box_and_put_it_in_the_basket.bddl", 0),
     ("libero_90/LIVING_ROOM_SCENE1_pick_up_the_ketchup_and_put_it_in_the_basket.bddl", 0),
@@ -111,17 +123,26 @@ _VISIBILITY_RETRY_REGRESSION_TUPLES = [
     ("libero_90/LIVING_ROOM_SCENE2_pick_up_the_butter_and_put_it_in_the_basket.bddl", 0),
     ("libero_90/LIVING_ROOM_SCENE2_pick_up_the_tomato_sauce_and_put_it_in_the_basket.bddl", 0),
     ("libero_90/LIVING_ROOM_SCENE3_pick_up_the_alphabet_soup_and_put_it_in_the_tray.bddl", 0),
-    ("libero_90/LIVING_ROOM_SCENE4_pick_up_the_black_bowl_on_the_left_and_put_it_in_the_tray.bddl", 0),
+    (
+        "libero_90/LIVING_ROOM_SCENE4_pick_up_the_black_bowl_on_the_left_and_put_it_in_the_tray.bddl",
+        0,
+    ),
     # Two-object basket task with multiple settle retries — exercises the
     # restack filter against ALL five workspace-supported objects.
-    ("libero_10/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate.bddl", 0),
-    ("libero_10/LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate.bddl", 0),
+    (
+        "libero_10/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate_and_put_the_chocolate_pudding_to_the_right_of_the_plate.bddl",
+        0,
+    ),
+    (
+        "libero_10/LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate_and_put_the_yellow_and_white_mug_on_the_right_plate.bddl",
+        0,
+    ),
 ]
 
 
-def _bddl_root() -> _pathlib.Path:
+def _bddl_root() -> Path:
     return (
-        _pathlib.Path(__file__).parent.parent
+        Path(__file__).parent.parent
         / "src"
         / "libero_infinity"
         / "data"
@@ -145,6 +166,7 @@ def test_position_axis_workspace_supported_reset_does_not_exhaust_retries(
     check`` at ``gym_env.py:268``. Each must now pass.
     """
     import random
+
     import numpy as np
 
     from libero_infinity.gym_env import LIBEROScenicEnv
@@ -186,6 +208,5 @@ def test_restack_filter_uses_movable_scene_objects_positive_set() -> None:
         "reject every position-axis sample on living_room/study arenas."
     )
     assert "if parent in movable_scene_names" in source, (
-        "Expected restack filter to keep only children whose parent is a "
-        "movable scene object."
+        "Expected restack filter to keep only children whose parent is a movable scene object."
     )
