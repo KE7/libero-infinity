@@ -14,7 +14,9 @@ Geometric difficulty levels (subjective):
 
 from __future__ import annotations
 
+import functools
 import json
+import pathlib
 import pkgutil
 import re
 
@@ -118,9 +120,6 @@ def get_distractor_pool(
 #
 # This is determined by scanning the bundled LIBERO asset MJCF files. The
 # result is cached on first use.
-
-import functools
-import pathlib
 
 
 @functools.lru_cache(maxsize=1)
