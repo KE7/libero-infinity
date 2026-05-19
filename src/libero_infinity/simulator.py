@@ -1011,17 +1011,43 @@ class LIBEROSimulation(Simulation):
             # ``On(bowl, cabinet_top_side)`` are recorded in
             # ``support_parent_names`` so the validator skips the AABB
             # overlap pair-check, but the child is intentionally sampled on
-            # the workspace, not on the fixture's AABB top — lifting it
-            # would re-introduce the PR #6 z-height regression.
-            fixture_support_names = {
+            # the workspace (or fixture exterior), not on the parent's AABB
+            # top — lifting it would re-introduce the PR #6 z-height
+            # regression.
+            #
+            # We allow restack ONLY when the parent is a *movable* scene
+            # object (graspable=True). Two failure modes occur if we
+            # instead filter by the negative set "explicit fixed fixtures
+            # in scene.objects":
+            #
+            #   1. Workspace tables (``living_room_table``,
+            #      ``kitchen_table``, …) are NOT enumerated in
+            #      ``scene.objects`` at all — they are the implicit
+            #      arena. The old filter ``parent not in
+            #      fixture_support_names`` was therefore vacuously true
+            #      for every workspace-supported child, and the restack
+            #      lifted every basket / soup / mug / book to its arena's
+            #      AABB top (z ≈ 1.30 m on living_room_table), which is
+            #      above the agentview camera (z = 0.96 m) and triggers
+            #      Scenic visibility rejection until the 10-retry cap
+            #      exhausts.
+            #
+            #   2. Same hazard for any future fixture not registered as a
+            #      Scenic object.
+            #
+            # Using the positive set "movable scene objects" closes both:
+            # restack lifts exist only for ``stacked_on`` (movable→movable)
+            # relationships; everything else falls through to physics
+            # settling alone.
+            movable_scene_names = {
                 getattr(o, "libero_name", "")
                 for o in self.scene.objects
-                if getattr(o, "graspable", True) is False
+                if getattr(o, "graspable", True) is True
             }
             stack_support_parent_names = {
                 child: parent
                 for child, parent in support_parent_names.items()
-                if parent not in fixture_support_names
+                if parent in movable_scene_names
             }
             self._restack_supported_children(
                 support_parent_names=stack_support_parent_names,
