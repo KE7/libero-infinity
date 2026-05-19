@@ -237,7 +237,8 @@
     "yellow_book": [0.12, 0.18, 0.03],
     "chefmate_8_frypan": [0.22, 0.22, 0.05],
     "bowl_drainer": [0.16, 0.14, 0.06],
-    "desk_caddy": [0.14, 0.10, 0.06]
+    "desk_caddy": [0.14, 0.42, 0.22],
+    "wooden_two_layer_shelf": [0.33, 0.20, 0.21]
   },
   "distractor_pool": [
     "cream_cheese",
