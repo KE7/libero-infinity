@@ -14,8 +14,11 @@ Geometric difficulty levels (subjective):
 
 from __future__ import annotations
 
+import functools
 import json
+import pathlib
 import pkgutil
+import re
 
 _raw = pkgutil.get_data("libero_infinity", "data/asset_variants.json")
 assert _raw is not None, "asset_variants.json not found in package data"
@@ -92,3 +95,98 @@ def get_distractor_pool(
     if exclude_classes:
         pool = [c for c in pool if c not in exclude_classes]
     return pool
+
+
+# ---------------------------------------------------------------------------
+# Asset affordance probe: which classes expose a ``contain_region`` site?
+# ---------------------------------------------------------------------------
+#
+# LIBERO's BDDL goal predicates refer to per-instance sub-regions like
+# ``basket_1_contain_region``. These names resolve at runtime to MuJoCo sites
+# named ``contain_region`` declared inside the asset's MJCF; LIBERO's
+# ``_load_sites_in_arena`` matches them by suffix and registers a
+# ``SiteObjectState`` in ``object_states_dict``. If the asset MJCF lacks a
+# ``contain_region`` site, the site state is never registered and
+# ``_eval_predicate`` raises ``KeyError`` the first time ``check_success()``
+# runs (see ``simulator.py``'s post-settle observable refresh).
+#
+# The object-axis perturbation pipeline picks variant classes from
+# ``ASSET_VARIANTS``; some of those (e.g. ``white_storage_box``,
+# ``chefmate_8_frypan``) lack a ``contain_region`` site. When chosen as a
+# substitute for a goal-required container (basket / wooden_tray /
+# desk_caddy), they break the goal predicate. The planner therefore needs to
+# know which classes preserve the ``contain_region`` affordance so it can
+# filter container variant pools.
+#
+# This is determined by scanning the bundled LIBERO asset MJCF files. The
+# result is cached on first use.
+
+
+@functools.lru_cache(maxsize=1)
+def _libero_assets_root() -> pathlib.Path | None:
+    """Locate the bundled LIBERO ``assets/`` directory.
+
+    The runtime resolves LIBERO assets via the installed ``libero`` package,
+    so we use the same root. Returns ``None`` if the package is not importable
+    (in which case affordance probing must fail closed — see callers).
+    """
+    try:
+        import libero.libero  # type: ignore
+    except Exception:
+        return None
+    pkg_dir = pathlib.Path(libero.libero.__file__).parent
+    candidate = pkg_dir / "assets"
+    return candidate if candidate.is_dir() else None
+
+
+_CONTAIN_REGION_SITE_RE = re.compile(rb'name="([A-Za-z0-9_]*contain_region)"')
+
+
+@functools.lru_cache(maxsize=512)
+def contain_region_sites(asset_class: str) -> frozenset[str]:
+    """Return the set of ``*contain_region``-suffixed MJCF site names that
+    ``asset_class`` declares.
+
+    LIBERO matches BDDL region references like ``<instance>_<site>`` against
+    the underlying MJCF site names; a missing site causes
+    ``_load_sites_in_arena`` to omit the entry from ``object_states_dict``
+    and ``_eval_predicate`` then raises ``KeyError`` on the first
+    ``check_success()`` (see ``rca/stage3_run2b_contain_region_family.md``).
+
+    The basket / wooden_tray classes expose a single site named
+    ``contain_region``; the desk_caddy class exposes four directional ones
+    (``left_contain_region``, ``right_contain_region``,
+    ``back_contain_region``, ``front_contain_region``). The object-axis
+    planner uses this set to require that any substitute variant exposes a
+    superset of the canonical class's containment sites.
+
+    Probing is done by scanning the bundled LIBERO ``assets/`` tree and is
+    cached. Returns the empty set if the asset has no MJCF (fail-closed:
+    callers must treat the canonical class as the only safe choice in that
+    case).
+    """
+    root = _libero_assets_root()
+    if root is None:
+        return frozenset()
+    # Convention: each asset class lives in ``<group>/<class>/<class>.xml``.
+    for group_dir in root.iterdir():
+        if not group_dir.is_dir():
+            continue
+        asset_dir = group_dir / asset_class
+        if not asset_dir.is_dir():
+            continue
+        xml_path = asset_dir / f"{asset_class}.xml"
+        if not xml_path.is_file():
+            continue
+        try:
+            with open(xml_path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return frozenset()
+        return frozenset(m.group(1).decode("ascii") for m in _CONTAIN_REGION_SITE_RE.finditer(data))
+    return frozenset()
+
+
+def class_provides_contain_region(asset_class: str) -> bool:
+    """Backwards-compatible: True iff the class declares any contain_region site."""
+    return bool(contain_region_sites(asset_class))

@@ -1,3 +1,5 @@
+# BDDL/site names in synthetic graph tuples are unavoidably long; relax E501.
+# ruff: noqa: E501
 """Focused regression tests for the object/language rewrite bug-fix bundle.
 
 Each test targets one specific bug:
@@ -329,3 +331,180 @@ def test_generate_cf_bddls_obj_of_interest_bounded_rewrite() -> None:
         ooi_block = cf_text[ooi_idx:end_idx]
         ooi_msg = f"obj_of_interest dropped akita_black_bowl_10: {ooi_block!r}"
         assert "akita_black_bowl_10" in ooi_block, ooi_msg
+
+
+# ---------------------------------------------------------------------------
+# Bug 7: container variant pool admits classes without contain_region site
+#
+# Root cause for the ``*_contain_region`` family failures in Stage 3 Run 2b
+# (see ``rca/stage3_run2b_contain_region_family.md``).  The basket / wooden
+# tray / desk caddy variant pools in ``asset_variants.json`` include classes
+# that lack a MuJoCo ``contain_region`` site (e.g. ``white_storage_box``,
+# ``chefmate_8_frypan``). When the object-axis planner picks one of those
+# as a substitute, LIBERO's ``_load_sites_in_arena`` cannot register
+# ``<inst>_contain_region`` in ``object_states_dict`` — and the BDDL goal
+# predicate ``(In x basket_1_contain_region)`` then raises ``KeyError`` on
+# the first ``check_success()`` after settle.  The planner must therefore
+# filter the variant pool of any node whose ``_contain_region`` is required
+# by an incoming ``contained_in`` edge.
+# ---------------------------------------------------------------------------
+
+
+def test_class_provides_contain_region_probe() -> None:
+    """The MJCF probe must correctly classify known container vs non-container
+    LIBERO asset classes."""
+    from libero_infinity.asset_registry import class_provides_contain_region
+
+    # Container classes — MJCF declares ``name="contain_region"``.
+    assert class_provides_contain_region("basket")
+    assert class_provides_contain_region("wooden_tray")
+    assert class_provides_contain_region("desk_caddy")
+
+    # Non-container classes — present in the basket/tray/caddy variant pools
+    # but their MJCF has no ``contain_region`` site.
+    assert not class_provides_contain_region("white_storage_box")
+    assert not class_provides_contain_region("chefmate_8_frypan")
+    # Random graspables should also be False.
+    assert not class_provides_contain_region("alphabet_soup")
+
+
+def test_plan_object_filters_container_variants_lacking_contain_region() -> None:
+    """Synthetic-graph variant of the container-affordance filter test.
+
+    Scope: pins ``plan_object``'s filter logic given the production
+    ``goal_target`` edge shape (``dst_id == "<node_id>_<contain_site>"``).
+    Originally constructed against an inert ``contained_in`` edge per PR #7;
+    repaired in ``fix/contain-region-filter-real-graph`` to mirror the real
+    graph builder. The real-BDDL regression lives in
+    ``tests/test_planner_contain_region_real_graph.py``; this one keeps a
+    self-contained unit-level pin on the asset-registry + planner contract.
+    """
+    from libero_infinity.ir.nodes import (
+        ArticulationModel,
+        ObjectNode,
+        PlanDiagnostics,
+        SceneEdge,
+    )
+    from libero_infinity.ir.scene_graph import SemanticSceneGraph
+    from libero_infinity.planner.axes import plan_object
+
+    graph = SemanticSceneGraph(
+        task_language="put both items in the basket",
+        bddl_path="<test>",
+        articulation_model=ArticulationModel.canonical(),
+    )
+    basket = ObjectNode(
+        node_id="basket_1",
+        node_type="object",
+        instance_name="basket_1",
+        object_class="basket",
+    )
+    soup = ObjectNode(
+        node_id="alphabet_soup_1",
+        node_type="object",
+        instance_name="alphabet_soup_1",
+        object_class="alphabet_soup",
+        contained=True,
+    )
+    cheese = ObjectNode(
+        node_id="cream_cheese_1",
+        node_type="object",
+        instance_name="cream_cheese_1",
+        object_class="cream_cheese",
+        contained=True,
+    )
+    graph.add_node(basket)
+    graph.add_node(soup)
+    graph.add_node(cheese)
+    # Real graph shape: BDDL ``(In x basket_1_contain_region)`` is emitted as
+    # a ``goal_target`` edge whose ``dst_id`` is the full site name. See
+    # ``ir/graph_builder.py::build_semantic_scene_graph``.
+    graph.add_edge(
+        SceneEdge(src_id="alphabet_soup_1", dst_id="basket_1_contain_region", label="goal_target")
+    )
+    graph.add_edge(
+        SceneEdge(src_id="cream_cheese_1", dst_id="basket_1_contain_region", label="goal_target")
+    )
+
+    diag = PlanDiagnostics()
+    plan = plan_object(graph, frozenset(["object"]), diag)
+
+    # basket_1 must have a pool; every variant in it must preserve contain_region.
+    # If it had been pinned to the canonical singleton it would be excluded from
+    # the plan (the planner skips no-choice nodes); the basket pool has
+    # ["basket", "wooden_tray", "white_storage_box"] and the two container
+    # classes survive filtering, so the pool must be present and exclude the
+    # non-container.
+    from libero_infinity.asset_registry import class_provides_contain_region
+
+    assert "basket_1" in plan, "basket should still have a substitution choice"
+    pool = plan["basket_1"]
+    _msg_filtered = f"lossy variant lacking contain_region site must be filtered: got {pool!r}"
+    assert "white_storage_box" not in pool, _msg_filtered
+    for v in pool:
+        _msg_variant = f"variant {v!r} kept in container pool despite missing contain_region"
+        assert class_provides_contain_region(v), _msg_variant
+
+
+def test_plan_object_pins_container_when_no_safe_variants() -> None:
+    """If no variant of a container preserves contain_region, the planner
+    must pin to the canonical class (drop it from the plan, since a 1-class
+    pool is a no-op substitution)."""
+    # Realistic scenario: temporarily narrow basket's variant pool to only
+    # non-container alternatives. After the planner's safety filter, the
+    # only surviving variant must be the canonical class (basket itself),
+    # which collapses the pool to a singleton and drops basket_1 from the
+    # plan dict (plan_object's existing no-choice filter).
+    import libero_infinity.asset_registry as ar
+    from libero_infinity.ir.nodes import (
+        ArticulationModel,
+        ObjectNode,
+        PlanDiagnostics,
+        SceneEdge,
+    )
+    from libero_infinity.ir.scene_graph import SemanticSceneGraph
+    from libero_infinity.planner.axes import plan_object
+
+    container_class = "basket"
+    saved = ar.ASSET_VARIANTS[container_class]
+    ar.ASSET_VARIANTS[container_class] = [
+        container_class,
+        "white_storage_box",
+        "chefmate_8_frypan",
+    ]
+    try:
+        graph = SemanticSceneGraph(
+            task_language="put item in basket",
+            bddl_path="<test>",
+            articulation_model=ArticulationModel.canonical(),
+        )
+        cont = ObjectNode(
+            node_id="basket_1",
+            node_type="object",
+            instance_name="basket_1",
+            object_class=container_class,
+        )
+        item = ObjectNode(
+            node_id="item_1",
+            node_type="object",
+            instance_name="item_1",
+            object_class="alphabet_soup",
+            contained=True,
+        )
+        graph.add_node(cont)
+        graph.add_node(item)
+        # Real graph shape (see note in the sibling test above).
+        graph.add_edge(
+            SceneEdge(src_id="item_1", dst_id="basket_1_contain_region", label="goal_target")
+        )
+
+        diag = PlanDiagnostics()
+        plan = plan_object(graph, frozenset(["object"]), diag)
+        # basket_1 must NOT appear — no contain_region-preserving variants
+        # other than canonical, so pinning collapses pool to singleton.
+        assert "basket_1" not in plan, (
+            "container with no contain_region-preserving variants must pin "
+            f"to canonical and be dropped from plan, got {plan!r}"
+        )
+    finally:
+        ar.ASSET_VARIANTS[container_class] = saved

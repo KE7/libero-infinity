@@ -177,6 +177,61 @@ def plan_object(
                         f"{contained_edges[0].dst_id}",
                     )
 
+        # Container-affordance preservation: if any goal predicate references
+        # a ``<node_id>_<site>`` region where ``<site>`` is a ``*contain_region``
+        # site declared by the canonical class's MJCF, every viable variant
+        # MUST expose that same site. Otherwise LIBERO's
+        # ``_load_sites_in_arena`` cannot register ``<inst>_<site>`` in
+        # ``object_states_dict`` and ``_eval_predicate`` raises ``KeyError`` on
+        # the first ``check_success()`` call. See
+        # ``rca/stage3_run2b_contain_region_family.md`` for the failure
+        # signature (basket/tray/caddy family, 29 % G5 fail rate post
+        # round-robin) and ``rca/integration_smoke_pr7_filter_inert.md`` for
+        # the PR #7 inert-filter post-mortem.
+        #
+        # PR #7 originally probed for incoming ``contained_in`` graph edges
+        # but the production ``build_semantic_scene_graph`` does not emit
+        # that label — it emits ``goal_target`` edges whose ``dst_id`` is the
+        # FULL site name (``<node_id>_<site>``), not the node id itself. The
+        # filter therefore never fired on real BDDL graphs. This corrected
+        # path inspects ``goal_target`` edges directly so the repair works
+        # against the real graph shape and is exercised by the
+        # ``test_planner_contain_region_real_graph`` regression test.
+        from libero_infinity.asset_registry import contain_region_sites
+
+        canonical_contain_sites = contain_region_sites(obj_class)
+        referenced_contain_sites: set[str] = set()
+        if canonical_contain_sites:
+            prefix = f"{node_id}_"
+            for e in graph.edges:
+                if e.label != "goal_target":
+                    continue
+                if not e.dst_id.startswith(prefix):
+                    continue
+                suffix = e.dst_id[len(prefix) :]
+                if suffix in canonical_contain_sites:
+                    referenced_contain_sites.add(suffix)
+        if referenced_contain_sites:
+            # A variant is safe iff it exposes every ``*contain_region`` site
+            # the goal references on this node. We require the canonical's
+            # full set (not just the referenced subset) so that perturbations
+            # do not silently degrade affordance coverage that future goal
+            # rewrites might depend on. For basket/wooden_tray the canonical
+            # set is ``{contain_region}``; for desk_caddy it is the four
+            # directional ``*_contain_region`` sites.
+            required_sites = canonical_contain_sites
+            filtered = [v for v in variants if contain_region_sites(v) >= required_sites]
+            if filtered:
+                variants = filtered
+            else:
+                variants = [obj_class]
+                diagnostics.narrow_axis(
+                    "object",
+                    f"{node_id}: no variants preserve contain_region sites "
+                    f"{sorted(required_sites)!r} required by goal predicate; "
+                    f"pinning to canonical {obj_class!r}",
+                )
+
         # Stacking dimensional check: variant footprint must fit on support.
         # The previous 20% over-footprint tolerance silently allowed stacks
         # whose centre of mass projected outside the support surface (e.g. a
