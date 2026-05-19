@@ -1,0 +1,83 @@
+name: Validation Reduced Suite (nightly)
+
+# Publication artifact (paper §5): reduced 10-task × 16-subset slice with all
+# G0–G4 hooks enabled (including the G4 identity adapter restored in PR #13).
+# Output JSONL is uploaded as a workflow artifact and consumed by the paper's
+# results table generator.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"  # 07:00 UTC nightly
+  workflow_dispatch:
+
+jobs:
+  reduced-suite:
+    name: Reduced-suite sweep (10 tasks × 16 subsets × 1 seed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install MuJoCo system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libegl1 libgles2 libosmesa6-dev
+
+      - name: Install project dependencies (dev only, no LIBERO sim)
+        run: uv sync --extra dev
+
+      - name: Run reduced-suite sweep (scenic-only; G0–G4 hooks active)
+        env:
+          MUJOCO_GL: egl
+        run: |
+          mkdir -p artifacts
+          # 10 representative tasks across libero_goal / libero_spatial / libero_10.
+          TASKS="libero_goal/put_the_bowl_on_the_stove.bddl,\
+          libero_goal/open_the_middle_drawer_of_the_cabinet.bddl,\
+          libero_goal/put_the_bowl_on_top_of_the_cabinet.bddl,\
+          libero_goal/push_the_plate_to_the_front_of_the_stove.bddl,\
+          libero_goal/put_the_wine_bottle_on_the_rack.bddl,\
+          libero_goal/put_the_cream_cheese_in_the_bowl.bddl,\
+          libero_goal/open_the_top_drawer_and_put_the_bowl_inside.bddl,\
+          libero_spatial/pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate.bddl,\
+          libero_10/KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it.bddl,\
+          libero_10/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl"
+          MUJOCO_GL=egl PYTHONPATH=src .venv/bin/python -m libero_infinity.validation.sweep \
+            --tasks "${TASKS}" \
+            --subsets 16 \
+            --seeds 1 \
+            --workers 4 \
+            --scenic-only \
+            --subset-seed 0 \
+            --out artifacts/reduced_suite.jsonl
+
+      - name: Summarise gate pass rates
+        run: |
+          PYTHONPATH=src .venv/bin/python - <<'PY'
+          import json, collections
+          rows = [json.loads(l) for l in open("artifacts/reduced_suite.jsonl")]
+          c = collections.Counter()
+          for r in rows:
+              for g in ("g0", "g1", "g2", "g3"):
+                  c[(g, r.get(g))] += 1
+          print(f"n_rows={len(rows)}")
+          for k, v in sorted(c.items()):
+              print(k, v)
+          PY
+
+      - name: Upload reduced-suite JSONL
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-reduced-suite
+          path: artifacts/reduced_suite.jsonl
+          retention-days: 30

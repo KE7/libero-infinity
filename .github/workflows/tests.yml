@@ -42,7 +42,77 @@ jobs:
           MUJOCO_GL=egl PYTHONPATH=src .venv/bin/python -m pytest \
             tests/test_scenic.py \
             tests/test_perturbation_policy.py \
+            tests/test_invariants_identity.py \
+            tests/test_invariants_affordance.py \
+            tests/test_invariants_consistency.py \
+            tests/test_invariants_domain.py \
             -v --tb=short
+
+  validation-smoke:
+    name: Validation Smoke (G0–G3 on 2-task × 3-subset sweep)
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install MuJoCo system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libegl1 libgles2 libosmesa6-dev
+
+      - name: Install project dependencies (dev only)
+        run: uv sync --extra dev
+
+      - name: Run validation sweep (scenic-only, deterministic)
+        env:
+          MUJOCO_GL: egl
+        run: |
+          MUJOCO_GL=egl PYTHONPATH=src .venv/bin/python -m libero_infinity.validation.sweep \
+            --tasks "libero_goal/put_the_bowl_on_the_stove.bddl,libero_goal/open_the_middle_drawer_of_the_cabinet.bddl" \
+            --subsets 3 \
+            --seeds 1 \
+            --workers 2 \
+            --scenic-only \
+            --subset-seed 0 \
+            --out /tmp/ci_smoke.jsonl
+
+      - name: Assert G0–G3 are 100% pass on all 6 rows
+        run: |
+          PYTHONPATH=src .venv/bin/python - <<'PY'
+          import json, sys
+          rows = [json.loads(l) for l in open("/tmp/ci_smoke.jsonl")]
+          assert len(rows) == 6, f"expected 6 rows, got {len(rows)}"
+          fails = []
+          for r in rows:
+              for gate in ("g0", "g1", "g2", "g3"):
+                  if r.get(gate) != "pass":
+                      fails.append((r.get("task"), r.get("axis_subset"), r.get("seed"), gate, r.get(gate), r.get("error_msg")))
+          if fails:
+              for f in fails:
+                  print("FAIL", f)
+              sys.exit(1)
+          print(f"OK: {len(rows)} rows, G0–G3 all pass")
+          PY
+
+      # Always upload the artifact so a failed CI run leaves a debuggable trail.
+      # This is a diagnostic upload, not a test bypass — no test result is altered.
+      - name: Upload smoke JSONL
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-smoke-jsonl
+          path: /tmp/ci_smoke.jsonl
+          if-no-files-found: warn
 
   lint:
     name: Lint & Format
