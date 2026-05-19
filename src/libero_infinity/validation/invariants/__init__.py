@@ -37,8 +37,8 @@ from .domain import (
     assert_on_predicates_z,
 )
 from .identity import (
-    AssertionResult,
     IDENTITY_ASSERTIONS,
+    AssertionResult,
     assert_all_identities,
     assert_articulation_unchanged,
     assert_background_unchanged,

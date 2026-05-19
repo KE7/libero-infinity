@@ -141,7 +141,9 @@ def _coerce_quat(o: Any) -> tuple[float, float, float, float] | None:
     return None
 
 
-def _quat_angle_deg(q1: tuple[float, float, float, float], q2: tuple[float, float, float, float]) -> float:
+def _quat_angle_deg(
+    q1: tuple[float, float, float, float], q2: tuple[float, float, float, float]
+) -> float:
     """Return the rotation angle (degrees) between two unit quaternions."""
     # Normalize defensively (callers may pass un-normalised).
     def _norm(q):
@@ -196,7 +198,9 @@ def assert_pose_tolerance(
     payload["env_position"] = e_pos_t
     payload["position_error"] = pos_err
 
-    s_ori = _coerce_quat(getattr(scenic_obj, "orientation", None) or getattr(scenic_obj, "yaw", None))
+    s_ori = _coerce_quat(
+        getattr(scenic_obj, "orientation", None) or getattr(scenic_obj, "yaw", None)
+    )
     e_ori = _coerce_quat(env_obj_state.get("orientation"))
     rot_err_deg: float | None = None
     if s_ori is not None and e_ori is not None:

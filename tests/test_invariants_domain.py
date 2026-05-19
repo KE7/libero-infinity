@@ -21,7 +21,6 @@ from libero_infinity.validation.invariants import (
     assert_on_predicates_z,
 )
 
-
 # ---------------------------------------------------------------------------
 # Mocks
 # ---------------------------------------------------------------------------
@@ -92,7 +91,9 @@ def test_bddl_objects_present_pass():
 
 
 def test_bddl_objects_present_fail():
-    bddl = _BDDL(movable_objects=[_BDDLObj("bowl_1", "akita_black_bowl"), _BDDLObj("plate_1", "plate")])
+    bddl = _BDDL(
+        movable_objects=[_BDDLObj("bowl_1", "akita_black_bowl"), _BDDLObj("plate_1", "plate")]
+    )
     scene = _Scene(objects=[_Obj("bowl_1", "akita_black_bowl")])
     r = assert_bddl_objects_present(bddl, scene)
     assert r.passed is False

@@ -244,7 +244,9 @@ def run_condition(
 
         scenic_src = compile_task_to_scenic(cfg, request)
         if not scenic_src or not isinstance(scenic_src, str):
-            raise RuntimeError(f"compile_task_to_scenic returned empty/non-str: {type(scenic_src)!r}")
+            raise RuntimeError(
+                f"compile_task_to_scenic returned empty/non-str: {type(scenic_src)!r}"
+            )
         row["g1"] = "pass"
     except Exception as exc:  # noqa: BLE001
         _record_failure(row, "g1", exc)

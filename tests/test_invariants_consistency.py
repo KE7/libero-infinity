@@ -139,7 +139,9 @@ def test_assert_consistency_env_missing_is_failure_not_skip():
 
 
 def test_assert_consistency_detects_class_mismatch():
-    scene = _Scene(objects=[_Obj("bowl_1", "bowl", position=(0, 0, 0), orientation=_quat_about_z(0))])
+    scene = _Scene(
+        objects=[_Obj("bowl_1", "bowl", position=(0, 0, 0), orientation=_quat_about_z(0))]
+    )
     env = _Env(
         {"bowl_1": {"position": (0, 0, 0), "orientation": _quat_about_z(0), "class": "plate"}}
     )

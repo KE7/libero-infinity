@@ -65,7 +65,9 @@ def _resolve_grasp_point(
     return None
 
 
-def _aabb_xy_intersects(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+def _aabb_xy_intersects(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> bool:
     ax0, ax1, ay0, ay1 = a
     bx0, bx1, by0, by1 = b
     return (ax0 <= bx1) and (bx0 <= ax1) and (ay0 <= by1) and (by0 <= ay1)
@@ -141,7 +143,11 @@ def assert_aabb_clear_around_grasp(
         "name": name,
         "class": cls,
         "grasp_point_local": gp,
-        "grasp_point_world": (gx_world, gy_world, float(obj_pos[2]) + gp[2] if len(obj_pos) >= 3 else None),
+        "grasp_point_world": (
+            gx_world,
+            gy_world,
+            float(obj_pos[2]) + gp[2] if len(obj_pos) >= 3 else None,
+        ),
         "grasp_aabb_xy": grasp_aabb,
         "gripper_jaw_half_width": h,
     }

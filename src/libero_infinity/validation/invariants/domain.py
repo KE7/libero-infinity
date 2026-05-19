@@ -10,7 +10,8 @@ Assertions (all return :class:`AssertionResult`):
 * ``assert_bddl_objects_present``      — every BDDL ``:objects`` instance is in the scene
 * ``assert_assets_in_registry``        — every sampled asset class is in the registry
 * ``assert_no_initial_collisions``     — no penetrating contacts after settling
-* ``assert_on_predicates_z``           — every ``(On A B)`` in ``:init`` satisfies ``A.z > B.z_top - tol``
+* ``assert_on_predicates_z``           — every ``(On A B)`` in ``:init`` satisfies
+  ``A.z > B.z_top - tol``
 * ``assert_goal_false_at_reset``       — ``:goal`` evaluates ``False`` at ``t=0``
 * ``assert_goal_reachable_soft``       — heuristic feasibility hint (objects present + not occluded)
 

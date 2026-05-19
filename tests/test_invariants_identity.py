@@ -20,8 +20,8 @@ import pytest
 
 from libero_infinity.validation.invariants.identity import (
     AXES,
-    AssertionResult,
     IDENTITY_ASSERTIONS,
+    AssertionResult,
     assert_all_identities,
     assert_articulation_unchanged,
     assert_background_unchanged,
@@ -34,7 +34,6 @@ from libero_infinity.validation.invariants.identity import (
     assert_texture_unchanged,
     g4_identity_hook,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

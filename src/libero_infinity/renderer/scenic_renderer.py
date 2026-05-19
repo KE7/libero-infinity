@@ -227,8 +227,10 @@ _FIXTURE_DIMS: dict[str, tuple[float, float, float]] = {
     "wine_rack": (0.18, 0.12, 0.20),
     "microwave": (0.24, 0.18, 0.16),
     "bowl_drainer": (0.18, 0.14, 0.08),
-    "desk_caddy": (0.14, 0.10, 0.06),
-    "wooden_two_layer_shelf": (0.24, 0.14, 0.22),
+    # desk_caddy: corrected to match MJCF geom-union AABB (was 0.14, 0.10, 0.06,
+    # off by factor ~4 in y and ~3.5 in z) — see rca/g5_settle_drift_caddy.md §3.
+    "desk_caddy": (0.14, 0.42, 0.22),
+    "wooden_two_layer_shelf": (0.33, 0.20, 0.21),
     "table": (0.80, 0.60, 0.05),
     "kitchen_table": (0.80, 0.60, 0.05),
     "living_room_table": (0.55, 0.65, 0.05),
