@@ -1147,6 +1147,9 @@ class LIBEROSimulation(Simulation):
         return any(
             params.get(k) is not None
             for k in (
+                "cam_azimuth",
+                "cam_elevation",
+                "cam_distance",
                 "camera_x_offset",
                 "camera_y_offset",
                 "camera_z_offset",
@@ -1262,6 +1265,7 @@ class LIBEROSimulation(Simulation):
                 not key.startswith("articulation_")
                 or key.startswith("articulation_state_")
                 or key.startswith("articulation_control_")
+                or key.endswith("_state")
             ):
                 continue
             fixture_name = key.removeprefix("articulation_")
@@ -1346,9 +1350,12 @@ class LIBEROSimulation(Simulation):
             )
 
     def _apply_camera_perturbation(self) -> None:
-        """Perturb agentview camera position and/or tilt from Scenic params.
+        """Perturb agentview camera pose from Scenic params.
 
         Scenic params read from scene.params:
+          cam_azimuth    — orbit angle around the table target, in degrees
+          cam_elevation  — elevation delta around the table target, in degrees
+          cam_distance   — multiplicative distance scale from the table target
           camera_x_offset  — additive x offset (metres)
           camera_y_offset  — additive y offset (metres)
           camera_z_offset  — additive z offset (metres)
@@ -1358,12 +1365,16 @@ class LIBEROSimulation(Simulation):
             return
         params = getattr(self.scene, "params", {})
 
+        azimuth = params.get("cam_azimuth")
+        elevation = params.get("cam_elevation")
+        distance = params.get("cam_distance")
         dx = params.get("camera_x_offset", 0.0)
         dy = params.get("camera_y_offset", 0.0)
         dz = params.get("camera_z_offset", 0.0)
         tilt = params.get("camera_tilt", 0.0)
 
-        if dx == 0 and dy == 0 and dz == 0 and tilt == 0:
+        has_orbit = azimuth is not None or elevation is not None or distance is not None
+        if not has_orbit and dx == 0 and dy == 0 and dz == 0 and tilt == 0:
             return
 
         sim = self.libero_env.env.sim
@@ -1374,6 +1385,48 @@ class LIBEROSimulation(Simulation):
         except Exception:
             log.warning("agentview camera not found; skipping camera perturbation")
             return
+
+        if has_orbit:
+            base_pos = np.array(sim.model.cam_pos[cam_id], dtype=float)
+            target = np.array(
+                [
+                    float(params.get("cam_target_x", 0.0)),
+                    float(params.get("cam_target_y", 0.0)),
+                    float(params.get("cam_target_z", TABLE_Z)),
+                ],
+                dtype=float,
+            )
+            vec = base_pos - target
+            radius = float(np.linalg.norm(vec))
+            if radius > 1e-9:
+                az0 = float(np.arctan2(vec[1], vec[0]))
+                el0 = float(np.arcsin(np.clip(vec[2] / radius, -1.0, 1.0)))
+                az = az0 + np.deg2rad(float(azimuth or 0.0))
+                el = np.clip(
+                    el0 + np.deg2rad(float(elevation or 0.0)),
+                    np.deg2rad(-85.0),
+                    np.deg2rad(85.0),
+                )
+                radius *= float(distance if distance is not None else 1.0)
+                radius = max(radius, 1e-6)
+
+                cos_el = float(np.cos(el))
+                new_pos = target + np.array(
+                    [
+                        radius * cos_el * np.cos(az),
+                        radius * cos_el * np.sin(az),
+                        radius * np.sin(el),
+                    ],
+                    dtype=float,
+                )
+                sim.model.cam_pos[cam_id] = new_pos
+                self._set_camera_lookat(cam_id, new_pos, target)
+                log.debug(
+                    "  camera orbit: azimuth=%.3f elevation=%.3f distance=%.3f",
+                    float(azimuth or 0.0),
+                    float(elevation or 0.0),
+                    float(distance if distance is not None else 1.0),
+                )
 
         if dx != 0 or dy != 0 or dz != 0:
             sim.model.cam_pos[cam_id][0] += float(dx)
@@ -1399,6 +1452,36 @@ class LIBEROSimulation(Simulation):
             q = r_new.as_quat()  # (x,y,z,w)
             sim.model.cam_quat[cam_id] = [q[3], q[0], q[1], q[2]]
             log.debug("  camera tilt: %.1f degrees", tilt)
+
+        try:
+            sim.forward()
+        except Exception:
+            pass
+
+    def _set_camera_lookat(self, cam_id: int, camera_pos: np.ndarray, target: np.ndarray) -> None:
+        """Orient a MuJoCo fixed camera so its local -z axis points at target."""
+        forward = target - camera_pos
+        norm = float(np.linalg.norm(forward))
+        if norm <= 1e-9:
+            return
+        forward = forward / norm
+
+        world_up = np.array([0.0, 0.0, 1.0], dtype=float)
+        right = np.cross(forward, world_up)
+        right_norm = float(np.linalg.norm(right))
+        if right_norm <= 1e-9:
+            right = np.array([1.0, 0.0, 0.0], dtype=float)
+        else:
+            right = right / right_norm
+        up = np.cross(right, forward)
+        rot = np.column_stack([right, up, -forward])
+        quat_xyzw = _Rotation.from_matrix(rot).as_quat()
+        self.libero_env.env.sim.model.cam_quat[cam_id] = [
+            quat_xyzw[3],
+            quat_xyzw[0],
+            quat_xyzw[1],
+            quat_xyzw[2],
+        ]
 
     def _apply_lighting_perturbation(self) -> None:
         """Perturb scene lighting from Scenic params.
