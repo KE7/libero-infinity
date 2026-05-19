@@ -48,7 +48,7 @@ def test_real_depth_map_handles_nan_and_out_of_range():
 
 
 def test_sensor_noise_varies_across_scene_seeds():
-    img = (np.ones((16, 16, 3), dtype=np.uint8) * 128)
+    img = np.ones((16, 16, 3), dtype=np.uint8) * 128
     a = _apply_image_corruption(img, "gaussian_noise", 3, seed=1)
     b = _apply_image_corruption(img, "gaussian_noise", 3, seed=2)
     c = _apply_image_corruption(img, "gaussian_noise", 3, seed=1)
@@ -59,7 +59,7 @@ def test_sensor_noise_varies_across_scene_seeds():
 
 
 def test_sensor_noise_legacy_path_unchanged_when_no_seed():
-    img = (np.ones((16, 16, 3), dtype=np.uint8) * 128)
+    img = np.ones((16, 16, 3), dtype=np.uint8) * 128
     a = _apply_image_corruption(img, "gaussian_noise", 3)
     b = _apply_image_corruption(img, "gaussian_noise", 3)
     # Severity-only seeding remains deterministic when seed is omitted.

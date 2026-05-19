@@ -281,8 +281,7 @@ def _fixture_baseline_for_node(
     if state_range is None:
         diagnostics.narrow_axis(
             "articulation",
-            f"{node.node_id}: baseline state_kind '{state_kind}' not in "
-            f"ranges {list(ranges)}",
+            f"{node.node_id}: baseline state_kind '{state_kind}' not in ranges {list(ranges)}",
         )
         return None
     lo, hi = state_range
@@ -381,7 +380,8 @@ def plan_articulation_perturbation(
         # to that state's range (variation in angle only). Otherwise the
         # perturbation may flip to the family's "active" state.
         pinned = node.init_state_kind is not None or (
-            base is not None and not base.reason.endswith("canonical_default")
+            base is not None
+            and not base.reason.endswith("canonical_default")
             and "canonical family default" not in base.reason
         )
         if pinned and base is not None:

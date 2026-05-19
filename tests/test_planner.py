@@ -1645,9 +1645,7 @@ def test_articulation_perturbation_cannot_close_required_open_fixture(tmp_path):
     graph = _build_graph_from(_opencabinet_bddl(), tmp_path)
     diag = PlanDiagnostics()
     baseline = compute_baseline_articulation(graph, diag)
-    overrides = plan_articulation_perturbation(
-        graph, baseline, frozenset(["articulation"]), diag
-    )
+    overrides = plan_articulation_perturbation(graph, baseline, frozenset(["articulation"]), diag)
     # The pinned fixture must not appear as an override (or, if it does,
     # must remain in the Open state). Either way: state_kind stays Open.
     final = dict(baseline)
@@ -1665,7 +1663,5 @@ def test_articulation_perturbation_no_axis_returns_empty_overrides(tmp_path):
     graph = _build_graph_from(_stove_bowl_bddl(), tmp_path)
     diag = PlanDiagnostics()
     baseline = compute_baseline_articulation(graph, diag)
-    overrides = plan_articulation_perturbation(
-        graph, baseline, frozenset(["position"]), diag
-    )
+    overrides = plan_articulation_perturbation(graph, baseline, frozenset(["position"]), diag)
     assert overrides == {}

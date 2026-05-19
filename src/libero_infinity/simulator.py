@@ -420,9 +420,7 @@ def _apply_image_corruption(
         # severity-only seeding is preserved for backward compatibility.
         if seed is None:
             return np.random.default_rng(severity + kind_offset)
-        return np.random.default_rng(
-            (int(seed), int(severity), int(kind_offset))
-        )
+        return np.random.default_rng((int(seed), int(severity), int(kind_offset)))
 
     if kind == "gaussian_noise":
         sigma = [4.0, 8.0, 16.0, 24.0, 32.0][severity - 1]
@@ -948,9 +946,7 @@ class LIBEROSimulation(Simulation):
                 for o in self.scene.objects
             )
             is_supported_child = (
-                bool(raw_support_parent)
-                and not is_contained
-                and not support_is_fixed_fixture
+                bool(raw_support_parent) and not is_contained and not support_is_fixed_fixture
             )
             # Use LIBERO's default support height only when the generated
             # Scenic object explicitly opts into it AND the object starts near
@@ -2154,9 +2150,7 @@ class LIBEROSimulation(Simulation):
             if not isinstance(value, np.ndarray):
                 continue
             try:
-                out[key] = _apply_image_corruption(
-                    value, kind, severity, seed=scene_seed
-                )
+                out[key] = _apply_image_corruption(value, kind, severity, seed=scene_seed)
             except Exception as exc:
                 log.debug("Sensor-noise transform '%s' failed: %s", kind, exc)
         return out
