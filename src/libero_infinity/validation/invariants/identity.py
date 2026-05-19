@@ -144,9 +144,7 @@ def _values_equal(a: Any, b: Any) -> bool:
     return a == b
 
 
-def _diff_fields(
-    baseline: Any, perturbed: Any, paths: Iterable[str]
-) -> dict[str, tuple[Any, Any]]:
+def _diff_fields(baseline: Any, perturbed: Any, paths: Iterable[str]) -> dict[str, tuple[Any, Any]]:
     """Compare a list of dotted paths between two scenes.
 
     Paths missing on **both** sides are recorded only when *every* path in
@@ -340,8 +338,12 @@ def _diff_aggregate(
             name=name,
             passed=False,
             detail=f"{name}: {label!r} missing on one side (baseline={bv!r}, observed={pv!r})",
-            delta={label: (bv if bv is not _MISSING else "<missing>",
-                            pv if pv is not _MISSING else "<missing>")},
+            delta={
+                label: (
+                    bv if bv is not _MISSING else "<missing>",
+                    pv if pv is not _MISSING else "<missing>",
+                )
+            },
         )
     if _values_equal(bv, pv):
         return AssertionResult(name=name, passed=True)
@@ -368,7 +370,10 @@ def assert_position_unchanged(baseline: Any, perturbed: Any) -> AssertionResult:
 def assert_articulation_unchanged(baseline: Any, perturbed: Any) -> AssertionResult:
     """Fixture joint states match baseline."""
     return _diff_aggregate(
-        "identity:articulation", baseline, perturbed, _fixture_joint_states,
+        "identity:articulation",
+        baseline,
+        perturbed,
+        _fixture_joint_states,
         "fixture_joint_states",
     )
 
@@ -391,7 +396,8 @@ def assert_robot_unchanged(baseline: Any, perturbed: Any) -> AssertionResult:
     all_missing = all(v == ("<missing>", "<missing>") for v in delta.values())
     if all_missing and delta:
         return AssertionResult(
-            name="identity:robot", passed=False,
+            name="identity:robot",
+            passed=False,
             detail="identity:robot: no robot fields present on either scene",
             delta=delta,
         )
@@ -400,23 +406,17 @@ def assert_robot_unchanged(baseline: Any, perturbed: Any) -> AssertionResult:
 
 def assert_texture_unchanged(baseline: Any, perturbed: Any) -> AssertionResult:
     """Object/fixture material identities match."""
-    return _diff_aggregate(
-        "identity:texture", baseline, perturbed, _object_materials, "materials"
-    )
+    return _diff_aggregate("identity:texture", baseline, perturbed, _object_materials, "materials")
 
 
 def assert_lighting_unchanged(baseline: Any, perturbed: Any) -> AssertionResult:
     """Light positions + intensities match."""
-    return _diff_aggregate(
-        "identity:lighting", baseline, perturbed, _lights, "lights"
-    )
+    return _diff_aggregate("identity:lighting", baseline, perturbed, _lights, "lights")
 
 
 def assert_camera_unchanged(baseline: Any, perturbed: Any) -> AssertionResult:
     """Camera extrinsics match."""
-    return _diff_aggregate(
-        "identity:camera", baseline, perturbed, _cameras, "cameras"
-    )
+    return _diff_aggregate("identity:camera", baseline, perturbed, _cameras, "cameras")
 
 
 def assert_distractor_unchanged(baseline: Any, perturbed: Any) -> AssertionResult:
@@ -433,7 +433,8 @@ def assert_background_unchanged(baseline: Any, perturbed: Any) -> AssertionResul
     all_missing = all(v == ("<missing>", "<missing>") for v in delta.values())
     if all_missing and delta:
         return AssertionResult(
-            name="identity:background", passed=False,
+            name="identity:background",
+            passed=False,
             detail="identity:background: no background field present on either scene",
             delta=delta,
         )
@@ -459,8 +460,7 @@ IDENTITY_ASSERTIONS: dict[str, Callable[[Any, Any], AssertionResult]] = {
 
 # Sanity: registry covers exactly the 9 canonical axes.
 assert set(IDENTITY_ASSERTIONS.keys()) == set(AXES), (
-    f"identity registry / AXES mismatch: "
-    f"{set(IDENTITY_ASSERTIONS) ^ set(AXES)}"
+    f"identity registry / AXES mismatch: {set(IDENTITY_ASSERTIONS) ^ set(AXES)}"
 )
 
 
@@ -477,9 +477,7 @@ def assert_all_identities(
     active = set(active_axes)
     unknown = active - set(AXES)
     if unknown:
-        raise ValueError(
-            f"assert_all_identities: unknown axes in active_axes: {sorted(unknown)}"
-        )
+        raise ValueError(f"assert_all_identities: unknown axes in active_axes: {sorted(unknown)}")
     # Project Scenic Scenes (which only expose .objects/.params) onto the
     # richer per-axis schema this module reads. Already-rich scenes (used by
     # the unit-test fixtures) pass through unchanged. See ``_scene_view.py``.
@@ -504,5 +502,7 @@ def g4_identity_hook(
     harness can flatten this dict into the JSONL row, e.g. as
     ``g4_identity_position=True``.
     """
-    return {r.name.split(":", 1)[1]: r.passed
-            for r in assert_all_identities(baseline_scene, perturbed_scene, active_axes)}
+    return {
+        r.name.split(":", 1)[1]: r.passed
+        for r in assert_all_identities(baseline_scene, perturbed_scene, active_axes)
+    }

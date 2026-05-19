@@ -145,6 +145,7 @@ def _quat_angle_deg(
     q1: tuple[float, float, float, float], q2: tuple[float, float, float, float]
 ) -> float:
     """Return the rotation angle (degrees) between two unit quaternions."""
+
     # Normalize defensively (callers may pass un-normalised).
     def _norm(q):
         n = math.sqrt(sum(c * c for c in q))

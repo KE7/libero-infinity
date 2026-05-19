@@ -80,10 +80,12 @@ def _get_baseline_scene(cfg: Any, bddl_key: str, max_iter: int) -> Any:
     if cached is not None:
         return cached
     from libero_infinity.compiler import compile_task_to_scenario
+
     scenario = compile_task_to_scenario(cfg, "")
     scene, _ = scenario.generate(maxIterations=max_iter)
     _BASELINE_CACHE[bddl_key] = scene
     return scene
+
 
 # Directory containing the bundled BDDLs (shipped with the package data tree).
 _PKG_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -287,6 +289,7 @@ def run_condition(
     try:
         baseline = _get_baseline_scene(cfg, str(bddl_path), max_iter)
         from libero_infinity.validation.invariants import g4_identity_hook
+
         row["g4_identity"] = g4_identity_hook(baseline, scene, axis_subset)
     except Exception as exc:  # noqa: BLE001 — recorded, not swallowed
         row["g4_identity"] = None
@@ -320,6 +323,7 @@ def run_condition(
     # marginal fail rates per family / per axis.
     try:
         from libero_infinity.validation.invariants import g4_domain_consistency_hook
+
         try:
             from libero_infinity.asset_registry import ASSET_VARIANTS as _registry
         except Exception:  # noqa: BLE001
@@ -382,8 +386,11 @@ def _worker_entry(args: tuple) -> dict[str, Any]:
     task_rel, axis_subset, seed, scenic_only, max_iter = args
     try:
         return run_condition(
-            task_rel, axis_subset, seed,
-            scenic_only=scenic_only, max_iter=max_iter,
+            task_rel,
+            axis_subset,
+            seed,
+            scenic_only=scenic_only,
+            max_iter=max_iter,
         )
     except BaseException as exc:  # noqa: BLE001 — last-resort harness guard
         # Even harness-internal failures must be reported, not swallowed.
@@ -392,8 +399,12 @@ def _worker_entry(args: tuple) -> dict[str, Any]:
             "axis_subset": list(axis_subset),
             "seed": seed,
             "cardinality": len(axis_subset),
-            "g0": "fail", "g1": "skip", "g2": "skip",
-            "g3": "skip", "g5": "skip", "g6": "skip",
+            "g0": "fail",
+            "g1": "skip",
+            "g2": "skip",
+            "g3": "skip",
+            "g5": "skip",
+            "g6": "skip",
             "n_iters": None,
             "error_class": type(exc).__name__,
             "error_msg": f"[harness] {exc}"[:2000],
@@ -427,18 +438,19 @@ def run_sweep(
     # accounting is preserved and the final aggregate is bit-identical to the
     # previous task-major ordering.
     per_task = [
-        [(t, axs, s, scenic_only, max_iter) for axs in subsets for s in seeds]
-        for t in tasks
+        [(t, axs, s, scenic_only, max_iter) for axs in subsets for s in seeds] for t in tasks
     ]
     conditions = [
-        c for c in itertools.chain.from_iterable(itertools.zip_longest(*per_task))
-        if c is not None
+        c for c in itertools.chain.from_iterable(itertools.zip_longest(*per_task)) if c is not None
     ]
     total = len(conditions)
-    print(f"[sweep] {total} conditions  "
-          f"({len(tasks)} tasks x {len(subsets)} subsets x {len(seeds)} seeds)  "
-          f"workers={workers}  scenic_only={scenic_only}  max_iter={max_iter}",
-          file=sys.stderr, flush=True)
+    print(
+        f"[sweep] {total} conditions  "
+        f"({len(tasks)} tasks x {len(subsets)} subsets x {len(seeds)} seeds)  "
+        f"workers={workers}  scenic_only={scenic_only}  max_iter={max_iter}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     counts = {g: {"pass": 0, "fail": 0, "skip": 0} for g in GATES}
 
@@ -476,21 +488,31 @@ def _parse_tasks(spec: str) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="libero_infinity.validation.sweep")
-    ap.add_argument("--tasks", default="smoke",
-                    help="'all', 'smoke', or comma list of suite/task.bddl paths")
-    ap.add_argument("--subsets", default="16",
-                    help="Number of axis subsets to sample per task, or 'all' for 511")
-    ap.add_argument("--seeds", type=int, default=1,
-                    help="Number of seeds per (task, subset) cell")
-    ap.add_argument("--workers", type=int, default=4,
-                    help="Number of worker processes (capped at 10)")
-    ap.add_argument("--scenic-only", action="store_true",
-                    help="Stop after G3 (no LIBERO env creation)")
+    ap.add_argument(
+        "--tasks", default="smoke", help="'all', 'smoke', or comma list of suite/task.bddl paths"
+    )
+    ap.add_argument(
+        "--subsets",
+        default="16",
+        help="Number of axis subsets to sample per task, or 'all' for 511",
+    )
+    ap.add_argument("--seeds", type=int, default=1, help="Number of seeds per (task, subset) cell")
+    ap.add_argument(
+        "--workers", type=int, default=4, help="Number of worker processes (capped at 10)"
+    )
+    ap.add_argument(
+        "--scenic-only", action="store_true", help="Stop after G3 (no LIBERO env creation)"
+    )
     ap.add_argument("--out", required=True, help="Output JSONL path")
-    ap.add_argument("--max-iter", type=int, default=2000,
-                    help="Scenic scenario.generate maxIterations")
-    ap.add_argument("--subset-seed", type=int, default=0,
-                    help="Seed for the subset sampler (determinism across runs)")
+    ap.add_argument(
+        "--max-iter", type=int, default=2000, help="Scenic scenario.generate maxIterations"
+    )
+    ap.add_argument(
+        "--subset-seed",
+        type=int,
+        default=0,
+        help="Seed for the subset sampler (determinism across runs)",
+    )
     args = ap.parse_args(argv)
 
     tasks = _parse_tasks(args.tasks)
@@ -509,7 +531,9 @@ def main(argv: list[str] | None = None) -> int:
     workers = max(1, min(10, args.workers))
 
     summary = run_sweep(
-        tasks, subsets, seeds,
+        tasks,
+        subsets,
+        seeds,
         out_path=pathlib.Path(args.out).expanduser(),
         workers=workers,
         scenic_only=args.scenic_only,

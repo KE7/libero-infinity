@@ -34,9 +34,7 @@ class AssertionResult:
     def __bool__(self) -> bool:  # pragma: no cover - defensive
         # Truthiness on a skip would be ambiguous; force callers to compare
         # against ``passed`` explicitly.
-        raise TypeError(
-            "AssertionResult is not directly boolean; check .passed (True/False/None)"
-        )
+        raise TypeError("AssertionResult is not directly boolean; check .passed (True/False/None)")
 
 
 __all__ = ["AssertionResult"]

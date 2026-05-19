@@ -48,10 +48,10 @@ def _baseline_scene():
     """A small but complete scene covering every axis-field group."""
     return _ns(
         objects=[
-            _ns(name="bowl", class_id="bowl_v1",
-                position=(0.1, 0.2, 0.3), material="ceramic_white"),
-            _ns(name="cup", class_id="cup_v2",
-                position=(0.4, 0.5, 0.6), material="porcelain_blue"),
+            _ns(
+                name="bowl", class_id="bowl_v1", position=(0.1, 0.2, 0.3), material="ceramic_white"
+            ),
+            _ns(name="cup", class_id="cup_v2", position=(0.4, 0.5, 0.6), material="porcelain_blue"),
         ],
         fixtures=[
             _ns(name="drawer", joint_states={"slide": 0.0}, material="oak"),
@@ -66,11 +66,9 @@ def _baseline_scene():
             _ns(name="fill", position=(-1.0, 0.5, 2.0), intensity=0.5),
         ],
         cameras=[
-            _ns(name="agentview", position=(0.0, -1.0, 1.5),
-                rotation=(0.0, 0.0, 0.0, 1.0)),
+            _ns(name="agentview", position=(0.0, -1.0, 1.5), rotation=(0.0, 0.0, 0.0, 1.0)),
         ],
-        robot=_ns(name="panda",
-                  init_qpos=(0.0, -0.3, 0.0, -2.0, 0.0, 1.7, 0.7)),
+        robot=_ns(name="panda", init_qpos=(0.0, -0.3, 0.0, -2.0, 0.0, 1.7, 0.7)),
         background="kitchen_v1",
     )
 
@@ -107,7 +105,7 @@ def test_object_class_pass_and_fail():
     b = _baseline_scene()
     assert assert_object_unchanged(b, _baseline_scene()).passed
     p = _baseline_scene()
-    p.objects[1].class_id = "cup_v3"   # one-bit asset swap
+    p.objects[1].class_id = "cup_v3"  # one-bit asset swap
     r = assert_object_unchanged(b, p)
     assert not r.passed
     assert "object_classes" in r.delta
@@ -233,7 +231,7 @@ def test_g4_identity_hook_detects_isolation_leak():
     must flag position as failing — that's the entire purpose of family A."""
     b = _baseline_scene()
     p = _baseline_scene()
-    p.objects[0].position = (0.1, 0.2, 0.3 + 0.01)   # position leak
+    p.objects[0].position = (0.1, 0.2, 0.3 + 0.01)  # position leak
     hook = g4_identity_hook(b, p, active_axes=["texture"])
     assert hook["position"] is False
     # Other inactive axes still pass — leak is localized.

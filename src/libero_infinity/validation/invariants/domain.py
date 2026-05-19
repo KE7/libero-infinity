@@ -463,9 +463,7 @@ def assert_goal_reachable_soft(bddl: Any, scene: Any) -> AssertionResult:
         return AssertionResult(
             name="goal_reachable_soft",
             passed=False,
-            detail=(
-                f"Soft reachability failed: missing={missing} occluded={occluded}"
-            ),
+            detail=(f"Soft reachability failed: missing={missing} occluded={occluded}"),
             payload={
                 "missing": missing,
                 "occluded": occluded,
@@ -483,15 +481,12 @@ def assert_goal_reachable_soft(bddl: Any, scene: Any) -> AssertionResult:
         name="goal_reachable_soft",
         passed=True,
         detail=(
-            f"Soft reachability OK ({len(resolved)} resolved, "
-            f"{len(unresolved)} unresolved refs)."
+            f"Soft reachability OK ({len(resolved)} resolved, {len(unresolved)} unresolved refs)."
         ),
         payload={
             "resolved": resolved,
             "unresolved": unresolved,
-            "heuristic": (
-                "xy-AABB containment + Z-occlusion probe; documented soft check."
-            ),
+            "heuristic": ("xy-AABB containment + Z-occlusion probe; documented soft check."),
         },
     )
 
