@@ -207,6 +207,7 @@ def test_restack_filter_uses_movable_scene_objects_positive_set() -> None:
         "children will again be lifted to z>=1.30 and visibility validation will "
         "reject every position-axis sample on living_room/study arenas."
     )
-    assert "if parent in movable_scene_names" in source, (
+    _restack_check_msg = (
         "Expected restack filter to keep only children whose parent is a movable scene object."
     )
+    assert "if parent in movable_scene_names" in source, _restack_check_msg
