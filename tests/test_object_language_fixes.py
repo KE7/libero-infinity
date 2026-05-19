@@ -1,3 +1,5 @@
+# BDDL/site names in synthetic graph tuples are unavoidably long; relax E501.
+# ruff: noqa: E501
 """Focused regression tests for the object/language rewrite bug-fix bundle.
 
 Each test targets one specific bug:
@@ -417,8 +419,12 @@ def test_plan_object_filters_container_variants_lacking_contain_region() -> None
     # Real graph shape: BDDL ``(In x basket_1_contain_region)`` is emitted as
     # a ``goal_target`` edge whose ``dst_id`` is the full site name. See
     # ``ir/graph_builder.py::build_semantic_scene_graph``.
-    graph.add_edge(SceneEdge(src_id="alphabet_soup_1", dst_id="basket_1_contain_region", label="goal_target"))
-    graph.add_edge(SceneEdge(src_id="cream_cheese_1", dst_id="basket_1_contain_region", label="goal_target"))
+    graph.add_edge(
+        SceneEdge(src_id="alphabet_soup_1", dst_id="basket_1_contain_region", label="goal_target")
+    )
+    graph.add_edge(
+        SceneEdge(src_id="cream_cheese_1", dst_id="basket_1_contain_region", label="goal_target")
+    )
 
     diag = PlanDiagnostics()
     plan = plan_object(graph, frozenset(["object"]), diag)
@@ -433,20 +439,23 @@ def test_plan_object_filters_container_variants_lacking_contain_region() -> None
 
     assert "basket_1" in plan, "basket should still have a substitution choice"
     pool = plan["basket_1"]
-    assert "white_storage_box" not in pool, (
-        "lossy variant lacking contain_region site must be filtered: "
-        f"got {pool!r}"
-    )
+    _msg_filtered = f"lossy variant lacking contain_region site must be filtered: got {pool!r}"
+    assert "white_storage_box" not in pool, _msg_filtered
     for v in pool:
-        assert class_provides_contain_region(v), (
-            f"variant {v!r} kept in container pool despite missing contain_region"
-        )
+        _msg_variant = f"variant {v!r} kept in container pool despite missing contain_region"
+        assert class_provides_contain_region(v), _msg_variant
 
 
 def test_plan_object_pins_container_when_no_safe_variants() -> None:
     """If no variant of a container preserves contain_region, the planner
     must pin to the canonical class (drop it from the plan, since a 1-class
     pool is a no-op substitution)."""
+    # Realistic scenario: temporarily narrow basket's variant pool to only
+    # non-container alternatives. After the planner's safety filter, the
+    # only surviving variant must be the canonical class (basket itself),
+    # which collapses the pool to a singleton and drops basket_1 from the
+    # plan dict (plan_object's existing no-choice filter).
+    import libero_infinity.asset_registry as ar
     from libero_infinity.ir.nodes import (
         ArticulationModel,
         ObjectNode,
@@ -455,13 +464,6 @@ def test_plan_object_pins_container_when_no_safe_variants() -> None:
     )
     from libero_infinity.ir.scene_graph import SemanticSceneGraph
     from libero_infinity.planner.axes import plan_object
-
-    # Realistic scenario: temporarily narrow basket's variant pool to only
-    # non-container alternatives. After the planner's safety filter, the
-    # only surviving variant must be the canonical class (basket itself),
-    # which collapses the pool to a singleton and drops basket_1 from the
-    # plan dict (plan_object's existing no-choice filter).
-    import libero_infinity.asset_registry as ar
 
     container_class = "basket"
     saved = ar.ASSET_VARIANTS[container_class]
@@ -492,7 +494,9 @@ def test_plan_object_pins_container_when_no_safe_variants() -> None:
         graph.add_node(cont)
         graph.add_node(item)
         # Real graph shape (see note in the sibling test above).
-        graph.add_edge(SceneEdge(src_id="item_1", dst_id="basket_1_contain_region", label="goal_target"))
+        graph.add_edge(
+            SceneEdge(src_id="item_1", dst_id="basket_1_contain_region", label="goal_target")
+        )
 
         diag = PlanDiagnostics()
         plan = plan_object(graph, frozenset(["object"]), diag)

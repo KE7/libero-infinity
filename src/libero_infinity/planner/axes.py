@@ -208,7 +208,7 @@ def plan_object(
                     continue
                 if not e.dst_id.startswith(prefix):
                     continue
-                suffix = e.dst_id[len(prefix):]
+                suffix = e.dst_id[len(prefix) :]
                 if suffix in canonical_contain_sites:
                     referenced_contain_sites.add(suffix)
         if referenced_contain_sites:
@@ -220,9 +220,7 @@ def plan_object(
             # set is ``{contain_region}``; for desk_caddy it is the four
             # directional ``*_contain_region`` sites.
             required_sites = canonical_contain_sites
-            filtered = [
-                v for v in variants if contain_region_sites(v) >= required_sites
-            ]
+            filtered = [v for v in variants if contain_region_sites(v) >= required_sites]
             if filtered:
                 variants = filtered
             else:

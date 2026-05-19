@@ -120,7 +120,6 @@ def get_distractor_pool(
 # result is cached on first use.
 
 import functools
-import os
 import pathlib
 
 
