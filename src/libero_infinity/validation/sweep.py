@@ -424,7 +424,10 @@ def _worker_entry(args: tuple) -> dict[str, Any]:
 
 
 def _attributed_pool_failure_row(
-    cond: tuple, exc: BaseException, *, attempts: int,
+    cond: tuple,
+    exc: BaseException,
+    *,
+    attempts: int,
 ) -> dict[str, Any]:
     """Build an honestly-attributed pool-failure row for a lost condition.
 
@@ -438,8 +441,12 @@ def _attributed_pool_failure_row(
         "axis_subset": list(axis_subset),
         "seed": seed,
         "cardinality": len(axis_subset),
-        "g0": "fail", "g1": "skip", "g2": "skip",
-        "g3": "skip", "g5": "skip", "g6": "skip",
+        "g0": "fail",
+        "g1": "skip",
+        "g2": "skip",
+        "g3": "skip",
+        "g5": "skip",
+        "g6": "skip",
         "n_iters": None,
         "error_class": type(exc).__name__,
         "error_msg": f"[pool] {exc}"[:2000],
@@ -547,6 +554,7 @@ def run_sweep(
 
     ctx = mp.get_context("spawn")
     with open(out_path, "w", encoding="utf-8") as fh:
+
         def _on_row(row: dict[str, Any]) -> None:
             nonlocal done
             fh.write(json.dumps(row) + "\n")
@@ -581,10 +589,13 @@ def run_sweep(
                 flush=True,
             )
         for cond in pending:
-            _on_row(_attributed_pool_failure_row(
-                cond, RuntimeError("pool restart budget exhausted"),
-                attempts=max_pool_restarts + 1,
-            ))
+            _on_row(
+                _attributed_pool_failure_row(
+                    cond,
+                    RuntimeError("pool restart budget exhausted"),
+                    attempts=max_pool_restarts + 1,
+                )
+            )
 
     return {
         "total": total,

@@ -21,15 +21,12 @@ from __future__ import annotations
 import json
 import multiprocessing as mp
 import os
-import pathlib
-
-import pytest
 
 from libero_infinity.validation import sweep as sweep_mod
 from libero_infinity.validation.sweep import (
+    DEFAULT_MAX_TASKS_PER_CHILD,
     _attributed_pool_failure_row,
     _run_pool_pass,
-    DEFAULT_MAX_TASKS_PER_CHILD,
 )
 
 # ---------------------------------------------------------------------------
@@ -47,8 +44,12 @@ def _good_worker(cond):
         "axis_subset": list(axis_subset),
         "seed": seed,
         "cardinality": len(axis_subset),
-        "g0": "pass", "g1": "pass", "g2": "pass",
-        "g3": "pass", "g5": "skip", "g6": "skip",
+        "g0": "pass",
+        "g1": "pass",
+        "g2": "pass",
+        "g3": "pass",
+        "g5": "skip",
+        "g6": "skip",
         "worker_pid": os.getpid(),
     }
 
@@ -121,7 +122,7 @@ def test_run_sweep_recovers_from_pool_break(tmp_path, monkeypatch):
         max_tasks_per_child=4,
         max_pool_restarts=3,
     )
-    rows = [json.loads(l) for l in out.read_text().splitlines() if l.strip()]
+    rows = [json.loads(line) for line in out.read_text().splitlines() if line.strip()]
     # Every condition is accounted for, exactly once per (task, axes, seed).
     keys = {(r["task"], tuple(r["axis_subset"]), r["seed"]) for r in rows}
     assert keys == {("t/a.bddl", ("position",), s) for s in range(8)}
