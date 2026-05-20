@@ -59,9 +59,9 @@ def test_override_mjcf_has_inertial(asset_name, expected_mass, tol_frac):
     inertials = tree.findall(".//body[@name='object']/inertial")
     assert len(inertials) == 1, f"{asset_name}: expected 1 <inertial>, got {len(inertials)}"
     mass = float(inertials[0].get("mass", "nan"))
-    assert (
-        abs(mass - expected_mass) <= tol_frac * expected_mass
-    ), f"{asset_name}: mass {mass} outside ±{tol_frac:.0%} of {expected_mass}"
+    assert abs(mass - expected_mass) <= tol_frac * expected_mass, (
+        f"{asset_name}: mass {mass} outside ±{tol_frac:.0%} of {expected_mass}"
+    )
 
 
 @pytest.mark.parametrize("asset_name", ["desk_caddy", "wooden_two_layer_shelf"])
@@ -222,9 +222,9 @@ def test_patched_fixture_xy_drift_under_settle(asset_name, yaw_idx):
             mujoco.mj_step(model, data)
         x1, y1 = float(data.qpos[0]), float(data.qpos[1])
         drift = float(np.hypot(x1 - x0, y1 - y0))
-        assert (
-            drift < 0.01
-        ), f"{asset_name} yaw={yaw:.2f}: xy drift {drift*1000:.1f} mm exceeds 10 mm"
+        assert drift < 0.01, (
+            f"{asset_name} yaw={yaw:.2f}: xy drift {drift * 1000:.1f} mm exceeds 10 mm"
+        )
     finally:
         if scene_path.exists():
             scene_path.unlink()
