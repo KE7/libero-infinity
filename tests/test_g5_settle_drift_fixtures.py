@@ -35,7 +35,6 @@ from libero_infinity.asset_overrides import (
 )
 from libero_infinity.asset_registry import OBJECT_DIMENSIONS
 
-
 # Paths to patched override XMLs shipped in-package.
 _OVERRIDE_PATHS = {p.parent.name: p for p in patched_override_paths()}
 
@@ -60,9 +59,9 @@ def test_override_mjcf_has_inertial(asset_name, expected_mass, tol_frac):
     inertials = tree.findall(".//body[@name='object']/inertial")
     assert len(inertials) == 1, f"{asset_name}: expected 1 <inertial>, got {len(inertials)}"
     mass = float(inertials[0].get("mass", "nan"))
-    assert abs(mass - expected_mass) <= tol_frac * expected_mass, (
-        f"{asset_name}: mass {mass} outside ±{tol_frac:.0%} of {expected_mass}"
-    )
+    assert (
+        abs(mass - expected_mass) <= tol_frac * expected_mass
+    ), f"{asset_name}: mass {mass} outside ±{tol_frac:.0%} of {expected_mass}"
 
 
 @pytest.mark.parametrize("asset_name", ["desk_caddy", "wooden_two_layer_shelf"])
@@ -108,12 +107,7 @@ def _geom_union_aabb(xml_path: pathlib.Path) -> tuple[float, float, float]:
         )
         # 8 corners in local box frame.
         signs = np.array(
-            [
-                [sx, sy, sz]
-                for sx in (-1, 1)
-                for sy in (-1, 1)
-                for sz in (-1, 1)
-            ],
+            [[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)],
             dtype=float,
         )
         corners_local = signs * size
@@ -138,9 +132,7 @@ def test_asset_variants_dims_match_mjcf_aabb(asset_name):
     measured = (Lx, Ly, Lz)
     for i, (m, r) in enumerate(zip(measured, registry_dims)):
         rel = abs(m - r) / max(m, r)
-        assert rel < 0.30, (
-            f"{asset_name}: dim[{i}] registry={r:.3f} mjcf={m:.3f} relerr={rel:.0%}"
-        )
+        assert rel < 0.30, f"{asset_name}: dim[{i}] registry={r:.3f} mjcf={m:.3f} relerr={rel:.0%}"
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +161,6 @@ def _wrap_in_settle_scene(asset_xml_path: pathlib.Path, yaw: float, mesh_dir: pa
     what LIBERO does when composing the table scene.
     """
     # Read the asset's <body name="object"> subtree as raw XML and re-host.
-    asset_dir = asset_xml_path.parent
     text = asset_xml_path.read_text(encoding="utf-8")
     # Pull <asset>...</asset> block intact so meshes/textures resolve.
     m_asset = re.search(r"<asset>.*?</asset>", text, flags=re.DOTALL)
@@ -231,9 +222,9 @@ def test_patched_fixture_xy_drift_under_settle(asset_name, yaw_idx):
             mujoco.mj_step(model, data)
         x1, y1 = float(data.qpos[0]), float(data.qpos[1])
         drift = float(np.hypot(x1 - x0, y1 - y0))
-        assert drift < 0.01, (
-            f"{asset_name} yaw={yaw:.2f}: xy drift {drift*1000:.1f} mm exceeds 10 mm"
-        )
+        assert (
+            drift < 0.01
+        ), f"{asset_name} yaw={yaw:.2f}: xy drift {drift*1000:.1f} mm exceeds 10 mm"
     finally:
         if scene_path.exists():
             scene_path.unlink()

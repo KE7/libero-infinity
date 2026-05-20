@@ -77,9 +77,7 @@ def _installed_libero_assets_root() -> pathlib.Path | None:
 
 
 def _read_override(subdir: str, filename: str) -> str | None:
-    data = pkgutil.get_data(
-        "libero_infinity", f"data/asset_overrides/{subdir}/{filename}"
-    )
+    data = pkgutil.get_data("libero_infinity", f"data/asset_overrides/{subdir}/{filename}")
     if data is None:
         return None
     return data.decode("utf-8")
