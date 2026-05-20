@@ -43,7 +43,15 @@ import sys
 import time
 import traceback as tb_mod
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any
+
+# Default cap on per-worker condition count before the pool recycles the
+# worker. Conservative ceiling chosen to bound MuJoCo/EGL/GLFW state
+# accumulation well below the ~6k-conditions-per-worker reached in Stage 3
+# Run 2 (which produced the d.4 4.75 % pool-teardown tail). Override via
+# ``run_sweep(..., max_tasks_per_child=...)`` or ``--max-tasks-per-child``.
+DEFAULT_MAX_TASKS_PER_CHILD: int = 64
 
 # Canonical 9 perturbation axes (matches the validation plan, not the planner
 # module's extra "sensor_noise" axis which is out of scope for the publication
@@ -415,6 +423,73 @@ def _worker_entry(args: tuple) -> dict[str, Any]:
         }
 
 
+def _attributed_pool_failure_row(
+    cond: tuple, exc: BaseException, *, attempts: int,
+) -> dict[str, Any]:
+    """Build an honestly-attributed pool-failure row for a lost condition.
+
+    Unlike the old driver behavior that recorded ``task: "?"``, this preserves
+    ``(task, axis_subset, seed, cardinality)`` so resume / aggregation can
+    pinpoint which conditions were affected by a pool teardown crash (d.4).
+    """
+    task_rel, axis_subset, seed, _scenic_only, _max_iter = cond
+    return {
+        "task": task_rel,
+        "axis_subset": list(axis_subset),
+        "seed": seed,
+        "cardinality": len(axis_subset),
+        "g0": "fail", "g1": "skip", "g2": "skip",
+        "g3": "skip", "g5": "skip", "g6": "skip",
+        "n_iters": None,
+        "error_class": type(exc).__name__,
+        "error_msg": f"[pool] {exc}"[:2000],
+        "error_file_line": None,
+        "traceback": None,
+        "duration_s": 0.0,
+        "worker_pid": None,
+        "pool_attempts": attempts,
+    }
+
+
+def _run_pool_pass(
+    conditions: list[tuple],
+    *,
+    workers: int,
+    max_tasks_per_child: int,
+    ctx: Any,
+    on_row,
+) -> tuple[set[int], BaseException | None]:
+    """One pool lifecycle: submit ``conditions``, stream results to ``on_row``.
+
+    Returns ``(completed_indices, broken_exc_or_None)``. ``completed_indices``
+    indexes into ``conditions``; the caller resubmits the complement on a fresh
+    pool if ``broken_exc_or_None`` is set.
+    """
+    completed: set[int] = set()
+    broken: BaseException | None = None
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=ctx,
+            max_tasks_per_child=max_tasks_per_child,
+        ) as ex:
+            fut_to_idx = {ex.submit(_worker_entry, c): i for i, c in enumerate(conditions)}
+            for fut in as_completed(fut_to_idx):
+                idx = fut_to_idx[fut]
+                try:
+                    row = fut.result()
+                except BrokenProcessPool as exc:
+                    broken = exc
+                    row = _attributed_pool_failure_row(conditions[idx], exc, attempts=1)
+                except BaseException as exc:  # noqa: BLE001
+                    row = _attributed_pool_failure_row(conditions[idx], exc, attempts=1)
+                on_row(row)
+                completed.add(idx)
+    except BrokenProcessPool as exc:  # raised by the context manager on shutdown
+        broken = exc
+    return completed, broken
+
+
 def run_sweep(
     tasks: list[str],
     subsets: list[tuple[str, ...]],
@@ -424,10 +499,23 @@ def run_sweep(
     workers: int,
     scenic_only: bool,
     max_iter: int,
+    max_tasks_per_child: int = DEFAULT_MAX_TASKS_PER_CHILD,
+    max_pool_restarts: int = 4,
 ) -> dict[str, Any]:
     """Execute the cartesian sweep and stream results to JSONL.
 
-    Returns a summary dict with per-gate pass/fail counts.
+    Resilience model (fix for d.4 BrokenProcessPool pool-teardown tail):
+
+    * Workers are recycled every ``max_tasks_per_child`` conditions so
+      accumulated MuJoCo / GLFW / EGL render-context state never reaches the
+      level that crashed Stage 3 Run 2 workers at pool shutdown.
+    * If a worker still dies and breaks the pool, the unfinished slice is
+      resubmitted on a fresh pool (up to ``max_pool_restarts`` times). Lost
+      conditions are recorded with full ``(task, axis_subset, seed)``
+      attribution — not the ``task: "?"`` placeholder the old driver wrote.
+
+    Returns a summary dict with per-gate pass/fail counts plus a
+    ``pool_restarts`` count for diagnostics.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Round-robin (task-minor) dispatch: interleave one (axis_subset, seed)
@@ -447,30 +535,64 @@ def run_sweep(
     print(
         f"[sweep] {total} conditions  "
         f"({len(tasks)} tasks x {len(subsets)} subsets x {len(seeds)} seeds)  "
-        f"workers={workers}  scenic_only={scenic_only}  max_iter={max_iter}",
+        f"workers={workers}  scenic_only={scenic_only}  max_iter={max_iter}  "
+        f"max_tasks_per_child={max_tasks_per_child}",
         file=sys.stderr,
         flush=True,
     )
 
     counts = {g: {"pass": 0, "fail": 0, "skip": 0} for g in GATES}
+    pool_restarts = 0
+    done = 0
 
-    # ProcessPoolExecutor; writer serialized in this (main) process.
     ctx = mp.get_context("spawn")
     with open(out_path, "w", encoding="utf-8") as fh:
-        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-            futures = [ex.submit(_worker_entry, c) for c in conditions]
-            done = 0
-            for fut in as_completed(futures):
-                row = fut.result()
-                fh.write(json.dumps(row) + "\n")
-                fh.flush()
-                for g in GATES:
-                    counts[g][row.get(g, "skip")] += 1
-                done += 1
-                if done % 10 == 0 or done == total:
-                    print(f"[sweep] {done}/{total}", file=sys.stderr, flush=True)
+        def _on_row(row: dict[str, Any]) -> None:
+            nonlocal done
+            fh.write(json.dumps(row) + "\n")
+            fh.flush()
+            for g in GATES:
+                counts[g][row.get(g, "skip")] += 1
+            done += 1
+            if done % 10 == 0 or done == total:
+                print(f"[sweep] {done}/{total}", file=sys.stderr, flush=True)
 
-    return {"total": total, "counts": counts, "out": str(out_path)}
+        pending = list(conditions)
+        for _attempt in range(max_pool_restarts + 1):
+            if not pending:
+                break
+            completed, broken = _run_pool_pass(
+                pending,
+                workers=workers,
+                max_tasks_per_child=max_tasks_per_child,
+                ctx=ctx,
+                on_row=_on_row,
+            )
+            if not broken:
+                pending = []
+                break
+            pool_restarts += 1
+            pending = [c for i, c in enumerate(pending) if i not in completed]
+            print(
+                f"[sweep] pool broke ({broken!r}); restart "
+                f"{pool_restarts}/{max_pool_restarts}, resubmitting "
+                f"{len(pending)} conditions",
+                file=sys.stderr,
+                flush=True,
+            )
+        for cond in pending:
+            _on_row(_attributed_pool_failure_row(
+                cond, RuntimeError("pool restart budget exhausted"),
+                attempts=max_pool_restarts + 1,
+            ))
+
+    return {
+        "total": total,
+        "counts": counts,
+        "out": str(out_path),
+        "pool_restarts": pool_restarts,
+        "max_tasks_per_child": max_tasks_per_child,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +635,12 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="Seed for the subset sampler (determinism across runs)",
     )
+    ap.add_argument(
+        "--max-tasks-per-child",
+        type=int,
+        default=DEFAULT_MAX_TASKS_PER_CHILD,
+        help="Recycle each worker after this many conditions (fix for d.4 pool-teardown tail)",
+    )
     args = ap.parse_args(argv)
 
     tasks = _parse_tasks(args.tasks)
@@ -538,6 +666,7 @@ def main(argv: list[str] | None = None) -> int:
         workers=workers,
         scenic_only=args.scenic_only,
         max_iter=args.max_iter,
+        max_tasks_per_child=args.max_tasks_per_child,
     )
 
     print(json.dumps(summary, indent=2))
