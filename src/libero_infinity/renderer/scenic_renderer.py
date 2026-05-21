@@ -254,15 +254,45 @@ def _footprint_clearance_xy(
     dims_a: tuple[float, float, float],
     dims_b: tuple[float, float, float],
 ) -> float:
-    """Minimum centre-to-centre xy distance before two footprints overlap.
+    """Minimum centre-to-centre **radial** xy distance before two footprints overlap.
 
     Computes the diagonal radius of each object's xy footprint and returns
-    their sum — the minimum separation needed to guarantee no overlap.
-    Duplicated from simulator.py to avoid circular imports.
+    their sum — the minimum separation needed to guarantee no overlap from
+    *any* approach angle.  Duplicated from simulator.py to avoid circular
+    imports.
+
+    NOTE: For *axis-aligned* AABBs (which is what every LIBERO fixture and
+    object uses), this radial form is unnecessarily conservative by a factor
+    of ~√2 in the symmetric case (and worse for elongated fixtures such as
+    flat_stove or desk_caddy).  The separating-axis theorem gives an *exact*
+    AABB non-overlap test using only per-axis half-width sums
+    (``_footprint_clearance_aabb`` below).  This radial form is retained for
+    callers that need a single scalar clearance (e.g. settle-drift tolerance
+    checks); the Scenic ``require`` emitters in ``_render_constraints`` use
+    the SAT-correct OR-form instead, mirroring the object↔object pair form.
     """
     radius_a = math.hypot(dims_a[0], dims_a[1]) / 2.0
     radius_b = math.hypot(dims_b[0], dims_b[1]) / 2.0
     return radius_a + radius_b
+
+
+def _footprint_clearance_aabb(
+    dims_a: tuple[float, float, float],
+    dims_b: tuple[float, float, float],
+) -> tuple[float, float]:
+    """SAT-correct per-axis half-width-sum clearance for two AABBs.
+
+    Returns ``(dx_min, dy_min)`` such that two axis-aligned bounding boxes
+    of footprint ``dims_a`` and ``dims_b`` are non-overlapping iff::
+
+        abs(xa - xb) > dx_min  OR  abs(ya - yb) > dy_min
+
+    This is the standard separating-axis theorem for axis-aligned rectangles
+    and is the tightest possible non-overlap condition.
+    """
+    dx_min = (dims_a[0] + dims_b[0]) / 2.0
+    dy_min = (dims_a[1] + dims_b[1]) / 2.0
+    return dx_min, dy_min
 
 
 # ---------------------------------------------------------------------------
@@ -868,11 +898,19 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             )
 
     # Object-fixture footprint clearance: task objects must not overlap fixed
-    # fixtures.  Use the radial diagonal clearance (_footprint_clearance_xy)
-    # rather than an AABB OR-based threshold — the OR form permits diagonal
-    # positions that still penetrate fixture geometry (one axis satisfied but
-    # the other not).  The diagonal radius sum guarantees clearance from all
-    # approach angles.
+    # fixtures.  Use the **SAT-correct per-axis OR-form** — identical in
+    # structure to the object↔object pairwise clearance at the top of this
+    # function.  By the separating-axis theorem for axis-aligned rectangles,
+    # two AABBs are non-overlapping iff |dx| > (wa+wb)/2 OR |dy| > (la+lb)/2.
+    # The previous radial-diagonal form (`distance > _footprint_clearance_xy`)
+    # was conservative by ~√2× (worse for elongated fixtures like flat_stove
+    # 0.36×0.20 or desk_caddy 0.14×0.42), and the original justification
+    # ("OR form permits diagonal corner penetration") is mathematically
+    # incorrect — disjoint x-projections imply disjoint AABBs regardless of
+    # y, and vice versa. The over-conservative radial form is the dominant
+    # contributor to Scenic rejection-sampler budget exhaustion on the
+    # 10-task `libero_goal/` drawer-family residual (campaign caveat c.1):
+    # see rca/stage4_c1_addendum_10_task_footprint.md.
     #
     # Decision routed through ``_should_emit_fixture_clearance`` so that:
     #   - fixed BDDL placements stay un-constrained (trust author), and
@@ -888,8 +926,11 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         for var_name, dims, _name, sampled in obj_info:
             if not _should_emit_fixture_clearance(var_name, sampled, fvar, support_relations):
                 continue
-            clearance = _footprint_clearance_xy(fdims, dims)
-            lines.append(f"require (distance from {var_name} to {fvar}) > {clearance:.4f}")
+            dx_min, dy_min = _footprint_clearance_aabb(fdims, dims)
+            lines.append(
+                f"require (abs({var_name}.position.x - {fvar}.position.x) > {dx_min:.4f}) "
+                f"or (abs({var_name}.position.y - {fvar}.position.y) > {dy_min:.4f})"
+            )
 
     # Anti-trivialization: note in params that it's active
     if plan.anti_trivialization_active:
@@ -939,10 +980,13 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
                 if not _should_emit_fixture_clearance(d_var, True, fvar, support_relations):
                     continue
                 fdims = _fixture_dims(fnode.object_class)
-                clearance = _footprint_clearance_xy(fdims, distractor_dims)
+                # SAT-correct AABB OR-form (see object↔fixture comment block
+                # above and rca/stage4_c1_addendum_10_task_footprint.md).
+                dx_min, dy_min = _footprint_clearance_aabb(fdims, distractor_dims)
                 lines.append(
                     f"require (_n_distractors <= {i}) "
-                    f"or ((distance from {d_var} to {fvar}) > {clearance:.4f})"
+                    f"or (abs({d_var}.position.x - {fvar}.position.x) > {dx_min:.4f}) "
+                    f"or (abs({d_var}.position.y - {fvar}.position.y) > {dy_min:.4f})"
                 )
 
     lines.append("")

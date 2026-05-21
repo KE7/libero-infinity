@@ -558,14 +558,16 @@ class TestScenicGenerator:
         path = generate_scenic_file(cfg, perturbation="position")
         try:
             code = pathlib.Path(path).read_text()
-            # New compiler emits radial footprint-clearance constraints (distance form)
-            assert "require (distance from " in code
+            # Compiler emits SAT-form AABB footprint-clearance constraints
+            # (per-axis half-width-sum OR'd over x/y) — see PR #16 RCA.
+            assert "require (abs(" in code
+            assert ".position.x - " in code and ".position.y - " in code
             # Both fixtures appear as declared variables in the program
             assert "flat_stove_1 = new LIBEROFixture" in code
             assert "wooden_cabinet_1 = new LIBEROFixture" in code
             # Objects' footprint-clearance constraints reference the fixture variables
-            assert "distance from " in code and "flat_stove_1" in code
-            assert "distance from " in code and "wooden_cabinet_1" in code
+            assert "flat_stove_1.position.x" in code and "flat_stove_1.position.y" in code
+            assert "wooden_cabinet_1.position.x" in code and "wooden_cabinet_1.position.y" in code
         finally:
             os.unlink(path)
 
@@ -766,15 +768,14 @@ class TestLiberoCorpusAudit:
             code = pathlib.Path(path).read_text()
             assert "param distractor_0_class = Uniform(*_distractor_pool)" in code
             assert "_n_distractors = globalParameters.n_distractors" in code
-            assert (
-                "require (_n_distractors <= 0) or ((distance from distractor_0 to wooden_cabinet_1)"
-            ) in code
-            assert (
-                "require (_n_distractors <= 0) or ((distance from distractor_0 to flat_stove_1)"
-            ) in code
-            assert (
-                "require (_n_distractors <= 0) or ((distance from distractor_0 to wine_rack_1)"
-            ) in code
+            # Compiler now emits SAT-form AABB clearance for distractor↔fixture
+            # pairs (per-axis OR), gated by the cardinality guard. See PR #16.
+            for fixture in ("wooden_cabinet_1", "flat_stove_1", "wine_rack_1"):
+                assert (
+                    f"require (_n_distractors <= 0) or "
+                    f"(abs(distractor_0.position.x - {fixture}.position.x)"
+                ) in code
+                assert f"abs(distractor_0.position.y - {fixture}.position.y)" in code
             scenario = sc.scenarioFromFile(path)
             scene, _ = scenario.generate(maxIterations=2000, verbosity=0)
             assert "n_distractors" in scene.params
