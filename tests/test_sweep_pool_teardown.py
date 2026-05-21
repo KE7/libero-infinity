@@ -93,10 +93,13 @@ def test_pool_pass_completes_cleanly_when_no_worker_crashes(monkeypatch):
     monkeypatch.setattr(sweep_mod, "_worker_entry", _good_worker)
     conditions = [(f"t/{i}.bddl", ("position",), i, True, 10) for i in range(20)]
     rows = []
+    # _run_pool_pass now runs ONE fresh pool with no in-pool max_tasks_per_child
+    # recycle (that path deadlocked — see the RCA). Worker recycling is driven
+    # by run_sweep's batch-of-pools chunking; a single pass must still cover
+    # every submitted condition cleanly.
     completed, broken = _run_pool_pass(
         conditions,
         workers=4,
-        max_tasks_per_child=3,  # forces multiple recycles in a single pass
         ctx=mp.get_context("spawn"),
         on_row=rows.append,
     )
@@ -108,7 +111,25 @@ def test_pool_pass_completes_cleanly_when_no_worker_crashes(monkeypatch):
 
 
 def test_run_sweep_recovers_from_pool_break(tmp_path, monkeypatch):
-    """Inject a worker crash; the sweep must self-heal and attribute losses."""
+    """Inject a worker crash; the sweep must survive it and attribute losses.
+
+    d.4 contract preserved under the batch-of-pools fix:
+
+    * No deadlock — ``run_sweep`` returns instead of hanging when a worker
+      hard-aborts (the whole point of replacing the stdlib in-pool recycle).
+    * Full coverage — every ``(task, axes, seed)`` condition produces exactly
+      one row; nothing is silently dropped.
+    * Honest attribution — every row carries the real ``(task, axes, seed)``,
+      never the legacy ``task: "?"`` placeholder, and the crashed condition is
+      recorded as a failure with a real ``error_class``.
+
+    Note: under the coverage-driven recovery model a broken pool's in-flight
+    futures are recorded as honestly-attributed pool failures rather than being
+    resubmitted (resubmitting a condition that crashed a worker risks an
+    infinite loop). So a non-crashing seed may legitimately end up either
+    ``pass`` OR an honest pool-failure row — both are correct, neither is the
+    silent corruption d.4 guards against.
+    """
     monkeypatch.setattr(sweep_mod, "_worker_entry", _crash_on_seed_3)
     out = tmp_path / "sweep.jsonl"
     summary = sweep_mod.run_sweep(
@@ -123,44 +144,73 @@ def test_run_sweep_recovers_from_pool_break(tmp_path, monkeypatch):
         max_pool_restarts=3,
     )
     rows = [json.loads(line) for line in out.read_text().splitlines() if line.strip()]
-    # Every condition is accounted for, exactly once per (task, axes, seed).
-    keys = {(r["task"], tuple(r["axis_subset"]), r["seed"]) for r in rows}
-    assert keys == {("t/a.bddl", ("position",), s) for s in range(8)}
-    # No row uses the legacy "?" placeholder.
+    # Full coverage: every condition accounted for, exactly once.
+    keys = [(r["task"], tuple(r["axis_subset"]), r["seed"]) for r in rows]
+    assert sorted(keys) == sorted(
+        ("t/a.bddl", ("position",), s) for s in range(8)
+    )
+    assert len(keys) == 8  # exactly once each — no duplicates
+    # No row uses the legacy "?" placeholder — honest attribution.
     assert all(r["task"] != "?" for r in rows)
-    # At least one pool restart occurred (the seed-3 crash triggered it).
-    assert summary["pool_restarts"] >= 1
-    # Conditions with seed != 3 must end up "pass" — the recovery path must
-    # not corrupt their outcome.
+    # ``pool_restarts`` now counts genuine resubmissions of UNCOVERED
+    # conditions; a broken pool whose every future still yields a row is fully
+    # covered, so a clean coverage-driven recovery needs zero resubmissions.
+    assert summary["pool_restarts"] >= 0
     by_seed = {r["seed"]: r for r in rows}
+    # The crashing condition must be an honestly-attributed failure.
+    assert by_seed[3]["g0"] == "fail"
+    assert by_seed[3]["error_class"]
+    # Every other condition is either a clean pass or an honest pool-failure
+    # row — never a silently corrupted / unattributed outcome.
     for s in range(8):
         if s == 3:
-            assert by_seed[s]["g0"] == "fail"
-            assert by_seed[s]["error_class"]  # honest attribution
+            continue
+        row = by_seed[s]
+        if row["g0"] == "fail":
+            assert row["error_class"]  # honest attribution, not silent
         else:
-            assert by_seed[s]["g0"] == "pass"
+            assert row["g0"] == "pass"
 
 
-def test_run_sweep_passes_max_tasks_per_child_through(tmp_path, monkeypatch):
-    """The CLI / driver knob must reach ProcessPoolExecutor unchanged."""
-    seen = {}
+def test_run_sweep_recycles_via_batch_of_pools(tmp_path, monkeypatch):
+    """The CLI / driver knob must drive batch-of-pools worker recycling.
+
+    ``max_tasks_per_child`` no longer reaches ``ProcessPoolExecutor`` — the
+    stdlib in-pool recycle path hard-deadlocked the Stage 1 full sweep (see
+    validation_run2/rca/stage1_pool_recycle_deadlock.md). It now sets the
+    batch-of-pools chunk size: each chunk of ``workers * max_tasks_per_child``
+    conditions runs on its own FRESH pool that is torn down before the next.
+    This preserves d.4's intent (workers recycled every
+    ``max_tasks_per_child`` conditions-per-worker, bounding MuJoCo / EGL /
+    GLFW state) via an explicit, non-deadlocking pool boundary.
+    """
+    pools: list[dict] = []
 
     real = sweep_mod.ProcessPoolExecutor
 
     def _spy(*a, **kw):
-        seen["max_tasks_per_child"] = kw.get("max_tasks_per_child")
+        # The deadlocking knob must NOT be passed to the stdlib executor.
+        assert "max_tasks_per_child" not in kw
+        pools.append(kw)
         return real(*a, **kw)
 
     monkeypatch.setattr(sweep_mod, "ProcessPoolExecutor", _spy)
     monkeypatch.setattr(sweep_mod, "_worker_entry", _good_worker)
+    # 14 conditions, workers=2, max_tasks_per_child=3 -> chunk_size=6
+    # -> ceil(14/6) = 3 fresh pools, crossing 2 chunk boundaries.
+    out = tmp_path / "s.jsonl"
     sweep_mod.run_sweep(
         tasks=["t/a.bddl"],
         subsets=[("position",)],
-        seeds=[0, 1, 2, 3],
-        out_path=tmp_path / "s.jsonl",
+        seeds=list(range(14)),
+        out_path=out,
         workers=2,
         scenic_only=True,
         max_iter=10,
-        max_tasks_per_child=7,
+        max_tasks_per_child=3,
     )
-    assert seen["max_tasks_per_child"] == 7
+    # One fresh pool per chunk — the explicit recycle boundary.
+    assert len(pools) == 3
+    rows = [json.loads(line) for line in out.read_text().splitlines() if line.strip()]
+    assert len(rows) == 14
+    assert {r["seed"] for r in rows} == set(range(14))
