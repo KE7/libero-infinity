@@ -36,6 +36,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
+from ._scene_view import wrap_scene
+
 # Canonical 9 axes — must agree with validation.sweep.CANONICAL_AXES.
 AXES: tuple[str, ...] = (
     "position",
@@ -475,9 +477,11 @@ def assert_all_identities(
     unknown = active - set(AXES)
     if unknown:
         raise ValueError(f"assert_all_identities: unknown axes in active_axes: {sorted(unknown)}")
-    # NOTE: This module reads a richer per-axis schema than a raw Scenic Scene
-    # exposes. Adapter (``_scene_view.wrap_scene``) is part of the in-flight
-    # ``g4-identity-adapter`` follow-up PR; the tests here use rich fixtures.
+    # Project Scenic Scenes (which only expose .objects/.params) onto the
+    # richer per-axis schema this module reads. Already-rich scenes (used by
+    # the unit-test fixtures) pass through unchanged. See ``_scene_view.py``.
+    baseline_scene = wrap_scene(baseline_scene)
+    perturbed_scene = wrap_scene(perturbed_scene)
     return [
         IDENTITY_ASSERTIONS[axis](baseline_scene, perturbed_scene)
         for axis in AXES
