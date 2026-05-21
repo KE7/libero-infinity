@@ -146,9 +146,7 @@ def test_run_sweep_recovers_from_pool_break(tmp_path, monkeypatch):
     rows = [json.loads(line) for line in out.read_text().splitlines() if line.strip()]
     # Full coverage: every condition accounted for, exactly once.
     keys = [(r["task"], tuple(r["axis_subset"]), r["seed"]) for r in rows]
-    assert sorted(keys) == sorted(
-        ("t/a.bddl", ("position",), s) for s in range(8)
-    )
+    assert sorted(keys) == sorted(("t/a.bddl", ("position",), s) for s in range(8))
     assert len(keys) == 8  # exactly once each — no duplicates
     # No row uses the legacy "?" placeholder — honest attribution.
     assert all(r["task"] != "?" for r in rows)
