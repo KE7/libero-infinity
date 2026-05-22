@@ -23,6 +23,7 @@ import math
 from typing import Any, Iterable
 
 from ._result import AssertionResult
+from ._scene_view import is_scene_fixture, resolve_object_name
 from .domain import _iter_scene_objects, _obj_class, _obj_position
 
 DEFAULT_POS_TOL = 5e-3
@@ -173,7 +174,7 @@ def assert_pose_tolerance(
     rot_tol_deg: float = DEFAULT_ROT_TOL_DEG,
 ) -> AssertionResult:
     """Compare Scenic vs env pose for a single object."""
-    name = getattr(scenic_obj, "name", "?")
+    name = resolve_object_name(scenic_obj) or "?"
     s_pos = _obj_position(scenic_obj)
     e_pos = env_obj_state.get("position")
     payload: dict[str, Any] = {"name": name, "pos_tol": pos_tol, "rot_tol_deg": rot_tol_deg}
@@ -245,8 +246,8 @@ def assert_pose_tolerance(
 
 def assert_class_match(scenic_obj: Any, env_obj_state: dict[str, Any]) -> AssertionResult:
     """Scenic object's asset class must equal the env's class string."""
-    name = getattr(scenic_obj, "name", "?")
-    s_cls = _obj_class(scenic_obj)
+    name = resolve_object_name(scenic_obj) or "?"
+    s_cls = _obj_class(scenic_obj) or None
     e_cls = env_obj_state.get("class")
     if s_cls is None or e_cls is None:
         return AssertionResult(
@@ -291,13 +292,16 @@ def assert_consistency(
     Missing env entries are reported as *failures* — silent omission would
     defeat the purpose of this check.
     """
-    objs = _iter_scene_objects(scene)
+    # Fixtures are scene structure injected from the BDDL :fixtures block, not
+    # Scenic-sampled task assets — the Scenic↔env consistency check is scoped
+    # to the sampled movable objects (and distractors).
+    objs = [o for o in _iter_scene_objects(scene) if not is_scene_fixture(o)]
     if names is not None:
         keep = set(names)
-        objs = [o for o in objs if getattr(o, "name", None) in keep]
+        objs = [o for o in objs if resolve_object_name(o) in keep]
     results: list[AssertionResult] = []
     for o in objs:
-        nm = getattr(o, "name", "?")
+        nm = resolve_object_name(o) or "?"
         try:
             state = _env_get_object(env, nm)
         except EnvObjectMissing as exc:

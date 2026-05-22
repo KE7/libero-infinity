@@ -39,6 +39,7 @@ import re
 from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
 from ._result import AssertionResult
+from ._scene_view import is_scene_fixture, resolve_object_name
 
 DEFAULT_POS_TOL = 1e-4
 
@@ -109,7 +110,21 @@ def _iter_scene_objects(scene: Any) -> list[Any]:
 
 
 def _scene_by_name(scene: Any) -> dict[str, Any]:
-    return {getattr(o, "name", ""): o for o in _iter_scene_objects(scene)}
+    # Scenic LIBEROObject/LIBEROFixture expose identity as ``libero_name``,
+    # not ``name`` — resolve via the shared scene-object adapter so the key
+    # is the real instance name (see ``_scene_view.resolve_object_name``).
+    return {resolve_object_name(o): o for o in _iter_scene_objects(scene)}
+
+
+def _iter_sampled_objects(scene: Any) -> list[Any]:
+    """Scene objects that are sampled task assets (movable objects + distractors).
+
+    Excludes Scenic ``LIBEROFixture`` instances: fixtures are scene structure
+    placed from the BDDL ``:fixtures`` block, not assets sampled from the
+    asset-variant registry, so the registry / consistency invariants must not
+    score them.
+    """
+    return [o for o in _iter_scene_objects(scene) if not is_scene_fixture(o)]
 
 
 # ---------------------------------------------------------------------------
@@ -165,24 +180,24 @@ def assert_assets_in_registry(scene: Any, registry: Iterable[str] | None = None)
         registry_set: set[str] = set(_default_registry())
     else:
         registry_set = set(registry)
-    objs = _iter_scene_objects(scene)
+    objs = _iter_sampled_objects(scene)
     if not objs:
         return AssertionResult(
             name="assets_in_registry",
             passed=None,
-            detail="Scene has no objects to verify.",
+            detail="Scene has no sampled objects to verify.",
             payload={},
         )
     unknown: list[tuple[str, str | None]] = []
     seen: set[str] = set()
     for o in objs:
-        cls = _obj_class(o)
+        cls = _obj_class(o) or None
         if cls is None:
-            unknown.append((getattr(o, "name", "?"), None))
+            unknown.append((resolve_object_name(o) or "?", None))
             continue
         seen.add(cls)
         if cls not in registry_set:
-            unknown.append((getattr(o, "name", "?"), cls))
+            unknown.append((resolve_object_name(o) or "?", cls))
     if unknown:
         return AssertionResult(
             name="assets_in_registry",

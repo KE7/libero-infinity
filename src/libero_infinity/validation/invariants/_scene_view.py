@@ -102,6 +102,48 @@ def _is_fixture(obj: Any) -> bool:
     return _scenic_class_name(obj).endswith("Fixture")
 
 
+# ---------------------------------------------------------------------------
+# Public scene-object identity adapter
+# ---------------------------------------------------------------------------
+#
+# These are the single source of truth for resolving a scene object's identity
+# and kind. The G4 family-A (identity) readers above and the family-B/C/D
+# invariants (``domain.py`` / ``consistency.py`` / ``affordance.py``) all route
+# through here so the Scenic ``libero_name`` convention cannot drift between
+# modules again (see RCA stage1_g4_bcd_scene_object_adapter).
+
+
+def resolve_object_name(obj: Any) -> str:
+    """Return the canonical instance name of a scene object.
+
+    Scenic ``LIBEROObject`` / ``LIBEROFixture`` expose the BDDL instance name
+    as the declared property ``libero_name`` — there is **no** ``name``
+    property. Plain test doubles / IR objects use ``name`` or ``id``. Returns
+    ``""`` only when the object is genuinely nameless.
+    """
+    for attr in ("libero_name", "name", "id"):
+        v = getattr(obj, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+def is_scene_fixture(obj: Any) -> bool:
+    """True for Scenic ``LIBEROFixture`` instances (non-movable scene structure).
+
+    Fixtures are scene structure, not sampled task assets — they are excluded
+    from the asset-registry / consistency / affordance invariants, which are
+    scoped to the movable objects (and distractors) the perturbation pipeline
+    actually samples.
+    """
+    return _is_fixture(obj)
+
+
+def is_scene_distractor(obj: Any) -> bool:
+    """True for Scenic distractor objects (``libero_name`` starts ``distractor_``)."""
+    return _is_distractor(obj)
+
+
 def _is_distractor(obj: Any) -> bool:
     name = _libero_name(obj)
     return name is not None and name.startswith("distractor_")

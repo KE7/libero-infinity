@@ -514,8 +514,18 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         # Build specifier list — Scenic 3 requires comma-separated specifiers.
         # libero_name is the declared property on LIBEROObject (not 'name').
         specifiers: list[str] = [pos_spec]
+        # asset_class MUST be emitted on every generated object so the G4
+        # family-B/C/D invariants (assets_in_registry, class_match, affordance
+        # class lookup) can read the real instantiated asset class. When the
+        # ``object`` axis is active and this object's class was substituted to
+        # a sampled OOD variant, asset_class is bound to the variant chooser
+        # (``_chosen_<class>``) — i.e. it reports the asset that was actually
+        # instantiated, not the canonical one. Otherwise it is the canonical
+        # asset class from the TaskConfig / scene graph.
         if scenic_class:
             specifiers.append(f"with asset_class {scenic_class}")
+        else:
+            specifiers.append(f'with asset_class "{obj_class}"')
         specifiers.append(f'with libero_name "{obj_name}"')
         # support_parent_name is read by the simulator both to skip
         # footprint-overlap validation between the object and its declared
