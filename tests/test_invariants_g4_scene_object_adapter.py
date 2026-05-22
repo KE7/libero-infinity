@@ -24,10 +24,7 @@ fail. After the adapter fix they pass.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from libero_infinity.validation.invariants import g4_domain_consistency_hook
-
 
 # ---------------------------------------------------------------------------
 # Scenic-style scene doubles — identity via ``libero_name`` (NOT ``name``).
@@ -227,9 +224,7 @@ def test_renderer_emits_asset_class_on_every_object():
     from libero_infinity.renderer.scenic_renderer import render_scenic
     from libero_infinity.task_config import TaskConfig
 
-    bddl = glob.glob(
-        "src/libero_infinity/data/libero_runtime/bddl_files/**/*.bddl", recursive=True
-    )
+    bddl = glob.glob("src/libero_infinity/data/libero_runtime/bddl_files/**/*.bddl", recursive=True)
     if not bddl:
         import pytest
 
