@@ -458,19 +458,45 @@ def _attributed_pool_failure_row(
     }
 
 
+def chunk_conditions(conditions: list[tuple], chunk_size: int) -> list[list[tuple]]:
+    """Partition ``conditions`` into contiguous chunks of ``chunk_size``.
+
+    Each chunk is run on its own fresh :class:`ProcessPoolExecutor` which is
+    torn down before the next chunk begins. That teardown destroys every
+    worker process every ``chunk_size`` conditions — the explicit,
+    non-deadlocking replacement for the stdlib ``max_tasks_per_child`` in-pool
+    recycle. With ``chunk_size = workers * max_tasks_per_child`` each worker
+    handles at most ``max_tasks_per_child`` conditions before its process is
+    destroyed, preserving PR #18's d.4 guarantee (no long-lived MuJoCo / EGL /
+    GLFW render-context state accumulation).
+    """
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+    return [conditions[i : i + chunk_size] for i in range(0, len(conditions), chunk_size)]
+
+
 def _run_pool_pass(
     conditions: list[tuple],
     *,
     workers: int,
-    max_tasks_per_child: int,
     ctx: Any,
     on_row,
 ) -> tuple[set[int], BaseException | None]:
-    """One pool lifecycle: submit ``conditions``, stream results to ``on_row``.
+    """One pool lifecycle: submit ``conditions`` on a FRESH pool, stream rows.
+
+    The pool is created **without** ``max_tasks_per_child``. Worker recycling
+    is driven explicitly by :func:`run_sweep` via batch-of-pools chunking (see
+    :func:`chunk_conditions`). Relying on the stdlib in-pool
+    ``max_tasks_per_child`` respawn path is what hard-deadlocked the Stage 1
+    full sweep at the ``workers x max_tasks_per_child`` boundary — when the
+    whole worker cohort retires in the same tick the ``_ExecutorManagerThread``
+    never spawns the replacement cohort and no ``BrokenProcessPool`` is raised
+    (RCA: validation_run2/rca/stage1_pool_recycle_deadlock.md).
 
     Returns ``(completed_indices, broken_exc_or_None)``. ``completed_indices``
-    indexes into ``conditions``; the caller resubmits the complement on a fresh
-    pool if ``broken_exc_or_None`` is set.
+    indexes into ``conditions``. The caller resubmits the complement on a
+    fresh pool whenever ``completed_indices`` does not cover every condition —
+    whether the gap is a raised ``BrokenProcessPool`` or a silent truncation.
     """
     completed: set[int] = set()
     broken: BaseException | None = None
@@ -478,7 +504,6 @@ def _run_pool_pass(
         with ProcessPoolExecutor(
             max_workers=workers,
             mp_context=ctx,
-            max_tasks_per_child=max_tasks_per_child,
         ) as ex:
             fut_to_idx = {ex.submit(_worker_entry, c): i for i, c in enumerate(conditions)}
             for fut in as_completed(fut_to_idx):
@@ -511,15 +536,30 @@ def run_sweep(
 ) -> dict[str, Any]:
     """Execute the cartesian sweep and stream results to JSONL.
 
-    Resilience model (fix for d.4 BrokenProcessPool pool-teardown tail):
+    Worker-recycle model — **batch-of-pools** (fix for the Stage 1 full-sweep
+    deadlock, RCA: validation_run2/rca/stage1_pool_recycle_deadlock.md):
 
-    * Workers are recycled every ``max_tasks_per_child`` conditions so
-      accumulated MuJoCo / GLFW / EGL render-context state never reaches the
-      level that crashed Stage 3 Run 2 workers at pool shutdown.
-    * If a worker still dies and breaks the pool, the unfinished slice is
-      resubmitted on a fresh pool (up to ``max_pool_restarts`` times). Lost
-      conditions are recorded with full ``(task, axis_subset, seed)``
-      attribution — not the ``task: "?"`` placeholder the old driver wrote.
+    * The condition list is partitioned into contiguous chunks of
+      ``workers * max_tasks_per_child``. Each chunk runs on a FRESH
+      :class:`ProcessPoolExecutor` created **without** ``max_tasks_per_child``;
+      the pool is torn down before the next chunk starts. This destroys every
+      worker process every ``max_tasks_per_child`` conditions-per-worker —
+      identical to PR #18's d.4 guarantee (no long-lived MuJoCo / GLFW / EGL
+      render-context state accumulation) — but via a deterministic,
+      harness-controlled pool boundary instead of the stdlib in-pool
+      ``max_tasks_per_child`` respawn path, which hard-deadlocks when the whole
+      worker cohort retires in the same tick.
+    * Silent-truncation hardening: after every pool pass the driver checks
+      ``completed == submitted`` by coverage, NOT by trusting the
+      ``BrokenProcessPool`` flag. Any uncovered conditions — a broken pool OR
+      a silent drop — are resubmitted on a fresh pool (up to
+      ``max_pool_restarts`` times per chunk).
+    * If conditions still cannot complete, they are recorded with full
+      ``(task, axis_subset, seed)`` attribution — not the ``task: "?"``
+      placeholder the old driver wrote.
+
+    The ``--max-tasks-per-child`` CLI semantics ("recycle workers every N
+    conditions") are unchanged; only the MECHANISM differs.
 
     Returns a summary dict with per-gate pass/fail counts plus a
     ``pool_restarts`` count for diagnostics.
@@ -565,37 +605,55 @@ def run_sweep(
             if done % 10 == 0 or done == total:
                 print(f"[sweep] {done}/{total}", file=sys.stderr, flush=True)
 
-        pending = list(conditions)
-        for _attempt in range(max_pool_restarts + 1):
-            if not pending:
-                break
-            completed, broken = _run_pool_pass(
-                pending,
-                workers=workers,
-                max_tasks_per_child=max_tasks_per_child,
-                ctx=ctx,
-                on_row=_on_row,
-            )
-            if not broken:
-                pending = []
-                break
-            pool_restarts += 1
-            pending = [c for i, c in enumerate(pending) if i not in completed]
-            print(
-                f"[sweep] pool broke ({broken!r}); restart "
-                f"{pool_restarts}/{max_pool_restarts}, resubmitting "
-                f"{len(pending)} conditions",
-                file=sys.stderr,
-                flush=True,
-            )
-        for cond in pending:
-            _on_row(
-                _attributed_pool_failure_row(
-                    cond,
-                    RuntimeError("pool restart budget exhausted"),
-                    attempts=max_pool_restarts + 1,
+        # Batch-of-pools worker recycling: partition into chunks of
+        # (workers * max_tasks_per_child) and run each chunk on a fresh pool,
+        # torn down before the next chunk. This recycles every worker process
+        # every `max_tasks_per_child` conditions-per-worker without the stdlib
+        # in-pool max_tasks_per_child deadlock.
+        chunk_size = max(1, workers * max_tasks_per_child)
+        for chunk in chunk_conditions(conditions, chunk_size):
+            pending = list(chunk)
+            for _attempt in range(max_pool_restarts + 1):
+                if not pending:
+                    break
+                submitted = len(pending)
+                completed, broken = _run_pool_pass(
+                    pending,
+                    workers=workers,
+                    ctx=ctx,
+                    on_row=_on_row,
                 )
-            )
+                remaining = [c for i, c in enumerate(pending) if i not in completed]
+                # Coverage check — NOT the broken flag. A pass is incomplete
+                # whenever it failed to cover every submitted condition,
+                # whether that surfaced as a BrokenProcessPool or a silent
+                # truncation. Either way the remainder is resubmitted fresh.
+                if not remaining:
+                    pending = []
+                    break
+                pool_restarts += 1
+                reason = (
+                    repr(broken)
+                    if broken is not None
+                    else f"silent truncation: only {len(completed)}/{submitted} covered"
+                )
+                print(
+                    f"[sweep] pool pass incomplete ({reason}); restart "
+                    f"{pool_restarts} (per-chunk budget {max_pool_restarts}), "
+                    f"resubmitting {len(remaining)} conditions on a fresh pool",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                pending = remaining
+            # Per-chunk restart budget exhausted: honestly attribute the loss.
+            for cond in pending:
+                _on_row(
+                    _attributed_pool_failure_row(
+                        cond,
+                        RuntimeError("pool restart budget exhausted"),
+                        attempts=max_pool_restarts + 1,
+                    )
+                )
 
     return {
         "total": total,
