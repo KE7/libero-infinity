@@ -258,6 +258,37 @@ def test_on_predicates_z_resolves_longest_fixture_prefix():
     assert r.passed is True, r.detail
 
 
+@dataclass
+class _ObjWithParent:
+    """Mock movable carrying ``support_parent_name`` (the implicit-support
+    annotation Scenic LIBEROObjects emit for table-supported objects)."""
+
+    name: str
+    object_class: str
+    position: tuple[float, float, float]
+    support_parent_name: str = "main_table"
+    z_top: float | None = None
+    aabb: tuple[float, float, float, float, float, float] | None = None
+    is_fixed: bool = False
+
+
+def test_on_predicates_z_virtual_main_table_support():
+    """`(On bowl_1 main_table_bowl_region)` resolves to a *virtual* support
+    derived from any movable's `support_parent_name == "main_table"` — the
+    table is rendered by LIBERO, not by the Scenic compiler, so it never
+    appears in `scene.objects` as a fixture. Regression for the second half
+    of RCA Finding 4 surfaced by the post-PR-21 smoke.
+    """
+    bddl = _BDDL(init_text="(On bowl_1 main_table_bowl_region)")
+    scene = _Scene(
+        objects=[
+            _ObjWithParent("bowl_1", "akita_black_bowl", position=(0, 0, 0.82)),
+        ]
+    )
+    r = assert_on_predicates_z(bddl, scene)
+    assert r.passed is True, r.detail
+
+
 def test_on_predicates_z_skip_no_predicates():
     r = assert_on_predicates_z(_BDDL(init_text="(AtPose bowl_1 region_1)"), _Scene())
     assert r.passed is None
