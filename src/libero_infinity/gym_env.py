@@ -237,6 +237,19 @@ class LIBEROScenicEnv(gym.Env):
                 self._resolve_bddl_for_scene(scene)
             )
 
+            # Parse the *effective* BDDL (post-substitution) for the
+            # asset-class map consumed by ``get_object_state`` (G4 family-C
+            # env-side accessor). The effective BDDL is what LIBERO/MuJoCo
+            # actually loaded, so its class strings are the ground truth.
+            try:
+                from libero_infinity.bddl_preprocessor import parse_object_classes
+
+                self._effective_obj_classes = parse_object_classes(
+                    pathlib.Path(effective_bddl).read_text()
+                )
+            except Exception:  # noqa: BLE001 — class map is best-effort
+                self._effective_obj_classes = {}
+
             simulator = LIBEROSimulator(
                 bddl_path=effective_bddl,
                 env_kwargs=env_kw,
@@ -329,6 +342,44 @@ class LIBEROScenicEnv(gym.Env):
             done = True
 
         return obs, reward, done, info
+
+    # ------------------------------------------------------------------
+    # G4 family-C env-side accessor
+    # ------------------------------------------------------------------
+
+    def get_object_state(self, name: str) -> dict[str, Any] | None:
+        """Return ``{position, orientation, class}`` for a Scenic-named object.
+
+        Used by :func:`libero_infinity.validation.invariants.assert_consistency`
+        to compare the Scenic-sampled scene against the live MuJoCo state
+        after :meth:`reset` — the G4 family-C consistency invariant. Returns
+        ``None`` when ``name`` is unknown so the caller can surface it as a
+        genuine consistency failure (silent omission would defeat the check).
+
+        - ``position`` is the world-frame body XYZ from MuJoCo
+          (``sim.data.body_xpos``).
+        - ``orientation`` is the body quaternion ``(w, x, y, z)`` from
+          ``sim.data.body_xquat`` (MuJoCo's native convention).
+        - ``class`` is the asset class string parsed from the *effective*
+          (post-substitution) BDDL — what LIBERO/MuJoCo actually loaded.
+        """
+        if self._sim is None:
+            return None
+        body_ids = getattr(self._sim, "_body_ids", None) or {}
+        bid = body_ids.get(name)
+        if bid is None:
+            return None
+        try:
+            sim_data = self._sim.libero_env.env.sim.data
+            pos = sim_data.body_xpos[bid]
+            quat = sim_data.body_xquat[bid]
+            position = (float(pos[0]), float(pos[1]), float(pos[2]))
+            orientation = (float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]))
+        except Exception:  # noqa: BLE001 — MuJoCo handle gone is a real fail
+            return None
+        cls_map = getattr(self, "_effective_obj_classes", {}) or {}
+        cls = cls_map.get(name)
+        return {"position": position, "orientation": orientation, "class": cls}
 
     def render(self, mode: str = "rgb_array") -> np.ndarray | None:
         """Return the current agentview image.

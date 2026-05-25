@@ -297,11 +297,38 @@ def assert_on_predicates_z(
             payload={},
         )
     by_name = _scene_by_name(scene)
+    # Pre-collect fixtures for prefix-based region/side resolution. BDDL
+    # `(On <obj> <fixture>_<region_or_side>)` predicates reference *named
+    # regions* on a fixture (e.g. `main_table_bowl_region`,
+    # `wooden_cabinet_1_top_side`) that are not themselves materialised as
+    # Scenic objects. We resolve the support to the longest fixture name
+    # that is a prefix of the target token (separated by `_`), and use that
+    # fixture's z_top as the support surface height. This is exactly the
+    # semantics LIBERO uses (regions are surface patches on a fixture).
+    fixtures_by_name = {
+        resolve_object_name(o): o
+        for o in _iter_scene_objects(scene)
+        if is_scene_fixture(o)
+    }
+
+    def _resolve_support(target: str) -> Any:
+        obj = by_name.get(target)
+        if obj is not None:
+            return obj
+        # Longest-prefix fixture match. `wooden_cabinet_1_top_side` →
+        # `wooden_cabinet_1`; `main_table_bowl_region` → `main_table`.
+        best: tuple[int, Any] = (-1, None)
+        for fname, fobj in fixtures_by_name.items():
+            if target == fname or target.startswith(fname + "_"):
+                if len(fname) > best[0]:
+                    best = (len(fname), fobj)
+        return best[1]
+
     violations: list[dict[str, Any]] = []
     missing: list[str] = []
     for a, b in pairs:
         oa = by_name.get(a)
-        ob = by_name.get(b)
+        ob = _resolve_support(b)
         if oa is None or ob is None:
             missing.append(f"{a} on {b}")
             continue

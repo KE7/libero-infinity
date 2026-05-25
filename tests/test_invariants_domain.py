@@ -188,6 +188,76 @@ def test_on_predicates_z_fail():
     assert r.payload["violations"][0]["a"] == "bowl_1"
 
 
+@dataclass
+class _Fixture:
+    """Mock fixture whose class name ends in ``Fixture`` so
+    ``is_scene_fixture`` resolves it as scene structure (not a sampled asset).
+    """
+
+    name: str
+    object_class: str
+    position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    z_top: float | None = None
+    aabb: tuple[float, float, float, float, float, float] | None = None
+    is_fixed: bool = True
+
+
+# Class name must end in "Fixture" for `is_scene_fixture` to detect it.
+_Fixture.__name__ = "LIBEROFixture"
+
+
+def test_on_predicates_z_resolves_region_via_fixture_prefix_pass():
+    """`(On bowl main_table_bowl_region)` resolves to the `main_table` fixture.
+
+    Regression test for RCA Finding 4 — On-predicate targets reference named
+    regions/sides on a fixture (e.g. `main_table_bowl_region`,
+    `wooden_cabinet_1_top_side`) that are not themselves materialised as
+    Scenic objects. The check must resolve the longest fixture-name prefix.
+    """
+    bddl = _BDDL(init_text="(On bowl_1 main_table_bowl_region)")
+    scene = _Scene(
+        objects=[
+            _Fixture("main_table", "main_table", position=(0, 0, 0.0), z_top=0.02),
+            _Obj("bowl_1", "akita_black_bowl", position=(0, 0, 0.05)),
+        ]
+    )
+    r = assert_on_predicates_z(bddl, scene)
+    assert r.passed is True, r.detail
+
+
+def test_on_predicates_z_resolves_region_via_fixture_prefix_fail():
+    """Same prefix resolution path, but the bowl is below the table top."""
+    bddl = _BDDL(init_text="(On bowl_1 main_table_bowl_region)")
+    scene = _Scene(
+        objects=[
+            _Fixture("main_table", "main_table", position=(0, 0, 0.0), z_top=0.50),
+            _Obj("bowl_1", "akita_black_bowl", position=(0, 0, 0.05)),
+        ]
+    )
+    r = assert_on_predicates_z(bddl, scene)
+    assert r.passed is False
+    assert r.payload["violations"][0]["a"] == "bowl_1"
+
+
+def test_on_predicates_z_resolves_longest_fixture_prefix():
+    """When two fixtures share a prefix, the longest match wins.
+
+    `wooden_cabinet_1_top_side` must resolve to `wooden_cabinet_1`, not
+    `wooden_cabinet`.
+    """
+    bddl = _BDDL(init_text="(On bowl_1 wooden_cabinet_1_top_side)")
+    scene = _Scene(
+        objects=[
+            _Fixture("wooden_cabinet", "cabinet", position=(0, 0, 0), z_top=1.0),
+            _Fixture("wooden_cabinet_1", "cabinet", position=(0, 0, 0), z_top=0.02),
+            _Obj("bowl_1", "akita_black_bowl", position=(0, 0, 0.05)),
+        ]
+    )
+    r = assert_on_predicates_z(bddl, scene)
+    # If the longer name resolved, z_top=0.02 → bowl at 0.05 passes.
+    assert r.passed is True, r.detail
+
+
 def test_on_predicates_z_skip_no_predicates():
     r = assert_on_predicates_z(_BDDL(init_text="(AtPose bowl_1 region_1)"), _Scene())
     assert r.passed is None
