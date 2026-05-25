@@ -155,6 +155,7 @@ def test_assert_consistency_detects_class_mismatch():
 # LIBEROScenicEnv.get_object_state — RCA Finding 3 env-side accessor
 # ---------------------------------------------------------------------------
 
+
 def test_libero_scenic_env_get_object_state_returns_pose_and_class():
     """LIBEROScenicEnv must expose `get_object_state(name)` so the G4
     family-C consistency check can compare Scenic vs MuJoCo poses. Before
@@ -211,8 +212,14 @@ def test_assert_consistency_uses_libero_env_accessor_real_results():
     env._effective_obj_classes = {"bowl_1": "akita_black_bowl"}
 
     scene = _Scene(
-        objects=[_Obj("bowl_1", "akita_black_bowl", position=(0.10, 0.20, 0.30),
-                     orientation=(1.0, 0.0, 0.0, 0.0))]
+        objects=[
+            _Obj(
+                "bowl_1",
+                "akita_black_bowl",
+                position=(0.10, 0.20, 0.30),
+                orientation=(1.0, 0.0, 0.0, 0.0),
+            )
+        ]
     )
     # The duck-typed Scenic object exposes `name` (not `libero_name`) — that is
     # fine because `resolve_object_name` falls back to `name` for test doubles.

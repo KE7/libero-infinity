@@ -306,9 +306,7 @@ def assert_on_predicates_z(
     # fixture's z_top as the support surface height. This is exactly the
     # semantics LIBERO uses (regions are surface patches on a fixture).
     fixtures_by_name = {
-        resolve_object_name(o): o
-        for o in _iter_scene_objects(scene)
-        if is_scene_fixture(o)
+        resolve_object_name(o): o for o in _iter_scene_objects(scene) if is_scene_fixture(o)
     }
 
     def _resolve_support(target: str) -> Any:

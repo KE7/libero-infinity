@@ -635,6 +635,7 @@ def test_visibility_targets_param_emitted_for_task_objects() -> None:
 # Articulation rendering — RCA Finding "baseline articulation"
 # ---------------------------------------------------------------------------
 
+
 def test_render_articulation_deterministic_when_axis_inactive() -> None:
     """Baseline articulation must be deterministic when the articulation axis
     is INACTIVE. Otherwise the no-axes baseline and any inactive-axis perturbed
