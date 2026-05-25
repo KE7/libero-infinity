@@ -31,6 +31,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from ._result import AssertionResult
+from ._scene_view import is_scene_fixture, resolve_object_name
 from .domain import _iter_scene_objects, _obj_class
 
 DEFAULT_GRIPPER_JAW_HALF_WIDTH = 0.04  # ~Panda jaw half-aperture, metres
@@ -90,8 +91,8 @@ def assert_aabb_clear_around_grasp(
 
     Skip (``passed=None``) iff the asset class has no grasp-point metadata.
     """
-    name = getattr(obj, "name", "?")
-    cls = _obj_class(obj)
+    name = resolve_object_name(obj) or "?"
+    cls = _obj_class(obj) or None
     if cls is None:
         return AssertionResult(
             name="aabb_clear_around_grasp",
@@ -134,7 +135,7 @@ def assert_aabb_clear_around_grasp(
         if _aabb_xy_intersects(grasp_aabb, (ox0, ox1, oy0, oy1)):
             obstructions.append(
                 {
-                    "occluder": getattr(other, "name", "?"),
+                    "occluder": resolve_object_name(other) or "?",
                     "occluder_aabb_xy": (ox0, ox1, oy0, oy1),
                 }
             )
@@ -192,6 +193,10 @@ def assert_affordance(
     """
     results: list[AssertionResult] = []
     for o in _iter_scene_objects(scene):
+        # Scenic LIBEROFixture instances are non-movable scene structure;
+        # ``is_fixed`` covers richer scene representations / test doubles.
+        if is_scene_fixture(o):
+            continue
         if only_movable and getattr(o, "is_fixed", False):
             continue
         results.append(
