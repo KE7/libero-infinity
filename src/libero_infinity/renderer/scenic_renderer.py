@@ -549,10 +549,29 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
 def _render_articulation(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     if not plan.articulation_plans:
         return ""
+    # When the articulation axis is INACTIVE the plan still carries the
+    # baseline articulation values that BDDL :init asserts as task
+    # preconditions (e.g. a closed cabinet). Those preconditions must be
+    # applied to the simulator regardless of axes, but they must be
+    # *deterministic* — emitting them as `Range(lo, hi)` would resample an
+    # independent concrete joint angle every time, breaking the G4 identity
+    # assertion that the baseline scene and any inactive-axis perturbed
+    # scene agree on joint state. Mirror the semantic split PR #6
+    # introduced for `plan_articulation_perturbation`: render
+    # stochastic Range only when the articulation axis is active.
+    art_active = "articulation" in plan.active_axes
     lines = ["# Articulation parameters"]
     for fixture_name, art_plan in plan.articulation_plans.items():
         var_name = _sanitize(fixture_name)
-        lines.append(f"param articulation_{var_name} = Range({art_plan.lo:.4f}, {art_plan.hi:.4f})")
+        lo = art_plan.lo
+        hi = art_plan.hi
+        if art_active and lo != hi:
+            lines.append(f"param articulation_{var_name} = Range({lo:.4f}, {hi:.4f})")
+        else:
+            # Deterministic baseline value. Use lo as the canonical sample
+            # so a degenerate range (lo == hi) reduces cleanly; this is the
+            # band edge documented in the RCA follow-up.
+            lines.append(f"param articulation_{var_name} = {lo:.4f}")
         lines.append(f'param articulation_{var_name}_state = "{art_plan.state_kind}"')
     lines.append("")
     return "\n".join(lines)

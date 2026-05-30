@@ -149,3 +149,86 @@ def test_assert_consistency_detects_class_mismatch():
     pose, cls = results
     assert pose.passed is True
     assert cls.passed is False
+
+
+# ---------------------------------------------------------------------------
+# LIBEROScenicEnv.get_object_state — RCA Finding 3 env-side accessor
+# ---------------------------------------------------------------------------
+
+
+def test_libero_scenic_env_get_object_state_returns_pose_and_class():
+    """LIBEROScenicEnv must expose `get_object_state(name)` so the G4
+    family-C consistency check can compare Scenic vs MuJoCo poses. Before
+    this fix the consistency hook duck-typed three accessors, none of which
+    LIBEROScenicEnv implemented — every check was uniform-False.
+    """
+    from types import SimpleNamespace
+
+    from libero_infinity.gym_env import LIBEROScenicEnv
+
+    # Bypass __init__: we exercise the accessor surface only, with a fake
+    # sim/libero_env wired to the MuJoCo arrays the method reads.
+    env = LIBEROScenicEnv.__new__(LIBEROScenicEnv)
+    fake_data = SimpleNamespace(
+        body_xpos={7: [1.0, 2.0, 3.0]},
+        body_xquat={7: [1.0, 0.0, 0.0, 0.0]},
+    )
+    fake_libero_env = SimpleNamespace(env=SimpleNamespace(sim=SimpleNamespace(data=fake_data)))
+    env._sim = SimpleNamespace(
+        _body_ids={"akita_black_bowl_1": 7, "missing_bowl": None},
+        libero_env=fake_libero_env,
+    )
+    env._effective_obj_classes = {"akita_black_bowl_1": "akita_black_bowl"}
+
+    st = env.get_object_state("akita_black_bowl_1")
+    assert st is not None
+    assert st["position"] == (1.0, 2.0, 3.0)
+    assert st["orientation"] == (1.0, 0.0, 0.0, 0.0)
+    assert st["class"] == "akita_black_bowl"
+
+    # Unknown / unresolved body returns None (caller surfaces as failure).
+    assert env.get_object_state("missing_bowl") is None
+    assert env.get_object_state("not_in_map") is None
+
+
+def test_assert_consistency_uses_libero_env_accessor_real_results():
+    """End-to-end check: with a LIBEROScenicEnv-shaped env exposing
+    `get_object_state`, `assert_consistency` returns *real* per-object pose
+    and class results (not uniform False with reason "env has no accessor").
+    """
+    from types import SimpleNamespace
+
+    from libero_infinity.gym_env import LIBEROScenicEnv
+
+    env = LIBEROScenicEnv.__new__(LIBEROScenicEnv)
+    fake_data = SimpleNamespace(
+        body_xpos={1: [0.10, 0.20, 0.30]},
+        body_xquat={1: [1.0, 0.0, 0.0, 0.0]},
+    )
+    env._sim = SimpleNamespace(
+        _body_ids={"bowl_1": 1},
+        libero_env=SimpleNamespace(env=SimpleNamespace(sim=SimpleNamespace(data=fake_data))),
+    )
+    env._effective_obj_classes = {"bowl_1": "akita_black_bowl"}
+
+    scene = _Scene(
+        objects=[
+            _Obj(
+                "bowl_1",
+                "akita_black_bowl",
+                position=(0.10, 0.20, 0.30),
+                orientation=(1.0, 0.0, 0.0, 0.0),
+            )
+        ]
+    )
+    # The duck-typed Scenic object exposes `name` (not `libero_name`) — that is
+    # fine because `resolve_object_name` falls back to `name` for test doubles.
+    results = assert_consistency(scene, env)
+    assert len(results) == 2
+    pose, cls = results
+    assert pose.name == "pose_tolerance"
+    assert pose.passed is True, pose.detail
+    assert cls.name == "class_match"
+    assert cls.passed is True, cls.detail
+    # Critical: not the uniform-False env_missing path.
+    assert pose.payload.get("reason") != "env_missing"

@@ -629,3 +629,58 @@ def test_visibility_targets_param_emitted_for_task_objects() -> None:
 
     assert "visibility_targets" in output, "visibility_targets param must be emitted when objects have must_remain_visible_with edges"  # fmt: skip  # noqa: E501
     assert "akita_black_bowl_1" in output, "The visible object name must appear in visibility_targets list"  # fmt: skip  # noqa: E501
+
+
+# ---------------------------------------------------------------------------
+# Articulation rendering — RCA Finding "baseline articulation"
+# ---------------------------------------------------------------------------
+
+
+def test_render_articulation_deterministic_when_axis_inactive() -> None:
+    """Baseline articulation must be deterministic when the articulation axis
+    is INACTIVE. Otherwise the no-axes baseline and any inactive-axis perturbed
+    sample independently draw different concrete joint values from `Range(lo, hi)`
+    and `g4_identity:articulation` reports a real non-identity on every
+    non-articulation subset (RCA secondary finding (a) → triage verdict).
+    """
+    from libero_infinity.planner.axes import ArticulationPlan
+    from libero_infinity.planner.types import PerturbationPlan
+    from libero_infinity.renderer.scenic_renderer import _render_articulation
+
+    plan = PerturbationPlan(active_axes=frozenset(["position"]))
+    plan.articulation_plans = {
+        "wooden_cabinet_1": ArticulationPlan(
+            fixture_name="wooden_cabinet_1",
+            state_kind="Close",
+            lo=-0.16,
+            hi=-0.14,
+            reason="baseline: BDDL :init (Close wooden_cabinet_1)",
+        )
+    }
+    out = _render_articulation(plan, None)
+    # Must NOT emit Range(...) for the baseline when axis inactive.
+    assert "Range(" not in out, f"articulation must be deterministic when axis inactive:\n{out}"
+    # Must emit the deterministic baseline value.
+    assert "param articulation_wooden_cabinet_1 = -0.1600" in out, out
+
+
+def test_render_articulation_stochastic_when_axis_active() -> None:
+    """When the articulation axis IS active and lo != hi, render as Range(lo, hi)
+    so the perturbation actually samples a varied joint angle.
+    """
+    from libero_infinity.planner.axes import ArticulationPlan
+    from libero_infinity.planner.types import PerturbationPlan
+    from libero_infinity.renderer.scenic_renderer import _render_articulation
+
+    plan = PerturbationPlan(active_axes=frozenset(["articulation"]))
+    plan.articulation_plans = {
+        "wooden_cabinet_1": ArticulationPlan(
+            fixture_name="wooden_cabinet_1",
+            state_kind="Open",
+            lo=0.10,
+            hi=0.30,
+            reason="articulation axis perturbation — Open",
+        )
+    }
+    out = _render_articulation(plan, None)
+    assert "Range(0.1000, 0.3000)" in out, out

@@ -178,10 +178,23 @@ class TestPositionPerturbationAudit:
         cfg = TaskConfig.from_bddl(str(MICROWAVE_BDDL))
         program = generate_scenic(cfg, perturbation="position")
 
-        # New compiler emits articulation params with _state suffix (not _control_ prefix)
-        assert "param articulation_microwave_1 = Range(" in program
+        # Articulation axis is INACTIVE under perturbation="position", so the
+        # baseline articulation must be rendered as a DETERMINISTIC value (not
+        # a stochastic `Range(...)`) — otherwise the no-axes baseline and any
+        # inactive-axis perturbed sample independently draw different concrete
+        # joint angles and `g4_identity:articulation` reports a false-negative.
+        assert "param articulation_microwave_1 = " in program
+        # Specifically: no Range() in the articulation line.
+        for line in program.splitlines():
+            if line.startswith("param articulation_microwave_1 ="):
+                assert "Range(" not in line, line
+                break
         assert "param articulation_microwave_1_state" in program
         assert "param visibility_targets" in program
+
+        # With articulation active, the param IS stochastic.
+        active_prog = generate_scenic(cfg, perturbation="articulation")
+        assert "param articulation_microwave_1 = Range(" in active_prog
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -297,16 +297,72 @@ def assert_on_predicates_z(
             payload={},
         )
     by_name = _scene_by_name(scene)
+    # Pre-collect fixtures for prefix-based region/side resolution. BDDL
+    # `(On <obj> <fixture>_<region_or_side>)` predicates reference *named
+    # regions* on a fixture (e.g. `main_table_bowl_region`,
+    # `wooden_cabinet_1_top_side`) that are not themselves materialised as
+    # Scenic objects. We resolve the support to the longest fixture name
+    # that is a prefix of the target token (separated by `_`), and use that
+    # fixture's z_top as the support surface height. This is exactly the
+    # semantics LIBERO uses (regions are surface patches on a fixture).
+    fixtures_by_name = {
+        resolve_object_name(o): o for o in _iter_scene_objects(scene) if is_scene_fixture(o)
+    }
+    # Implicit-support map: many BDDL `(On A B)` predicates reference a
+    # *region* on the table (e.g. `main_table_bowl_region`) rather than a
+    # Scenic fixture. The table itself is rendered by LIBERO, not by the
+    # Scenic compiler, so it never appears in `scene.objects`. Movable
+    # objects carry their parent surface as `support_parent_name`
+    # (`"main_table"` for table-supported objects). Synthesise a virtual
+    # support per parent name whose z_top is the parent surface height —
+    # taken as position[2] of any supported sampled object (which equals
+    # TABLE_Z by construction in `renderer.scenic_renderer`).
+    virtual_supports: dict[str, float] = {}
+    for o in _iter_scene_objects(scene):
+        parent = getattr(o, "support_parent_name", None)
+        if isinstance(parent, str) and parent and parent not in virtual_supports:
+            pos = _obj_position(o)
+            if pos is not None:
+                virtual_supports[parent] = pos[2]
+
+    def _resolve_support(target: str) -> tuple[Any, float | None]:
+        """Return ``(scene_obj_or_sentinel, z_top)`` for an On-predicate support.
+
+        Resolves direct scene-object hits first, then the longest fixture-
+        name prefix (e.g. `wooden_cabinet_1_top_side` → `wooden_cabinet_1`),
+        then the longest virtual-support prefix
+        (e.g. `main_table_*_region` → virtual `main_table` at TABLE_Z).
+        Returns ``(None, None)`` when no path resolves.
+        """
+        obj = by_name.get(target)
+        if obj is not None:
+            return (obj, _obj_z_top(obj))
+        best: tuple[int, Any] = (-1, None)
+        for fname, fobj in fixtures_by_name.items():
+            if target == fname or target.startswith(fname + "_"):
+                if len(fname) > best[0]:
+                    best = (len(fname), fobj)
+        if best[1] is not None:
+            return (best[1], _obj_z_top(best[1]))
+        v_best: tuple[int, float | None] = (-1, None)
+        for vname, vz in virtual_supports.items():
+            if target == vname or target.startswith(vname + "_"):
+                if len(vname) > v_best[0]:
+                    v_best = (len(vname), vz)
+        if v_best[1] is not None:
+            # Sentinel — only z_top matters for the virtual case.
+            return (object(), v_best[1])
+        return (None, None)
+
     violations: list[dict[str, Any]] = []
     missing: list[str] = []
     for a, b in pairs:
         oa = by_name.get(a)
-        ob = by_name.get(b)
+        ob, z_top_b = _resolve_support(b)
         if oa is None or ob is None:
             missing.append(f"{a} on {b}")
             continue
         pa = _obj_position(oa)
-        z_top_b = _obj_z_top(ob)
         if pa is None or z_top_b is None:
             missing.append(f"{a} on {b} (no z/z_top)")
             continue
