@@ -56,6 +56,8 @@ from scenic.core.simulators import Simulation, Simulator
 from scenic.core.vectors import Vector
 from scipy.spatial.transform import Rotation as _Rotation
 
+from libero_infinity.asset_metadata import spawn_clearance as _spawn_clearance
+from libero_infinity.asset_metadata import surface_spawn_z as _shared_surface_spawn_z
 from libero_infinity.asset_registry import get_dimensions
 from libero_infinity.planner.axes import LIBERO_BACKGROUND_TEXTURES
 from libero_infinity.validation_errors import (  # noqa: F401 — re-exported for callers
@@ -148,9 +150,15 @@ def _scenic_quat(scenic_orientation) -> np.ndarray:
 
 
 def _surface_spawn_z(surface_z: float, asset_class: str) -> float:
-    """Approximate object-centre z for spawning directly on a root surface."""
-    _w, _l, h = get_dimensions(asset_class)
-    return surface_z + max(float(h) / 2.0, 0.01) + 1e-3
+    """Resolved object-centre z for spawning directly on a root surface.
+
+    Thin delegate to the shared, pure :func:`asset_metadata.surface_spawn_z` so
+    the simulator and the Scenic renderer resolve byte-identical spawn z for the
+    same ``(surface_z, asset_class)`` — the G4 family-C ``pose_tolerance``
+    invariant relies on both sides agreeing (see ``asset_metadata`` docstring
+    and ``rca/stage1_g4_consistency_pose_frame_mismatch.md``).
+    """
+    return _shared_surface_spawn_z(surface_z, asset_class)
 
 
 def _bddl_contained_object_names(bddl_path: str) -> set[str]:
@@ -178,8 +186,13 @@ def _infer_root_surface_z(scene_objects, default_pose: dict[str, np.ndarray]) ->
             continue
         if getattr(obj, "support_parent_name", ""):
             continue
-        _w, _l, h = get_dimensions(getattr(obj, "asset_class", "_default"))
-        surface_candidates.append(float(default_pose[libero_name][2]) - max(float(h) / 2.0, 0.01))
+        # Invert the spawn model: surface = settled body-origin z − clearance.
+        # Using the SAME clearance that ``_surface_spawn_z`` applies keeps the
+        # round trip consistent — for a table object this recovers ≈ TABLE_Z, so
+        # re-spawning an elevated object onto the inferred surface reproduces its
+        # natural settled z rather than a bounding-box approximation.
+        clearance = _spawn_clearance(getattr(obj, "asset_class", "_default"))
+        surface_candidates.append(float(default_pose[libero_name][2]) - clearance)
     if not surface_candidates:
         return TABLE_Z
     return float(np.median(surface_candidates))

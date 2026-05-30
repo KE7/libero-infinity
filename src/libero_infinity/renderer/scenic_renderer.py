@@ -13,6 +13,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from libero_infinity.asset_metadata import TABLE_SURFACE_Z, surface_spawn_z
 from libero_infinity.asset_registry import get_dimensions
 from libero_infinity.ir.nodes import (
     FixtureNode,
@@ -487,13 +488,26 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         # Position plan
         pos_plan = plan.position_plans.get(obj_name)
 
+        # Resolve the spawn z that the simulator will settle this object to, at
+        # codegen, so the Scenic-sampled pose matches the post-reset MuJoCo pose
+        # in the SAME frame (G4 family-C pose_tolerance; validation plan §4).
+        # Previously every object was emitted at the bare ``TABLE_Z`` placeholder
+        # and the simulator silently overrode the z, so pose_tolerance failed on
+        # an 8–18 cm z-frame mismatch. We now emit the concrete resolved z via
+        # the shared ``surface_spawn_z`` helper — the same function the simulator
+        # calls — so the override becomes a no-op for agreeing objects. The
+        # canonical ``obj_class`` drives the clearance; under an active object
+        # axis the instantiated variant shares its canonical class's clearance.
+        spawn_z = surface_spawn_z(TABLE_SURFACE_Z, obj_class)
+
         if pos_plan is not None and not pos_plan.use_relative_positioning:
             x_lo = pos_plan.x_envelope.lo
             x_hi = pos_plan.x_envelope.hi
             y_lo = pos_plan.y_envelope.lo
             y_hi = pos_plan.y_envelope.hi
             pos_spec = (
-                f"at Vector(Range({x_lo:.4f}, {x_hi:.4f}), Range({y_lo:.4f}, {y_hi:.4f}), TABLE_Z)"
+                f"at Vector(Range({x_lo:.4f}, {x_hi:.4f}), "
+                f"Range({y_lo:.4f}, {y_hi:.4f}), {spawn_z:.4f})"
             )
         elif pos_plan is not None and pos_plan.use_relative_positioning:
             support_var = _to_var(pos_plan.support_name)
@@ -501,12 +515,15 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
             x_hi = pos_plan.x_envelope.hi
             y_lo = pos_plan.y_envelope.lo
             y_hi = pos_plan.y_envelope.hi
+            # Relative placement inherits z from the support (offset 0.0): a
+            # supported/contained child's z derives from its support relation,
+            # not the table surface, so the resolved spawn z does not apply here.
             pos_spec = (
                 f"at {support_var} offset by Vector(Range({x_lo:.4f}, {x_hi:.4f}), "
                 f"Range({y_lo:.4f}, {y_hi:.4f}), 0.0)"
             )
         elif node.init_x is not None and node.init_y is not None:
-            pos_spec = f"at Vector({node.init_x:.4f}, {node.init_y:.4f}, TABLE_Z)"
+            pos_spec = f"at Vector({node.init_x:.4f}, {node.init_y:.4f}, {spawn_z:.4f})"
         else:
             # No position info — use workspace center
             pos_spec = "in SAFE_REGION"
