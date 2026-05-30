@@ -88,15 +88,11 @@ def test_renderer_emits_concrete_resolved_z_for_table_objects() -> None:
     bowl_z = surface_spawn_z(TABLE_SURFACE_Z, "akita_black_bowl")
     z_literal = f"{bowl_z:.4f}"
     obj_lines = [
-        ln
-        for ln in src.splitlines()
-        if "new LIBEROObject" in ln and "akita_black_bowl_1" in ln
+        ln for ln in src.splitlines() if "new LIBEROObject" in ln and "akita_black_bowl_1" in ln
     ]
     assert obj_lines, "expected an akita_black_bowl_1 LIBEROObject declaration"
     line = obj_lines[0]
-    assert z_literal in line, (
-        f"bowl placement should carry concrete z {z_literal}; got: {line}"
-    )
+    assert z_literal in line, f"bowl placement should carry concrete z {z_literal}; got: {line}"
 
     # No absolutely-placed LIBEROObject may still use the bare TABLE_Z token in
     # its position vector (relative `offset by ... 0.0` placements are exempt).
