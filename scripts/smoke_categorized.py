@@ -22,7 +22,25 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--subsets", type=int, default=8)
     ap.add_argument("--out", default="/tmp/smoke_cat.jsonl")
+    ap.add_argument(
+        "--clean",
+        action="store_true",
+        help="Use non-displacing axis subsets only (exclude robot/distractor, "
+        "which physically displace objects post-settle — Finding B). Isolates "
+        "the z-frame fix's domain.",
+    )
     args = ap.parse_args()
+
+    # Non-displacing axis subsets: position/object/camera/lighting/texture/
+    # background/articulation, never robot or distractor.
+    CLEAN_SUBSETS = [
+        ("position",),
+        ("position", "object"),
+        ("position", "camera", "lighting"),
+        ("object", "texture", "background"),
+        ("position", "object", "camera", "lighting", "texture", "background", "articulation"),
+        ("position", "articulation"),
+    ]
 
     from libero_infinity.compiler import compile_task_to_scenario
     from libero_infinity.gym_env import make_env
@@ -42,7 +60,7 @@ def main() -> int:
         sample_subsets,
     )
 
-    subsets = sample_subsets(args.subsets, seed=0)
+    subsets = CLEAN_SUBSETS if args.clean else sample_subsets(args.subsets, seed=0)
 
     tally = {
         "non_subst": [0, 0],   # [True, False] for objects with no variant swap
