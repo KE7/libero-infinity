@@ -53,6 +53,22 @@ def test_renderer_and_simulator_resolve_identical_spawn_z(
     )
 
 
+def test_unmeasured_class_uses_median_prior_not_bounding_box() -> None:
+    """Unmeasured classes must fall back to the median measured clearance.
+
+    The pre-fix ``bbox_height / 2`` model is the one the z-frame RCA refuted; a
+    short distractor/variant would otherwise be placed ~5–9 cm too low and fail
+    pose_tolerance. The data-derived median prior keeps unmeasured classes in the
+    correct ~0.10 m table band.
+    """
+    from libero_infinity.asset_metadata import DEFAULT_CLEARANCE, spawn_clearance
+
+    assert not asset_metadata.is_measured("__nonexistent_class__")
+    assert spawn_clearance("__nonexistent_class__") == pytest.approx(DEFAULT_CLEARANCE)
+    # The prior is the median of the measured registry, in the table band.
+    assert 0.08 <= DEFAULT_CLEARANCE <= 0.16
+
+
 def test_surface_spawn_z_is_pure_and_surface_additive() -> None:
     """surface_spawn_z is a pure function: shifting the surface shifts z 1:1."""
     for cls in MEASURED_CLASSES:

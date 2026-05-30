@@ -36,8 +36,6 @@ from __future__ import annotations
 import json
 import pkgutil
 
-from libero_infinity.asset_registry import get_dimensions
-
 # Canonical workspace table-surface height in the Scenic / MuJoCo world frame
 # (floor → 0). This is the surface objects are sampled to rest on. It MUST stay
 # equal to ``TABLE_Z`` in ``scenic/libero_model.scenic`` and ``simulator.py``;
@@ -49,10 +47,6 @@ TABLE_SURFACE_Z: float = 0.82
 # Minimum physical clearance of an object's body origin above its support (m).
 # Guards against degenerate/zero-height registry entries.
 _MIN_CLEARANCE: float = 0.01
-
-# Tiny anti-interpenetration lift used only by the legacy bounding-box fallback,
-# preserved so unmeasured classes keep their historical spawn z exactly.
-_FALLBACK_EPS: float = 1e-3
 
 
 def _load_clearances() -> dict[str, float]:
@@ -66,19 +60,43 @@ def _load_clearances() -> dict[str, float]:
 SPAWN_CLEARANCES: dict[str, float] = _load_clearances()
 
 
+def _default_clearance() -> float:
+    """Data-derived prior for an unmeasured class: the median measured clearance.
+
+    A movable LIBERO object's settled body-origin sits ~0.10 m above the table
+    in a tight band (the measured clearances cluster at 0.087–0.152 m, median
+    ≈ 0.10). The pre-fix ``bbox_height / 2`` approximation is *known wrong* — it
+    is exactly the model the z-frame RCA refuted (the body origin is not the
+    geometric centre), and it systematically under-estimates by ~5–9 cm, which
+    is what made unmeasured classes (object-axis OOD variants, distractor-pool
+    objects) fail pose_tolerance. The median measured clearance is an unbiased,
+    data-derived prior — far closer than the bounding box — used until the class
+    is measured (regenerate via ``scripts/measure_spawn_clearances.py``).
+    """
+    if SPAWN_CLEARANCES:
+        vals = sorted(SPAWN_CLEARANCES.values())
+        n = len(vals)
+        mid = n // 2
+        return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+    return 0.10
+
+
+DEFAULT_CLEARANCE: float = _default_clearance()
+
+
 def spawn_clearance(asset_class: str) -> float:
     """Return the resting body-origin height (m) above the workspace surface.
 
     Uses the measured per-class clearance when available; otherwise falls back
-    to half the registry bounding-box height plus the legacy anti-penetration
-    epsilon (the pre-fix approximation), so the function is total for every
-    class — including OOD object-axis substitutions not yet measured.
+    to the median measured clearance (:data:`DEFAULT_CLEARANCE`) — a data-derived
+    prior, not the discredited bounding-box approximation — so the function is
+    total for every class, including OOD object-axis substitutions and
+    distractor-pool classes not yet measured.
     """
     measured = SPAWN_CLEARANCES.get(asset_class)
     if measured is not None:
         return max(float(measured), _MIN_CLEARANCE)
-    _w, _l, h = get_dimensions(asset_class)
-    return max(float(h) / 2.0, _MIN_CLEARANCE) + _FALLBACK_EPS
+    return max(DEFAULT_CLEARANCE, _MIN_CLEARANCE)
 
 
 def surface_spawn_z(surface_z: float, asset_class: str) -> float:
