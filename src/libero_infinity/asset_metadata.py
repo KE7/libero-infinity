@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import pkgutil
+import warnings
 
 # Canonical workspace table-surface height in the Scenic / MuJoCo world frame
 # (floor → 0). This is the surface objects are sampled to rest on. It MUST stay
@@ -92,6 +93,22 @@ def _load_variant_clearances() -> dict[str, float]:
 
 SPAWN_CLEARANCES: dict[str, float] = _load_clearances()
 VARIANT_CLEARANCES: dict[str, float] = _load_variant_clearances()
+
+if not VARIANT_CLEARANCES:
+    # FV SMT D2 / MC Prop 2: make the inert state visible. When the per-(variant,
+    # surface) table is absent, ``surface_spawn_z`` ignores its ``surface_class``
+    # argument and every (variant, surface) pair resolves to the canonical
+    # per-class clearance (or the median ``DEFAULT_CLEARANCE`` for OOD variants),
+    # re-introducing the seating-height settle the table is meant to remove.
+    warnings.warn(
+        "libero_infinity.asset_metadata: spawn_clearances_variants.json is "
+        "absent or empty — surface_spawn_z ignores its surface argument and "
+        "per-(variant,surface) seating heights fall back to the canonical "
+        "per-class clearance (FV SMT D2). Run "
+        "scripts/measure_spawn_clearances.py to populate it.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 def _default_clearance() -> float:
