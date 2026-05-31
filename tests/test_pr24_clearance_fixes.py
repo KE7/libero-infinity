@@ -11,6 +11,7 @@ Covered:
 These render Scenic source text only (no MuJoCo), so they are fast and run in
 the `pytest -k 'clearance or scenic or placement'` slice.
 """
+
 from __future__ import annotations
 
 import re
@@ -23,6 +24,7 @@ from libero_infinity.compiler import (
     plan_perturbations,
     render_scenic,
 )
+
 # Pull node types + helpers from the renderer namespace so the test resolves the
 # exact symbols the renderer uses, regardless of their defining module.
 from libero_infinity.renderer.scenic_renderer import (  # type: ignore
