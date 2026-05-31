@@ -22,6 +22,7 @@ from libero_infinity.ir.nodes import (
 )
 from libero_infinity.ir.scene_graph import SemanticSceneGraph
 from libero_infinity.planner.types import PerturbationPlan
+from libero_infinity.robot_metadata import RobotFootprint, RobotLink, get_robot_footprint
 
 if TYPE_CHECKING:
     pass
@@ -411,6 +412,71 @@ def _render_fixtures(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     return "\n".join(lines)
 
 
+def _resolve_surface_class(
+    node: "ObjectNode | MovableSupportNode",
+    plan: PerturbationPlan,
+    graph: SemanticSceneGraph,
+) -> str | None:
+    """Resolve the class of the support surface ``node`` rests on, at codegen.
+
+    The support is known from the BDDL ``:init`` semantics carried in the plan /
+    graph: the position plan's ``support_name`` (when the planner anchored the
+    object to a support) or, failing that, a declared ``supported_by`` /
+    ``contained_in`` / ``stacked_on`` edge. Returns the support's object class
+    (e.g. ``"flat_stove"``, ``"wooden_cabinet"``) so the per-(variant, surface)
+    clearance table can resolve the object's settled z for *this* surface
+    context (Finding A: clearance is not surface-invariant). Returns ``None`` for
+    objects resting directly on the default workspace table — the legacy
+    class-only clearance applies there.
+    """
+    pp = plan.position_plans.get(node.instance_name)
+    support_name = pp.support_name if (pp is not None and pp.support_name) else None
+    if support_name is None:
+        # Try the node's own id and its instance name (the graph may key the
+        # node under either) when scanning declared support/containment edges.
+        candidate_ids = [getattr(node, "node_id", None), node.instance_name]
+        for cid in candidate_ids:
+            if cid is None:
+                continue
+            for edge in graph.edges_from(cid):
+                if edge.label in {"supported_by", "contained_in", "stacked_on"}:
+                    support_name = edge.dst_id
+                    break
+            if support_name is not None:
+                break
+    if support_name is None:
+        return None
+    support_node = graph.get_node(support_name)
+    if support_node is None:
+        return None
+    return support_node.object_class or None
+
+
+def _spawn_z_expr(
+    obj_class: str,
+    surface_class: str | None,
+    scenic_class: str | None,
+    variants: list[str] | None,
+) -> str:
+    """Return a Scenic expression string for an object's resolved spawn z.
+
+    When the ``object`` axis substitutes this object's identity (``scenic_class``
+    is the ``_chosen_<class>`` sampler and ``variants`` is its pool), the z is
+    emitted as a conditional chain on the *same* sampled variable, so the chosen
+    variant carries ITS measured seating height on the current surface — Scenic
+    picks the (class, z) pair together (Fix 3 / Finding A). Otherwise a single
+    measured float is emitted, as before.
+    """
+    if scenic_class and variants:
+        # The variant chooser is a Uniform over (class, z) pairs, so the chosen
+        # variant's measured spawn z is the second element of the SAME sample.
+        # Indexing with a constant subscript is a deterministic op on a random
+        # value (allowed by Scenic), unlike an `if`/`==` branch (forbidden).
+        del obj_class, surface_class  # folded into the pair at chooser build time
+        return f"{scenic_class}[1]"
+    return f"{surface_spawn_z(TABLE_SURFACE_Z, obj_class, surface_class):.4f}"
+
+
 def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     lines = ["# Object declarations"]
 
@@ -420,6 +486,13 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
 
     if "object" in plan.active_axes and plan.object_substitutions:
         lines.append("# Asset variant sampling")
+        # Each chooser is a single Uniform over (asset_class, resolved_spawn_z)
+        # PAIRS, so the chosen variant and its measured seating height are drawn
+        # together from ONE sample (Scenic forbids branching on a random value,
+        # so a per-variant ternary is illegal; correlated tuples are the
+        # idiomatic substitute). ``_chosen_X[0]`` is the asset class; the
+        # object's z spec reads ``_chosen_X[1]`` (Fix 3 / Finding A). The z is
+        # resolved against the support surface of the first object of this class.
         for obj_name, variants in plan.object_substitutions.items():
             node = graph.get_node(obj_name)
             if node is None:
@@ -429,15 +502,19 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
                 continue
             seen_classes.add(obj_class)
             var_name = f"_chosen_{_sanitize(obj_class)}"
-            variants_str = ", ".join(f'"{v}"' for v in variants)
-            lines.append(f"{var_name} = Uniform({variants_str})")
+            surface_class = _resolve_surface_class(node, plan, graph)
+            pairs = ", ".join(
+                f'("{v}", {surface_spawn_z(TABLE_SURFACE_Z, v, surface_class):.4f})'
+                for v in variants
+            )
+            lines.append(f"{var_name} = Uniform({pairs})")
             asset_var_map[obj_class] = var_name
 
         if asset_var_map:
             first_class = next(iter(asset_var_map))
             first_var = asset_var_map[first_class]
             lines.append(f'param perturb_class = "{first_class}"')
-            lines.append(f"param chosen_asset = {first_var}")
+            lines.append(f"param chosen_asset = {first_var}[0]")
         lines.append("")
 
     # Object placements — topologically sorted so support objects are
@@ -495,10 +572,19 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         # and the simulator silently overrode the z, so pose_tolerance failed on
         # an 8–18 cm z-frame mismatch. We now emit the concrete resolved z via
         # the shared ``surface_spawn_z`` helper — the same function the simulator
-        # calls — so the override becomes a no-op for agreeing objects. The
-        # canonical ``obj_class`` drives the clearance; under an active object
-        # axis the instantiated variant shares its canonical class's clearance.
-        spawn_z = surface_spawn_z(TABLE_SURFACE_Z, obj_class)
+        # calls — so the override becomes a no-op for agreeing objects.
+        #
+        # Fix 3 (Finding A): the clearance is resolved against the object's
+        # ACTUAL support surface (stove vs cabinet top settle ~50 mm apart), and
+        # under an active ``object`` axis the spawn z is emitted as a conditional
+        # on the sampled variant identity, so the instantiated variant carries
+        # its OWN measured seating height instead of inheriting the canonical
+        # class's z. Scenic thus picks the (class, z) pair together.
+        surface_class = _resolve_surface_class(node, plan, graph)
+        object_axis_variants = (
+            plan.object_substitutions.get(obj_name) if "object" in plan.active_axes else None
+        )
+        spawn_z_expr = _spawn_z_expr(obj_class, surface_class, scenic_class, object_axis_variants)
 
         if pos_plan is not None and not pos_plan.use_relative_positioning:
             x_lo = pos_plan.x_envelope.lo
@@ -507,7 +593,7 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
             y_hi = pos_plan.y_envelope.hi
             pos_spec = (
                 f"at Vector(Range({x_lo:.4f}, {x_hi:.4f}), "
-                f"Range({y_lo:.4f}, {y_hi:.4f}), {spawn_z:.4f})"
+                f"Range({y_lo:.4f}, {y_hi:.4f}), {spawn_z_expr})"
             )
         elif pos_plan is not None and pos_plan.use_relative_positioning:
             support_var = _to_var(pos_plan.support_name)
@@ -523,7 +609,7 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
                 f"Range({y_lo:.4f}, {y_hi:.4f}), 0.0)"
             )
         elif node.init_x is not None and node.init_y is not None:
-            pos_spec = f"at Vector({node.init_x:.4f}, {node.init_y:.4f}, {spawn_z:.4f})"
+            pos_spec = f"at Vector({node.init_x:.4f}, {node.init_y:.4f}, {spawn_z_expr})"
         else:
             # No position info — use workspace center
             pos_spec = "in SAFE_REGION"
@@ -540,7 +626,8 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         # instantiated, not the canonical one. Otherwise it is the canonical
         # asset class from the TaskConfig / scene graph.
         if scenic_class:
-            specifiers.append(f"with asset_class {scenic_class}")
+            # ``_chosen_X`` is a (class, z) pair; element [0] is the class.
+            specifiers.append(f"with asset_class {scenic_class}[0]")
         else:
             specifiers.append(f'with asset_class "{obj_class}"')
         specifiers.append(f'with libero_name "{obj_name}"')
@@ -556,6 +643,12 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         # relative) sampling for the child.
         if pos_plan is not None and pos_plan.support_name:
             specifiers.append(f'with support_parent_name "{pos_plan.support_name}"')
+        # Emit the resolved support-surface class so the simulator resolves the
+        # object's settle z through the SAME per-(variant, surface) clearance the
+        # renderer used for spawn_z_expr above — keeping the two in lockstep
+        # (Fix 3 / Finding A). Empty/None means the default workspace table.
+        if surface_class:
+            specifiers.append(f'with support_surface_class "{surface_class}"')
 
         lines.append(f"{var_name} = new LIBEROObject " + ", ".join(specifiers))
 
@@ -620,9 +713,17 @@ def _render_robot(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         dir_terms.append(f"_robot_dir_{idx}")
     norm_expr = " + ".join(f"({_term} * {_term})" for _term in dir_terms)
     lines.append(f"_robot_dir_norm = (({norm_expr}) + 1e-12) ** 0.5")
+    # Per-joint perturbation delta (qpos - canonical), exposed as a reusable
+    # Scenic local so the robot-clearance constraints in ``_render_constraints``
+    # can express each link's *perturbed* world position as a linear function of
+    # the SAME sampled deltas the qpos params consume (Fix 1: robot in the
+    # require graph). Keeping one delta local avoids re-deriving the spherical
+    # sample and guarantees the constraint graph and the applied qpos agree.
+    for idx in range(len(rp.canonical_qpos)):
+        lines.append(f"_robot_dq_{idx} = (_robot_radius * _robot_dir_{idx}) / _robot_dir_norm")
     qpos_refs: list[str] = []
     for idx, qpos in enumerate(rp.canonical_qpos):
-        expr = f"{qpos:.8f} + ((_robot_radius * _robot_dir_{idx}) / _robot_dir_norm)"
+        expr = f"{qpos:.8f} + _robot_dq_{idx}"
         lines.append(f"param robot_init_qpos_{idx} = {expr}")
         qpos_refs.append(f"globalParameters.robot_init_qpos_{idx}")
     lines.append("param robot_init_radius = _robot_radius")
@@ -848,6 +949,167 @@ def _clearance_relationship(
     return "independent"
 
 
+def _link_pos_exprs(link: RobotLink, n_dof: int) -> tuple[str, str, str]:
+    """Scenic expressions for a link's *perturbed* world position.
+
+    Each coordinate is the canonical origin plus the linearized FK contribution
+    of the sampled joint deltas: ``c0 + Σ_k J_k * _robot_dq_k`` (near-zero
+    Jacobian terms are dropped for compactness). The same ``_robot_dq_k`` locals
+    drive the applied ``robot_init_qpos_k`` params, so the constraint graph and
+    the simulator's applied pose are derived from one sample.
+    """
+
+    def _build(c0: float, jrow: tuple[float, ...]) -> str:
+        terms = [f"{c0:.6f}"]
+        for k in range(min(n_dof, len(jrow))):
+            coef = jrow[k]
+            if abs(coef) < 1e-6:
+                continue
+            terms.append(f"({coef:.6f} * _robot_dq_{k})")
+        return " + ".join(terms)
+
+    return _build(link.x0, link.jx), _build(link.y0, link.jy), _build(link.z0, link.jz)
+
+
+def _render_robot_clearance(
+    footprint: RobotFootprint, plan: PerturbationPlan, graph: SemanticSceneGraph
+) -> list[str]:
+    """Emit 3-D SAT clearance clauses between every movable robot link and every
+    placed object / distractor / fixture (Fix 1; RCA Finding B).
+
+    The z term is required, not optional: at the home pose the arm sits ~30 cm
+    above the table, so a pure-xy shadow would reject every object beneath the
+    (stationary) arm. The z projection only rejects samples where the perturbed
+    link actually dips into the target's slab. A static z prune drops (link,
+    target) pairs whose measured swept-z ranges can never overlap.
+    """
+    rp = plan.robot_plan
+    if rp is None:
+        return []
+    active_links = footprint.active_links()
+    if not active_links:
+        return []
+    n_dof = footprint.n_dof or len(rp.canonical_qpos)
+
+    # target = (guard_prefix, cx_expr, cy_expr, cz_expr, thx, thy, thz, z_lo, z_hi)
+    targets: list[tuple[str, str, str, str, float, float, float, float | None, float | None]] = []
+
+    # Task objects / movable supports.
+    for node_id, node in graph.nodes.items():
+        if not isinstance(node, (ObjectNode, MovableSupportNode)):
+            continue
+        if isinstance(node, ObjectNode) and node.contained:
+            continue
+        var = _to_var(node.instance_name)
+        obj_class = node.object_class or node.instance_name
+        dims = get_dimensions(obj_class)
+        thx, thy, thz = dims[0] / 2.0, dims[1] / 2.0, dims[2] / 2.0
+        pp = plan.position_plans.get(node.instance_name)
+        surface_class = _resolve_surface_class(node, plan, graph)
+        if pp is not None and pp.use_relative_positioning:
+            # Support-inherited z: not statically known, so never prune; the
+            # dynamic z term still guards correctly.
+            z_lo = z_hi = None
+        else:
+            variants = (
+                plan.object_substitutions.get(node.instance_name)
+                if "object" in plan.active_axes
+                else None
+            )
+            zs = [surface_spawn_z(TABLE_SURFACE_Z, obj_class, surface_class)]
+            if variants:
+                zs.extend(surface_spawn_z(TABLE_SURFACE_Z, v, surface_class) for v in variants)
+            z_lo = min(zs) - thz
+            z_hi = max(zs) + thz
+        targets.append(
+            (
+                "",
+                f"{var}.position.x",
+                f"{var}.position.y",
+                f"{var}.position.z",
+                thx,
+                thy,
+                thz,
+                z_lo,
+                z_hi,
+            )
+        )
+
+    # Distractors (guarded by the active-count gate).
+    if plan.distractor_budget > 0 and "distractor" in plan.active_axes:
+        dz_lo = footprint.table_world_z
+        dz_hi = footprint.table_world_z + 0.08
+        for i in range(plan.distractor_budget):
+            guard = f"(_n_distractors <= {i}) or "
+            targets.append(
+                (
+                    guard,
+                    f"distractor_{i}.position.x",
+                    f"distractor_{i}.position.y",
+                    f"distractor_{i}.position.z",
+                    0.04,
+                    0.04,
+                    0.04,
+                    dz_lo,
+                    dz_hi,
+                )
+            )
+
+    # Fixtures (immovable; world-z slab from the measured table height + height).
+    for _node_id, fnode in graph.nodes.items():
+        if not isinstance(fnode, FixtureNode):
+            continue
+        if fnode.init_x is None or fnode.init_y is None:
+            continue
+        fdims = _fixture_dims(fnode.object_class)
+        fh = fdims[2]
+        fz_center = footprint.table_world_z + fh / 2.0
+        targets.append(
+            (
+                "",
+                f"{fnode.init_x:.4f}",
+                f"{fnode.init_y:.4f}",
+                f"{fz_center:.4f}",
+                fdims[0] / 2.0,
+                fdims[1] / 2.0,
+                fh / 2.0,
+                footprint.table_world_z,
+                footprint.table_world_z + fh,
+            )
+        )
+
+    if not targets:
+        return []
+
+    lines = [
+        "",
+        "# Robot link clearance (Fix 1: perturbed robot init pose in the require graph).",
+        "# Each link's perturbed world position is a linear (Jacobian) function of the",
+        "# sampled joint deltas _robot_dq_k; the SAT-correct 3-D AABB clause keeps every",
+        "# placed object, distractor and fixture out of the link's measured world AABB so",
+        "# MuJoCo settle need not shove them (RCA Finding B). Footprints are measured by",
+        "# scripts/measure_robot_link_footprints.py.",
+    ]
+    for link in active_links:
+        lx, ly, lz = _link_pos_exprs(link, n_dof)
+        sv = _sanitize(link.name)
+        lines.append(f"_rc_{sv}_x = {lx}")
+        lines.append(f"_rc_{sv}_y = {ly}")
+        lines.append(f"_rc_{sv}_z = {lz}")
+        for guard, cx, cy, cz, thx, thy, thz, z_lo, z_hi in targets:
+            if z_lo is not None and (link.z_min > z_hi or link.z_max < z_lo):
+                continue
+            dx = link.hx + thx
+            dy = link.hy + thy
+            dz = link.hz + thz
+            lines.append(
+                f"require {guard}(abs(_rc_{sv}_x - {cx}) > {dx:.4f}) "
+                f"or (abs(_rc_{sv}_y - {cy}) > {dy:.4f}) "
+                f"or (abs(_rc_{sv}_z - {cz}) > {dz:.4f})"
+            )
+    return lines
+
+
 def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     lines = ["# Distance constraints"]
 
@@ -990,7 +1252,6 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
     # distractor-vs-fixture loop unconditional but wire it through the
     # helper to remain forward-compatible if the planner is later extended
     # to put distractors on a fixture.
-    obj_vars = [var for var, _, _n, _s in obj_info]
     if plan.distractor_budget > 0 and "distractor" in plan.active_axes:
         distractor_dims = (0.08, 0.08, 0.08)
         # Diagonal-radius clearance between two AABBs of equal half-extent h
@@ -1001,9 +1262,20 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         _DISTRACTOR_PAIR_CLEARANCE = math.sqrt(distractor_dims[0] ** 2 + distractor_dims[1] ** 2)
         for i in range(plan.distractor_budget):
             d_var = f"distractor_{i}"
-            for var in obj_vars:
+            # Distractor↔object clearance: SAT-correct per-axis AABB OR-form,
+            # the same fix PR #16 applied to the fixture pairs. The previous
+            # ``distance from d to obj > 0.13`` was the radial point-distance
+            # bug family — a hardcoded scalar that both over-constrains along
+            # the axes and under-constrains on the diagonal, and ignored each
+            # object's measured footprint entirely. Use the measured object
+            # dims (NOT a hardcoded 0.13): two AABBs are non-overlapping iff
+            # their projections are disjoint on x OR y.
+            for var, dims, _n, _s in obj_info:
+                dx_min, dy_min = _footprint_clearance_aabb(distractor_dims, dims)
                 lines.append(
-                    f"require (_n_distractors <= {i}) or ((distance from {d_var} to {var}) > 0.13)"
+                    f"require (_n_distractors <= {i}) "
+                    f"or (abs({d_var}.position.x - {var}.position.x) > {dx_min:.4f}) "
+                    f"or (abs({d_var}.position.y - {var}.position.y) > {dy_min:.4f})"
                 )
             for j in range(i + 1, plan.distractor_budget):
                 lines.append(
@@ -1034,6 +1306,16 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
                     f"or (abs({d_var}.position.x - {fvar}.position.x) > {dx_min:.4f}) "
                     f"or (abs({d_var}.position.y - {fvar}.position.y) > {dy_min:.4f})"
                 )
+
+    # Robot link clearance (Fix 1): put the perturbed robot init pose into the
+    # require graph so Scenic rejects samples where a perturbed arm link's volume
+    # intersects a placed object/distractor/fixture (otherwise MuJoCo settle
+    # resolves the penetration by shoving the object 40–260 mm in xy — the
+    # dominant pose_tolerance failure in RCA Finding B).
+    if plan.robot_plan is not None and "robot" in plan.active_axes:
+        footprint = get_robot_footprint(plan.robot_plan.robot_model)
+        if footprint is not None:
+            lines.extend(_render_robot_clearance(footprint, plan, graph))
 
     lines.append("")
     return "\n".join(lines)

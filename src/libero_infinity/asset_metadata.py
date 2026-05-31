@@ -57,7 +57,41 @@ def _load_clearances() -> dict[str, float]:
     return {str(k): float(v) for k, v in data.get("clearances", {}).items()}
 
 
+def _variant_key(asset_class: str, surface_class: str) -> str:
+    """Composite key for the per-(variant, surface) clearance table."""
+    return f"{asset_class}|{surface_class}"
+
+
+def _load_variant_clearances() -> dict[str, float]:
+    """Load the per-(variant_class, surface_class) settled-clearance table.
+
+    This table (``data/spawn_clearances_variants.json``) resolves Finding A of
+    the RCA: an object's settled clearance is NOT class-invariant across support
+    surfaces (the same white_bowl settles ~50 mm higher on a cabinet top than on
+    a stove), and an OOD object-axis variant generally settles at a different
+    clearance than the canonical class on the SAME surface. It is keyed by
+    ``"<variant_class>|<surface_class>"`` and measured by
+    ``scripts/measure_spawn_clearances.py``. Absent when not yet generated, in
+    which case :func:`surface_spawn_z` falls back to the canonical class table.
+    """
+    try:
+        raw = pkgutil.get_data("libero_infinity", "data/spawn_clearances_variants.json")
+    except FileNotFoundError:
+        # Optional resource: when the generator has not been run the renderer
+        # falls back to the canonical per-class table. This is an expected
+        # absence, not a swallowed error.
+        return {}
+    if raw is None:
+        return {}
+    data = json.loads(raw)
+    out: dict[str, float] = {}
+    for k, v in data.get("clearances", {}).items():
+        out[str(k)] = float(v)
+    return out
+
+
 SPAWN_CLEARANCES: dict[str, float] = _load_clearances()
+VARIANT_CLEARANCES: dict[str, float] = _load_variant_clearances()
 
 
 def _default_clearance() -> float:
@@ -84,32 +118,49 @@ def _default_clearance() -> float:
 DEFAULT_CLEARANCE: float = _default_clearance()
 
 
-def spawn_clearance(asset_class: str) -> float:
+def spawn_clearance(asset_class: str, surface_class: str | None = None) -> float:
     """Return the resting body-origin height (m) above the workspace surface.
 
-    Uses the measured per-class clearance when available; otherwise falls back
-    to the median measured clearance (:data:`DEFAULT_CLEARANCE`) — a data-derived
-    prior, not the discredited bounding-box approximation — so the function is
-    total for every class, including OOD object-axis substitutions and
-    distractor-pool classes not yet measured.
+    Resolution order (most specific first), so an object-axis variant carries
+    its own measured seating height on the *actual* support surface:
+
+    1. The measured per-(variant, surface) clearance, when ``surface_class`` is
+       given and the pair was measured. This captures both Finding-A sub-causes:
+       geometry-different variants seat at a different height, and the *same*
+       class seats differently on different surfaces (stove vs cabinet top).
+    2. The measured per-canonical-class clearance (legacy table-resting table).
+    3. The median measured clearance (:data:`DEFAULT_CLEARANCE`) — a data-derived
+       prior, NOT the discredited bounding-box approximation — so the function is
+       total for every (class, surface), including unmeasured OOD variants and
+       distractor-pool classes.
     """
+    if surface_class is not None:
+        measured = VARIANT_CLEARANCES.get(_variant_key(asset_class, surface_class))
+        if measured is not None:
+            return max(float(measured), _MIN_CLEARANCE)
     measured = SPAWN_CLEARANCES.get(asset_class)
     if measured is not None:
         return max(float(measured), _MIN_CLEARANCE)
     return max(DEFAULT_CLEARANCE, _MIN_CLEARANCE)
 
 
-def surface_spawn_z(surface_z: float, asset_class: str) -> float:
-    """Resolved spawn z for ``asset_class`` resting on a surface at ``surface_z``.
+def surface_spawn_z(surface_z: float, asset_class: str, surface_class: str | None = None) -> float:
+    """Resolved spawn z for ``asset_class`` resting on ``surface_class``.
 
     Pure function: identical output for identical inputs, on both the renderer
     and the simulator sides. ``surface_z`` is the Scenic table-surface constant
-    (``TABLE_Z``); the measured clearance already folds in the small gap between
-    that frame and the object's true MuJoCo settled pose.
+    (``TABLE_Z``); the measured clearance already folds in the gap between that
+    frame and the object's true MuJoCo settled pose on the given surface.
+
+    ``surface_class`` is the class of the support the object rests on (e.g.
+    ``"flat_stove"``, ``"wooden_cabinet"``); pass ``None`` for the default
+    workspace table to preserve the legacy class-only behaviour.
     """
-    return float(surface_z) + spawn_clearance(asset_class)
+    return float(surface_z) + spawn_clearance(asset_class, surface_class)
 
 
-def is_measured(asset_class: str) -> bool:
-    """True iff ``asset_class`` has a measured (non-fallback) spawn clearance."""
+def is_measured(asset_class: str, surface_class: str | None = None) -> bool:
+    """True iff ``asset_class`` (on ``surface_class``) has a measured clearance."""
+    if surface_class is not None and _variant_key(asset_class, surface_class) in VARIANT_CLEARANCES:
+        return True
     return asset_class in SPAWN_CLEARANCES

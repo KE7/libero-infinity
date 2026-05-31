@@ -1074,3 +1074,209 @@ class TestBatchReversal:
             assert "(:init" in content
             assert "(:goal" in content
             assert content.count("(") == content.count(")")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Consolidated placement-clearance fix (robot in require graph, distractor↔object
+# AABB, per-(variant, surface) z). See
+# rca/stage1_g5_pose_tolerance_object_axis_and_settle_drift.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _kitchen_bowl_bddl():
+    """A kitchen task with bowl/plate/wine object pools, a stove and a cabinet."""
+    from libero_infinity.validation.sweep import resolve_task_path
+
+    return str(resolve_task_path("libero_goal/put_the_bowl_on_the_stove.bddl"))
+
+
+class TestRobotClearanceInRequireGraph:
+    """Fix 1: the perturbed robot init pose is in the Scenic require graph and
+    sampled scenes are AABB-collision-free with every placed object."""
+
+    def test_robot_axis_emits_link_clearance_requires(self):
+        from libero_infinity.compiler import compile_task_to_scenic
+        from libero_infinity.task_config import TaskConfig
+
+        cfg = TaskConfig.from_bddl(_kitchen_bowl_bddl())
+        code = compile_task_to_scenic(cfg, "robot")
+        # Robot is now coupled into the require graph via per-link world-position
+        # locals (a linear fn of the sampled joint deltas) and 3-D SAT clauses.
+        assert "_robot_dq_0 =" in code
+        assert "_rc_" in code and "_robot_dq_" in code
+        assert "# Robot link clearance" in code
+        # At least one link-vs-object SAT clause referencing an object position.
+        assert re.search(r"require .*_rc_.*position\.x.* > ", code)
+
+    def test_no_robot_clearance_without_robot_axis(self):
+        from libero_infinity.compiler import compile_task_to_scenic
+        from libero_infinity.task_config import TaskConfig
+
+        cfg = TaskConfig.from_bddl(_kitchen_bowl_bddl())
+        code = compile_task_to_scenic(cfg, "position")
+        assert "_rc_" not in code
+        assert "# Robot link clearance" not in code
+
+    @pytest.mark.parametrize("subset", ["robot", "position,robot", "object,robot"])
+    def test_sampled_robot_pose_collision_free_with_objects(self, subset):
+        """Every sampled scene's perturbed robot links are AABB-disjoint (in 3-D)
+        from every placed task object — i.e. the constraint is enforced, not just
+        emitted. Re-derives each link's linearized world box from the sampled
+        joint deltas and asserts the SAT non-overlap the renderer required."""
+        import random
+
+        from libero_infinity.asset_registry import get_dimensions
+        from libero_infinity.compiler import compile_task_to_scenario
+        from libero_infinity.robot_metadata import get_robot_footprint
+        from libero_infinity.task_config import TaskConfig
+
+        fp = get_robot_footprint("Panda")
+        assert fp is not None and fp.active_links()
+        canon = list(fp.canonical_qpos)
+        cfg = TaskConfig.from_bddl(_kitchen_bowl_bddl())
+
+        n_checked = 0
+        for seed in range(6):
+            random.seed(seed)
+            scenario = compile_task_to_scenario(cfg, subset)
+            scene, _ = scenario.generate(maxIterations=4000)
+            params = scene.params
+            dq = [float(params[f"robot_init_qpos_{k}"]) - canon[k] for k in range(len(canon))]
+            # Object world boxes (centre + half extents) from the sampled scene.
+            objects = []
+            for o in scene.objects:
+                if not getattr(o, "graspable", True):
+                    continue
+                name = getattr(o, "libero_name", "")
+                if not name or name.startswith("distractor_"):
+                    continue
+                pos = o.position
+                dims = get_dimensions(getattr(o, "asset_class", "_default"))
+                objects.append((float(pos[0]), float(pos[1]), float(pos[2]), dims))
+            for link in fp.active_links():
+                lx = link.x0 + sum(link.jx[k] * dq[k] for k in range(len(dq)))
+                ly = link.y0 + sum(link.jy[k] * dq[k] for k in range(len(dq)))
+                lz = link.z0 + sum(link.jz[k] * dq[k] for k in range(len(dq)))
+                for ox, oy, oz, dims in objects:
+                    # Mirror the renderer's static z-prune: a pair whose measured
+                    # swept-z range can never reach the object's slab is truly
+                    # z-disjoint (no collision) and emits no clause — skip it.
+                    obj_bottom = oz - dims[2] / 2.0
+                    obj_top = oz + dims[2] / 2.0
+                    if link.z_min > obj_top or link.z_max < obj_bottom:
+                        continue
+                    dx = link.hx + dims[0] / 2.0
+                    dy = link.hy + dims[1] / 2.0
+                    dz = link.hz + dims[2] / 2.0
+                    separated = abs(lx - ox) > dx or abs(ly - oy) > dy or abs(lz - oz) > dz
+                    assert separated, (
+                        f"{subset} seed={seed}: link {link.name} overlaps object at "
+                        f"({ox:.3f},{oy:.3f},{oz:.3f}) — robot not collision-free"
+                    )
+                    n_checked += 1
+        assert n_checked > 0
+
+
+class TestDistractorObjectAABBClearance:
+    """Fix 2: distractor↔object clearance is the SAT-correct AABB OR-form using
+    measured object dims, not the radial 0.13 point-distance."""
+
+    def test_distractor_object_clearance_is_sat_aabb_not_radial(self):
+        from libero_infinity.asset_registry import get_dimensions
+        from libero_infinity.compiler import compile_task_to_scenic
+        from libero_infinity.task_config import TaskConfig
+
+        cfg = TaskConfig.from_bddl(_kitchen_bowl_bddl())
+        code = compile_task_to_scenic(cfg, "distractor")
+        # The old radial distractor↔OBJECT bug form (and its hardcoded 0.13)
+        # must be gone. (Distractor↔distractor pairwise clearance is a separate
+        # clause and out of scope for this fix.)
+        for ln in code.splitlines():
+            if "distance from distractor_" in ln:
+                # Only distractor↔distractor pairwise lines may use the radial
+                # form; never a distractor↔object line.
+                assert " to distractor_" in ln, f"radial distractor↔object clause: {ln}"
+        assert "> 0.13)" not in code
+        # The SAT OR-form, guarded by the distractor-count gate, must be present
+        # and reference an object position, with a measured half-width-sum dx.
+        line = None
+        for ln in code.splitlines():
+            if (
+                ln.startswith("require (_n_distractors <= ")
+                and "distractor_0.position.x" in ln
+                and "wine_bottle_1.position.x" in ln
+            ):
+                line = ln
+                break
+        assert line is not None, "no distractor↔object SAT clause for wine_bottle_1"
+        # The emitted dx threshold equals (w_distractor + w_object)/2 from the
+        # measured dims — NOT a hardcoded 0.13.
+        wdims = get_dimensions("wine_bottle")
+        expected_dx = (0.08 + wdims[0]) / 2.0
+        m = re.search(
+            r"abs\(distractor_0\.position\.x - wine_bottle_1\.position\.x\) > ([0-9.]+)",
+            line,
+        )
+        assert m is not None
+        assert abs(float(m.group(1)) - expected_dx) < 1e-3
+
+
+class TestPerVariantSurfaceSpawnZ:
+    """Fix 3: spawn z resolves per (variant, surface); the renderer emits the
+    surface-resolved z coupled to the sampled variant identity."""
+
+    def test_surface_spawn_z_distinguishes_surfaces(self, monkeypatch):
+        import libero_infinity.asset_metadata as am
+
+        # Two measured (white_bowl, surface) entries ~50 mm apart, as in the RCA
+        # (white_bowl seats higher on a cabinet top than on a stove).
+        table_z = am.TABLE_SURFACE_Z
+        monkeypatch.setattr(
+            am,
+            "VARIANT_CLEARANCES",
+            {"white_bowl|flat_stove": 0.1016, "white_bowl|wooden_cabinet": 0.1516},
+        )
+        z_stove = am.surface_spawn_z(table_z, "white_bowl", "flat_stove")
+        z_cab = am.surface_spawn_z(table_z, "white_bowl", "wooden_cabinet")
+        assert abs((z_cab - z_stove) - 0.05) < 1e-6
+        # Unknown surface falls back to the canonical per-class table.
+        z_canon = am.surface_spawn_z(table_z, "white_bowl", None)
+        assert abs(z_canon - (table_z + am.spawn_clearance("white_bowl"))) < 1e-9
+        # is_measured reflects the variant table.
+        assert am.is_measured("white_bowl", "flat_stove")
+        assert not am.is_measured("white_bowl", "nonexistent_surface") or am.is_measured(
+            "white_bowl"
+        )
+
+    def test_renderer_couples_variant_identity_and_z(self):
+        from libero_infinity.compiler import compile_task_to_scenic
+        from libero_infinity.task_config import TaskConfig
+
+        cfg = TaskConfig.from_bddl(_kitchen_bowl_bddl())
+        code = compile_task_to_scenic(cfg, "object")
+        # The variant chooser is a single Uniform over (class, z) PAIRS, and the
+        # object reads element [0] for identity and [1] for its spawn z — so the
+        # chosen variant carries its own measured seating height.
+        assert re.search(r'_chosen_\w+ = Uniform\(\("[^"]+", [0-9.]+\)', code)
+        assert "with asset_class _chosen_" in code and "[0]" in code
+        assert re.search(r"at Vector\([^)]*_chosen_\w+\[1\]\)", code)
+
+    def test_variant_pool_emits_per_variant_distinct_z(self):
+        """Different variants of one object emit different spawn z (per-variant
+        clearance), not a single shared canonical z."""
+        from libero_infinity.compiler import compile_task_to_scenic
+        from libero_infinity.task_config import TaskConfig
+
+        cfg = TaskConfig.from_bddl(_kitchen_bowl_bddl())
+        code = compile_task_to_scenic(cfg, "object")
+        # Grab a chooser line with >=2 variants and assert not all z are equal
+        # (ketchup/milk seat higher than wine_bottle, etc.).
+        chooser = None
+        for ln in code.splitlines():
+            if ln.startswith("_chosen_wine_bottle = Uniform("):
+                chooser = ln
+                break
+        assert chooser is not None
+        zs = [float(z) for z in re.findall(r'"[^"]+", ([0-9.]+)\)', chooser)]
+        assert len(zs) >= 2
+        assert max(zs) - min(zs) > 1e-3, f"per-variant z not distinguished: {zs}"
