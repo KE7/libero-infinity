@@ -1002,8 +1002,20 @@ def _render_robot_clearance(
             continue
         var = _to_var(node.instance_name)
         obj_class = node.object_class or node.instance_name
-        dims = get_dimensions(obj_class)
-        thx, thy, thz = dims[0] / 2.0, dims[1] / 2.0, dims[2] / 2.0
+        # FV MC #6: a substituted OOD variant may be WIDER (and taller) than the
+        # canonical class. The clearance half-extents must bound the widest
+        # footprint the object axis can instantiate -- mirroring the max-over-pool
+        # already done for z (zs) below -- or canonical-only thx/thy admit an AABB
+        # overlap for wide variants that the simulator must then shove.
+        variants = (
+            plan.object_substitutions.get(node.instance_name)
+            if "object" in plan.active_axes
+            else None
+        )
+        pool_classes = [obj_class] + list(variants or [])
+        thx = max(get_dimensions(c)[0] for c in pool_classes) / 2.0
+        thy = max(get_dimensions(c)[1] for c in pool_classes) / 2.0
+        thz = max(get_dimensions(c)[2] for c in pool_classes) / 2.0
         pp = plan.position_plans.get(node.instance_name)
         surface_class = _resolve_surface_class(node, plan, graph)
         if pp is not None and pp.use_relative_positioning:
@@ -1011,11 +1023,6 @@ def _render_robot_clearance(
             # dynamic z term still guards correctly.
             z_lo = z_hi = None
         else:
-            variants = (
-                plan.object_substitutions.get(node.instance_name)
-                if "object" in plan.active_axes
-                else None
-            )
             zs = [surface_spawn_z(TABLE_SURFACE_Z, obj_class, surface_class)]
             if variants:
                 zs.extend(surface_spawn_z(TABLE_SURFACE_Z, v, surface_class) for v in variants)
@@ -1154,7 +1161,17 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             continue
         var_name = _to_var(node.instance_name)
         obj_class = node.object_class or node.instance_name
-        dims = get_dimensions(obj_class)
+        # FV MC #6: bound the footprint by the WIDEST variant the object axis can
+        # substitute, not just the canonical class (a wider OOD variant otherwise
+        # slips through the pairwise / fixture / distractor AABB clearance and the
+        # simulator shoves it). Mirrors the max-over-pool the robot-clearance
+        # z-prune already does.
+        _pool = [obj_class] + (
+            list(plan.object_substitutions.get(node.instance_name) or [])
+            if "object" in plan.active_axes
+            else []
+        )
+        dims = tuple(max(get_dimensions(c)[k] for c in _pool) for k in range(3))
         sampled = _is_sampled(node, plan)
         obj_info.append((var_name, dims, node.instance_name, sampled))
 
