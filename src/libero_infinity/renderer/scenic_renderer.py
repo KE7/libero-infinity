@@ -1039,6 +1039,16 @@ def _render_robot_clearance(
     if plan.distractor_budget > 0 and "distractor" in plan.active_axes:
         dz_lo = footprint.table_world_z
         dz_hi = footprint.table_world_z + 0.08
+        # FV SMT Finding G: the simulator instantiates each distractor at its
+        # world settle z (surface_spawn_z ~= 0.92), NOT the Scenic SAFE_REGION
+        # TABLE_Z (~0.82). Emitting `distractor_{i}.position.z` (the Scenic value)
+        # into the robot<->distractor z-term guarded a phantom ~100 mm below
+        # reality. Distractors rest on the table (surface_class=None) and their
+        # class is sampled at runtime, so emit the canonical-distractor world
+        # settle z as a constant; the static z-prune band [table_world_z, +0.08]
+        # bounds the residual per-class variation. The constraint variable and the
+        # prune band now live in the same (world) frame the simulator uses.
+        dz_world = surface_spawn_z(TABLE_SURFACE_Z, "distractor", None)
         for i in range(plan.distractor_budget):
             guard = f"(_n_distractors <= {i}) or "
             targets.append(
@@ -1046,7 +1056,7 @@ def _render_robot_clearance(
                     guard,
                     f"distractor_{i}.position.x",
                     f"distractor_{i}.position.y",
-                    f"distractor_{i}.position.z",
+                    f"{dz_world:.4f}",
                     0.04,
                     0.04,
                     0.04,
