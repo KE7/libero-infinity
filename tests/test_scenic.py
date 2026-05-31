@@ -1279,9 +1279,16 @@ class TestPerVariantSurfaceSpawnZ:
         code = compile_task_to_scenic(cfg, "object")
         # Grab a chooser line with >=2 variants and assert not all z are equal
         # (ketchup/milk seat higher than wine_bottle, etc.).
+        #
+        # FV MC #3 (per-instance keying): the variant chooser is keyed by object
+        # INSTANCE, not class, so the emitted variable is ``_chosen_wine_bottle_1``
+        # (the instance name) rather than the legacy per-class ``_chosen_wine_bottle``.
+        # Keying per instance lets two same-class objects draw their OOD variant
+        # (and resolve their own surface z) independently — the invariant this
+        # test now pins.
         chooser = None
         for ln in code.splitlines():
-            if ln.startswith("_chosen_wine_bottle = Uniform("):
+            if ln.startswith("_chosen_wine_bottle_1 = Uniform("):
                 chooser = ln
                 break
         assert chooser is not None
