@@ -481,8 +481,9 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     lines = ["# Object declarations"]
 
     # Asset variant sampling (object axis)
-    seen_classes: set[str] = set()
-    asset_var_map: dict[str, str] = {}  # object_class -> scenic var name
+    seen_instances: set[str] = set()
+    asset_var_map: dict[str, str] = {}  # instance_name -> scenic chooser var name
+    inst_class: dict[str, str] = {}  # instance_name -> canonical class (for params)
 
     if "object" in plan.active_axes and plan.object_substitutions:
         lines.append("# Asset variant sampling")
@@ -493,27 +494,35 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         # idiomatic substitute). ``_chosen_X[0]`` is the asset class; the
         # object's z spec reads ``_chosen_X[1]`` (Fix 3 / Finding A). The z is
         # resolved against the support surface of the first object of this class.
+        # FV MC #3: key per object INSTANCE, not per class. Two same-class objects
+        # on different supports must each resolve their OWN surface z, and each
+        # instance draws its variant identity independently (intentional: two
+        # same-class objects need not collapse to the same OOD variant, and a
+        # shared per-class chooser would otherwise bind the second instance to the
+        # first instance's surface z).
         for obj_name, variants in plan.object_substitutions.items():
             node = graph.get_node(obj_name)
             if node is None:
                 continue
+            inst = node.instance_name
             obj_class = node.object_class or obj_name
-            if obj_class in seen_classes:
+            if inst in seen_instances:
                 continue
-            seen_classes.add(obj_class)
-            var_name = f"_chosen_{_sanitize(obj_class)}"
+            seen_instances.add(inst)
+            var_name = f"_chosen_{_sanitize(inst)}"
             surface_class = _resolve_surface_class(node, plan, graph)
             pairs = ", ".join(
                 f'("{v}", {surface_spawn_z(TABLE_SURFACE_Z, v, surface_class):.4f})'
                 for v in variants
             )
             lines.append(f"{var_name} = Uniform({pairs})")
-            asset_var_map[obj_class] = var_name
+            asset_var_map[inst] = var_name
+            inst_class[inst] = obj_class
 
         if asset_var_map:
-            first_class = next(iter(asset_var_map))
-            first_var = asset_var_map[first_class]
-            lines.append(f'param perturb_class = "{first_class}"')
+            first_inst = next(iter(asset_var_map))
+            first_var = asset_var_map[first_inst]
+            lines.append(f'param perturb_class = "{inst_class[first_inst]}"')
             lines.append(f"param chosen_asset = {first_var}[0]")
         lines.append("")
 
@@ -560,7 +569,7 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         obj_name = node.instance_name
         obj_class = node.object_class or obj_name
         var_name = _to_var(obj_name)
-        scenic_class = asset_var_map.get(obj_class)
+        scenic_class = asset_var_map.get(obj_name)
 
         # Position plan
         pos_plan = plan.position_plans.get(obj_name)
