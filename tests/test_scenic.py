@@ -502,9 +502,17 @@ class TestScenicGenerator:
         path = generate_scenic_file(bowl_config, perturbation="combined")
         try:
             scenario = sc.scenarioFromFile(path)
-            # Radial footprint-clearance constraints need more rejection-sampling
-            # iterations for multi-object + multi-fixture + distractor scenarios.
-            scene, _ = scenario.generate(maxIterations=10000, verbosity=0)
+            # Combined mode activates every axis at once. The PR #24 clearance
+            # fixes (FV MC #6 max-over-pool footprints + Fix 1 robot-link AABB
+            # clauses + distractor↔object/fixture clearances) are individually
+            # CORRECT and must NOT be loosened (loosening re-opens the FV MC #6
+            # CRITICAL — the simulator would shove an overlapping wider variant).
+            # The cost is a tighter, but still feasible, region: the rejection
+            # sampler needs a larger iteration budget to find a satisfying
+            # assignment for this fully-perturbed scene. Per the RCA
+            # (combined_mode_rejection_feasibility.md, Option B) and FV MC
+            # Property 5, raise the budget rather than weaken any require clause.
+            scene, _ = scenario.generate(maxIterations=200000, verbosity=0)
             assert "chosen_asset" in scene.params
             for obj in scene.objects:
                 if getattr(obj, "libero_name", "") == "akita_black_bowl_1":
