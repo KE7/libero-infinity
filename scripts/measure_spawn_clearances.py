@@ -26,6 +26,125 @@ import pathlib
 import random
 import statistics
 
+# Workspace-table fixture classes (the arena tables objects rest on directly).
+# Must stay in sync with ``WorldModel.root_workspace_fixtures`` in
+# ``ir/nodes.py``. A movable keyed under ``<class>|<surface>`` for one of these
+# surfaces is only a valid table-resting sample if it physically settles in
+# contact with the table — not on an elevated fixture that happened to sit
+# under its sampled (x, y).
+_WORKSPACE_TABLE_CLASSES = frozenset(
+    {"table", "kitchen_table", "living_room_table", "study_table", "floor"}
+)
+
+# Settling budget for the physical-support check. A movable resting at its
+# Scenic spawn z sits ~1–2 mm above the table collision surface after the
+# setup() settle; a few dozen extra steps close that micro-gap so a genuine
+# table contact registers, while an object perched on a fixture never makes a
+# table contact no matter how long it settles.
+_SUPPORT_CHECK_STEPS = 80
+
+# Max allowed deviation (m) between a measured (canonical_class|workspace-table)
+# clearance and that class's canonical per-class clearance. This is a COARSE
+# backstop, not the primary defense — the per-sample physical-support contact
+# guard (``_settled_on_table_surface``) is what precisely removes the
+# over-measurement (a bowl settling on a wine_rack, mis-bucketed as
+# table-resting, which shifted akita_black_bowl|table by ~31 mm). The tolerance
+# must clear legit small-sample seating variance between the pooled-canonical
+# median and a per-bucket median (multimodal assets such as an upright-vs-tipped
+# milk carton span ~25 mm) while still catching gross fixture-stacking
+# contamination if the contact guard ever regresses.
+_TABLE_ROW_TOL = 0.03
+
+
+def _settled_on_table_surface(env, name: str, *, max_steps: int = _SUPPORT_CHECK_STEPS) -> bool:
+    """Return True iff movable ``name`` physically rests on the workspace table.
+
+    Root-cause guard for the per-(variant, surface) over-measurement: the
+    sample loop buckets a movable by the renderer's *intended*
+    ``support_surface_class``, but position sampling can land the object's
+    (x, y) over an elevated fixture (e.g. a ``wine_rack``) so it settles ON the
+    fixture, ~tens of mm above the table. Its ``body_xpos[2] - TABLE_Z`` then
+    over-states the true table-resting clearance and, in a small per-bucket
+    median, dominates (akita_black_bowl|table: 0.100 → 0.132).
+
+    We resolve the *physical* support by stepping the live MuJoCo sim forward
+    (settling the micro-gap above the table) and inspecting ``data.contact``:
+    a genuine table-rester makes a contact with a table geom; a fixture-perched
+    object never does. The sim state (qpos/qvel) is snapshotted and restored so
+    the check is side-effect-free and the recorded z stays the reset pose.
+    """
+    sim = env._sim.libero_env.env.sim  # noqa: SLF001 — measurement-only sim handle
+    body_ids = getattr(env._sim, "_body_ids", None) or {}
+    bid = body_ids.get(name)
+    if bid is None:
+        return False
+    model, data = sim.model, sim.data
+    obj_geoms = frozenset(g for g in range(model.ngeom) if model.geom_bodyid[g] == bid)
+    qpos0 = data.qpos.copy()
+    qvel0 = data.qvel.copy()
+    try:
+        for _ in range(max_steps):
+            sim.step()
+            for c in range(data.ncon):
+                con = data.contact[c]
+                if con.geom1 in obj_geoms or con.geom2 in obj_geoms:
+                    other = con.geom2 if con.geom1 in obj_geoms else con.geom1
+                    obody = (model.body_id2name(model.geom_bodyid[other]) or "").lower()
+                    ogeom = (model.geom_id2name(other) or "").lower()
+                    if "table" in obody or "table" in ogeom:
+                        return True
+        return False
+    finally:
+        data.qpos[:] = qpos0
+        data.qvel[:] = qvel0
+        sim.forward()
+
+
+def _assert_table_rows_match_canonical(
+    variant_clearances: dict[str, float],
+    canonical_clearances: dict[str, float],
+    *,
+    tol: float = _TABLE_ROW_TOL,
+) -> None:
+    """Fail loudly if any *canonical-class* table row drifts from its canonical z.
+
+    For a workspace-table surface the settled clearance of a *known* base class
+    is its canonical per-class clearance (the arena tables are all at the same
+    height; FV Task 5 found z is surface-invariant across them). Any
+    ``<canonical_class>|<table>`` row that deviates by more than ``tol`` means a
+    non-table-resting sample leaked into the bucket (the exact over-measurement
+    the physical-support guard removes), so raise rather than ship an inflated z.
+
+    Rows whose asset is NOT a measured canonical class are object-axis OOD
+    variants with no per-class ground truth: a tall variant
+    (``macaroni_and_cheese``, an elongated box) legitimately seats higher than
+    the ~0.10 median, so comparing it against a median prior would false-positive.
+    Those rows are already protected by the per-sample physical-support contact
+    guard; we only pin the rows for which a canonical value exists.
+    """
+    offenders = []
+    for key, measured in variant_clearances.items():
+        asset, _, surface = key.partition("|")
+        if surface not in _WORKSPACE_TABLE_CLASSES:
+            continue
+        canonical = canonical_clearances.get(asset)
+        if canonical is None:
+            # OOD variant with no canonical ground truth — guarded by the
+            # physical-support contact check, not pinned to the median prior.
+            continue
+        if abs(measured - canonical) > tol:
+            offenders.append(
+                f"{key}: measured={measured:.5f} canonical={canonical:.5f} "
+                f"|Δ|={abs(measured - canonical) * 1000:.1f}mm > {tol * 1000:.0f}mm"
+            )
+    if offenders:
+        raise AssertionError(
+            "Per-(variant, surface) clearance sanity check FAILED — workspace-table "
+            "rows for canonical base classes must equal the canonical per-class "
+            f"clearance within {tol * 1000:.0f} mm (a larger gap means a "
+            "non-table-resting sample polluted the bucket):\n  " + "\n  ".join(offenders)
+        )
+
 # Kitchen tasks whose workspace table sits at the canonical TABLE_Z frame.
 # Chosen for broad movable-class coverage (bowls, plates, bottles, boxes,
 # cans, pots). Non-kitchen suites (e.g. living-room tables at a different
@@ -122,6 +241,13 @@ def measure_variants() -> dict:
                 clearance = st["position"][2] - TABLE_Z
                 if not (0.0 <= clearance <= 0.18):
                     continue
+                # Physical-support guard: only bucket the object under a
+                # workspace-table key when it actually settles in contact with
+                # the table. Objects whose (x, y) landed over a fixture settle
+                # ON the fixture (tens of mm higher) and would otherwise inflate
+                # the median (Finding: akita_black_bowl|table 0.100 → 0.132).
+                if surface in _WORKSPACE_TABLE_CLASSES and not _settled_on_table_surface(env, nm):
+                    continue
                 key = f"{cls}|{surface}"
                 samples.setdefault(key, []).append(round(float(clearance), 5))
             env.close()
@@ -200,6 +326,12 @@ def measure() -> dict:
                 # elevated fixture (cabinet top, stove) or fell off the table.
                 if not (0.0 <= clearance <= 0.18):
                     continue
+                # Physical-support guard (see measure_variants): the band alone
+                # admits objects perched on a fixture whose top happens to fall
+                # in the band; require an actual table contact so the pooled
+                # median is not biased by fixture-resting outliers.
+                if not _settled_on_table_surface(env, nm):
+                    continue
                 samples.setdefault(str(cls), []).append(round(float(clearance), 5))
             env.close()
 
@@ -232,6 +364,12 @@ if __name__ == "__main__":
     if "--no-variants" not in sys.argv:
         vout = measure_variants()
         vout["_meta"]["table_z"] = TABLE_Z
+
+        # Fail loudly before writing if any canonical-class workspace-table row
+        # drifted from the canonical per-class clearance — that can only happen
+        # if a non-table-resting sample leaked past the physical-support guard.
+        _assert_table_rows_match_canonical(vout["clearances"], out["clearances"])
+
         vdest = pathlib.Path("src/libero_infinity/data/spawn_clearances_variants.json")
         vdest.write_text(json.dumps(vout, indent=2, sort_keys=False) + "\n")
         print(f"\nWrote {vdest} with {len(vout['clearances'])} (variant|surface) keys:")
