@@ -856,6 +856,58 @@ class TestLiberoCorpusAudit:
             z_table = surface_spawn_z(TABLE_SURFACE_Z, cls0, None)
             assert z > z_table
 
+    def test_goal_feasibility_distractor_clears_goal_region(self):
+        """Fix 1: across generated scenes for put_the_bowl_on_the_stove, no
+        distractor may occupy the goal region, and the goal object's footprint
+        must still fit (assert_goal_region_admits_object passes)."""
+        import scenic as sc
+        from libero_infinity.compiler import generate_scenic_file
+        from libero_infinity.ir.goal_regions import resolve_goal_regions
+        from libero_infinity.ir.graph_builder import build_semantic_scene_graph
+        from libero_infinity.task_config import TaskConfig
+        from libero_infinity.validation.invariants.domain import (
+            assert_goal_region_admits_object,
+        )
+
+        bddl = BDDL_DIR / "libero_goal" / "put_the_bowl_on_the_stove.bddl"
+        cfg = TaskConfig.from_bddl(str(bddl))
+        graph = build_semantic_scene_graph(cfg)
+        regions = resolve_goal_regions(graph)
+        assert regions, "stove goal must resolve to a goal region"
+
+        path = generate_scenic_file(cfg, perturbation="distractor")
+        checked = 0
+        try:
+            scenario = sc.scenarioFromFile(path)
+            for _ in range(8):
+                scene, _ = scenario.generate(maxIterations=4000, verbosity=0)
+                res = assert_goal_region_admits_object(cfg, scene)
+                # passed is True (distractors present + clear) or None (none).
+                assert res.passed is not False, res.detail
+                # Direct geometric check too: no ACTIVE distractor in the
+                # inflated region (inactive slots are not injected into MuJoCo
+                # and their positions are unconstrained, so they are excluded).
+                n_active = int(scene.params.get("n_distractors", 0))
+                dists = [
+                    o
+                    for o in scene.objects
+                    if getattr(o, "libero_name", "").startswith("distractor_")
+                    and int(getattr(o, "libero_name").rsplit("_", 1)[1]) < n_active
+                ]
+                for gr in regions:
+                    thr_x = gr.half_x + gr.obj_half_x + 0.04
+                    thr_y = gr.half_y + gr.obj_half_y + 0.04
+                    for o in dists:
+                        p = o.position
+                        assert (
+                            abs(float(p[0]) - gr.cx) > thr_x
+                            or abs(float(p[1]) - gr.cy) > thr_y
+                        ), f"distractor {o.libero_name} blocks goal region {gr.target_name}"
+                checked += 1
+        finally:
+            os.unlink(path)
+        assert checked >= 1
+
     def test_distractor_pool_excludes_task_classes(self, bowl_config):
         from libero_infinity.compiler import generate_scenic
 
