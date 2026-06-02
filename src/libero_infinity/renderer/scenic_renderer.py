@@ -226,6 +226,7 @@ def _should_emit_fixture_clearance(
 # Fixture footprint dimensions
 # ---------------------------------------------------------------------------
 
+
 # Fixture (width, length, height) for object-fixture clearance constraints.
 #
 # Sourced from MEASURED geometry (``data/fixture_geometry.json`` via
@@ -247,8 +248,7 @@ def _fixture_dims(fixture_class: str | None) -> tuple[float, float, float]:
 # the static corpus audit (``fixture_classes <= set(_FIXTURE_DIMENSIONS)``)
 # stays satisfied while the values track the measured geometry.
 _FIXTURE_DIMS: dict[str, tuple[float, float, float]] = {
-    cls: _fixture_dims(cls)
-    for cls in set(_FIXTURE_DIMS_FALLBACK) | set(_AM_FIXTURE_GEOMETRY)
+    cls: _fixture_dims(cls) for cls in set(_FIXTURE_DIMS_FALLBACK) | set(_AM_FIXTURE_GEOMETRY)
 }
 
 
@@ -899,9 +899,7 @@ class _DistractorSlot:
     z_hi: float  # max spawn z over the distractor pool on this support
 
 
-def _assignable_fixtures(
-    plan: PerturbationPlan, graph: SemanticSceneGraph
-) -> list[FixtureNode]:
+def _assignable_fixtures(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list[FixtureNode]:
     """Scene fixtures a distractor may be placed to rest ON.
 
     Excludes (a) goal fixtures — a distractor on the goal fixture would block
@@ -1513,9 +1511,7 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         # always has a clear, non-overlapping spot (SAT-correct AABB OR-form).
         goal_regions = resolve_goal_regions(graph)
         if goal_regions:
-            lines.append(
-                "# Goal-feasibility (Fix 1): distractor must not block the goal object's"
-            )
+            lines.append("# Goal-feasibility (Fix 1): distractor must not block the goal object's")
             lines.append("# required final footprint at any goal-relevant region.")
         for gr in goal_regions:
             cx_dx = gr.half_x + gr.obj_half_x + _DISTRACTOR_HALF

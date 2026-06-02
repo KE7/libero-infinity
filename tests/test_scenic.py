@@ -900,8 +900,7 @@ class TestLiberoCorpusAudit:
                     for o in dists:
                         p = o.position
                         assert (
-                            abs(float(p[0]) - gr.cx) > thr_x
-                            or abs(float(p[1]) - gr.cy) > thr_y
+                            abs(float(p[0]) - gr.cx) > thr_x or abs(float(p[1]) - gr.cy) > thr_y
                         ), f"distractor {o.libero_name} blocks goal region {gr.target_name}"
                 checked += 1
         finally:
