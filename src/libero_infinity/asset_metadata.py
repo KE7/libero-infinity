@@ -34,6 +34,7 @@ half-bounding-box approximation so the function is always total.
 from __future__ import annotations
 
 import json
+import math
 import pkgutil
 import warnings
 
@@ -321,3 +322,111 @@ def fixture_top_z_above_table(fixture_class: str | None) -> float:
 def is_fixture_measured(fixture_class: str | None) -> bool:
     """True iff ``fixture_class`` has measured geometry in the data table."""
     return (fixture_class or "") in FIXTURE_GEOMETRY
+
+
+# ---------------------------------------------------------------------------
+# Distractor footprint geometry — measured per-class settled AABB extents
+# ---------------------------------------------------------------------------
+#
+# The renderer historically declared EVERY distractor as a uniform 8 cm cube
+# (``_DISTRACTOR_HALF = 0.04``) while MuJoCo loaded the REAL asset mesh. For a
+# box-like distractor (cream_cheese, popcorn, …) the 8 cm proxy is close enough,
+# but for an anisotropic / irregular class (desk_caddy: real footprint
+# 0.14×0.42×0.22 m; bowl_drainer: 0.18×0.14) the proxy is off by hundreds of mm —
+# so the placement engine reasoned about a 4 cm half-cube while a 0.42 m caddy
+# was instantiated, overhanging an undersized fixture top and tilting to an
+# xy-dependent settle no single clearance-z could satisfy (RCA
+# ``distractor_z_convergence.md`` §"structural proxy").
+#
+# These footprints are MEASURED from the authoritative LIBERO MuJoCo assets by
+# ``scripts/measure_spawn_clearances.py --distractor-footprints-only`` and stored
+# in ``data/distractor_geometry.json``. Each entry holds:
+#   * ``footprint`` = [w, l] — median settled geom-AABB horizontal extents (m),
+#     informational (the settle yaw is free, so per-axis w/l are not load-bearing).
+#   * ``height``    = settled geom-AABB z-extent (m), used for the z-prune band.
+#   * ``radius``    = the dominant-mode of the per-sample circumscribed planar
+#     half-extent ``0.5·sqrt(wx² + wy²)`` — a yaw-ROBUST half-extent that bounds
+#     the distractor's footprint under ANY settle yaw (and the consistent ~90°
+#     settle tip). This is the value threaded into every clearance constraint, so
+#     orientation enters the clearance instead of a single scalar half-extent.
+
+# Legacy uniform-proxy fallback (w, l, h) in metres — used only for a distractor
+# class with no measured geometry, preserving the historical 8 cm-cube behaviour.
+_DISTRACTOR_DIM_DEFAULT: tuple[float, float, float] = (0.08, 0.08, 0.08)
+
+
+def _load_distractor_geometry() -> dict[str, dict]:
+    try:
+        raw = pkgutil.get_data("libero_infinity", "data/distractor_geometry.json")
+    except FileNotFoundError:
+        return {}
+    if raw is None:
+        return {}
+    data = json.loads(raw)
+    out: dict[str, dict] = {}
+    for k, v in data.get("distractors", {}).items():
+        if isinstance(v, dict):
+            out[str(k)] = v
+    return out
+
+
+DISTRACTOR_GEOMETRY: dict[str, dict] = _load_distractor_geometry()
+
+
+def distractor_footprint(asset_class: str | None) -> tuple[float, float, float]:
+    """Return the measured (width, length, height) settled AABB extents (m).
+
+    Falls back to the legacy uniform 8 cm proxy for an unmeasured class so the
+    function is total.
+    """
+    geom = DISTRACTOR_GEOMETRY.get(asset_class or "")
+    if geom is not None:
+        fp = geom.get("footprint")
+        h = geom.get("height")
+        if isinstance(fp, (list, tuple)) and len(fp) >= 2 and h is not None:
+            return float(fp[0]), float(fp[1]), float(h)
+    return _DISTRACTOR_DIM_DEFAULT
+
+
+def distractor_planar_half(asset_class: str | None) -> float:
+    """Yaw-robust planar half-extent (circumscribed radius, m) of a distractor.
+
+    Used as the per-class clearance half-extent on BOTH x and y so an arbitrary
+    settle yaw (and the consistent ~90° settle tip the irregular distractors
+    take) is bounded. Reads the measured ``radius`` when present; otherwise
+    derives the circumscribed radius from the footprint (legacy proxy for an
+    unmeasured class).
+    """
+    geom = DISTRACTOR_GEOMETRY.get(asset_class or "")
+    if geom is not None and geom.get("radius") is not None:
+        return max(float(geom["radius"]), _MIN_CLEARANCE)
+    w, length, _ = distractor_footprint(asset_class)
+    return max(0.5 * math.hypot(w, length), _MIN_CLEARANCE)
+
+
+def distractor_fit_half(asset_class: str | None) -> float:
+    """Resting-orientation footprint half-extent (m) for the support-FIT test.
+
+    The larger horizontal half-extent of the settled footprint
+    (``max(w, l) / 2``). Unlike :func:`distractor_planar_half` (the 45°-robust
+    circumscribed radius used for *clearance*), this is the half-extent the
+    distractor actually occupies in its roughly axis-aligned resting pose, so the
+    "does it sit on this support top?" decision and the placement-region sizing
+    are neither under-counted (the old uniform 0.04 proxy ignored the real mesh)
+    nor over-counted (the diagonal radius would wrongly exclude a box from a
+    narrow stove it physically fits). For the legacy 8 cm cube this is 0.04 —
+    identical to the historical proxy, so box-distractor support assignment is
+    unchanged; only genuinely-oversized classes (desk_caddy) are newly excluded.
+    """
+    w, length, _ = distractor_footprint(asset_class)
+    return max(max(w, length) / 2.0, _MIN_CLEARANCE)
+
+
+def distractor_half_height(asset_class: str | None) -> float:
+    """Half of the measured settled z-extent (m) of a distractor class."""
+    return max(distractor_footprint(asset_class)[2] / 2.0, _MIN_CLEARANCE)
+
+
+def is_distractor_measured(asset_class: str | None) -> bool:
+    """True iff ``asset_class`` has measured distractor geometry."""
+    return (asset_class or "") in DISTRACTOR_GEOMETRY

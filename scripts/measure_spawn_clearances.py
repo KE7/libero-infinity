@@ -331,6 +331,10 @@ _POSE_TOLERANCE = 0.005
 _FIXTURE_CLEARANCE_MAX = 0.60
 
 _DISTRACTOR_FIXTURE_SEEDS = 16
+# Seeds for the per-class distractor footprint sweep. Larger than the fixture
+# sweep so every one of the 10 pool classes (uniformly sampled into a few slots
+# per scene) is observed across the measurement task set.
+_DISTRACTOR_FOOTPRINT_SEEDS = 24
 
 
 def _dominant_mode(values: list[float], *, bandwidth: float = 2 * _POSE_TOLERANCE) -> float:
@@ -627,6 +631,136 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
     return variant_rows, fixture_geometry, table_rows
 
 
+def measure_distractor_footprints() -> dict:
+    """Measure per-class distractor footprints (settled geom-AABB extents).
+
+    For every active distractor in the measurement scenes (on the table OR on a
+    fixture — the body's own AABB excludes the support, so the support does not
+    contaminate the extents), record the settled world-AABB:
+
+        wx = xmax-xmin,  wy = ymax-ymin,  hz = zmax-zmin
+
+    and the per-sample circumscribed planar half-extent ``r = 0.5·sqrt(wx²+wy²)``
+    — a yaw-ROBUST half-extent that bounds the footprint under any settle yaw and
+    the consistent ~90° settle tip (RCA ``distractor_z_convergence.md``). The
+    per-class ``radius`` / ``height`` are the dominant settle MODE
+    (``_dominant_mode``) so a lone atypical settle cannot drag the row, mirroring
+    the on-fixture clearance aggregation. NO live-stepping of the irregular
+    distractor↔fixture contact set (it overflows MuJoCo's ncon arena and
+    segfaults — see the RCA); the reset-settle the env already performs is the
+    measurement.
+
+    Writes ``data/distractor_geometry.json`` consumed by
+    ``asset_metadata.distractor_footprint`` / ``distractor_planar_half``.
+    """
+    import math as _math
+
+    from libero_infinity.asset_registry import DEFAULT_DISTRACTOR_POOL
+    from libero_infinity.compiler import compile_task_to_scenario
+    from libero_infinity.gym_env import make_env
+    from libero_infinity.task_config import TaskConfig
+    from libero_infinity.validation.sweep import discover_all_tasks, resolve_task_path
+
+    avail = set(discover_all_tasks())
+    radii: dict[str, list[float]] = {}
+    heights: dict[str, list[float]] = {}
+    wxs: dict[str, list[float]] = {}
+    wys: dict[str, list[float]] = {}
+
+    for task_rel in MEASURE_TASKS:
+        if task_rel not in avail:
+            continue
+        bddl = str(resolve_task_path(task_rel))
+        for seed in range(_DISTRACTOR_FOOTPRINT_SEEDS):
+            try:
+                cfg = TaskConfig.from_bddl(bddl)
+                random.seed(seed)
+                scenario = compile_task_to_scenario(cfg, "distractor")
+                scene, _ = scenario.generate(maxIterations=8000)
+                env = make_env(scene, bddl_path=bddl)
+                env.reset()
+            except Exception as exc:  # noqa: BLE001 — measurement noise, recorded
+                print(f"# build failed {task_rel} [seed {seed}]: {exc}")
+                continue
+            sim = env._sim.libero_env.env.sim  # noqa: SLF001
+            active = getattr(env._sim, "_active_distractor_names", set())  # noqa: SLF001
+            for o in scene.objects:
+                nm = getattr(o, "libero_name", "")
+                if not nm.startswith("distractor_") or nm not in active:
+                    continue
+                cls = getattr(o, "asset_class", "") or ""
+                if not cls:
+                    continue
+                bid = None
+                for cand in (nm, nm + "_main"):
+                    try:
+                        bid = sim.model.body_name2id(cand)
+                        break
+                    except Exception:
+                        continue
+                if bid is None:
+                    continue
+                box = _body_world_aabb(sim, bid)
+                if box is None:
+                    continue
+                wx = round(box[1] - box[0], 5)
+                wy = round(box[3] - box[2], 5)
+                hz = round(box[5] - box[4], 5)
+                # Reject degenerate / un-loaded AABBs.
+                if not (0.0 < wx < 1.0 and 0.0 < wy < 1.0 and 0.0 < hz < 1.0):
+                    continue
+                radii.setdefault(cls, []).append(round(0.5 * _math.hypot(wx, wy), 5))
+                heights.setdefault(cls, []).append(hz)
+                wxs.setdefault(cls, []).append(wx)
+                wys.setdefault(cls, []).append(wy)
+            env.close()
+
+    distractors: dict[str, dict] = {}
+    for cls in sorted(set(radii)):
+        distractors[cls] = {
+            "footprint": [
+                round(statistics.median(wxs[cls]), 5),
+                round(statistics.median(wys[cls]), 5),
+            ],
+            "height": round(_dominant_mode(heights[cls]), 5),
+            "radius": round(_dominant_mode(radii[cls]), 5),
+            "n": len(radii[cls]),
+        }
+
+    missing = [c for c in DEFAULT_DISTRACTOR_POOL if c not in distractors]
+    print(f"\n# distractor footprints: {len(distractors)} classes measured")
+    for cls, g in distractors.items():
+        print(
+            f"  {cls:24} radius={g['radius']:.4f} h={g['height']:.4f} "
+            f"footprint={g['footprint']} (n={g['n']})"
+        )
+    if missing:
+        print(f"# WARNING: pool classes never sampled (no footprint row): {missing}")
+
+    return {
+        "_meta": {
+            "description": "Measured per-class distractor footprints. footprint=[w,l] "
+            "and height are settled geom-AABB world extents (m); radius is the "
+            "yaw-robust circumscribed planar half-extent 0.5*sqrt(wx^2+wy^2) "
+            "(dominant settle mode) threaded into renderer clearance + support-fit. "
+            "Generated by scripts/measure_spawn_clearances.py "
+            "(measure_distractor_footprints).",
+            "n_classes": len(distractors),
+            "missing_pool_classes": missing,
+        },
+        "distractors": distractors,
+    }
+
+
+def _run_distractor_footprints_only() -> None:
+    """Measure ONLY per-class distractor footprints and write
+    ``data/distractor_geometry.json``, leaving all clearance data untouched."""
+    out = measure_distractor_footprints()
+    dest = pathlib.Path("src/libero_infinity/data/distractor_geometry.json")
+    dest.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
+    print(f"\nWrote {dest} with {len(out['distractors'])} distractor classes.")
+
+
 def measure() -> dict:
     from libero_infinity.compiler import compile_task_to_scenario
     from libero_infinity.gym_env import make_env
@@ -807,6 +941,10 @@ if __name__ == "__main__":
     import sys
 
     from libero_infinity.simulator import TABLE_Z
+
+    if "--distractor-footprints-only" in sys.argv:
+        _run_distractor_footprints_only()
+        raise SystemExit(0)
 
     if "--distractor-fixtures-only" in sys.argv:
         _run_distractor_fixtures_only()

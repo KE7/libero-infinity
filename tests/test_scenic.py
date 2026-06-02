@@ -847,11 +847,13 @@ class TestLiberoCorpusAudit:
             assert s.fixture_name != "flat_stove_1"
             assert f'with support_surface_class "{s.surface_class}"' in code
             assert f'with support_parent_name "{s.fixture_name}"' in code
-            # The correlated z for at least one pool class equals surface_spawn_z
-            # on the assigned fixture surface (NOT the bare table z).
-            cls0 = plan.distractor_classes[0]
+            # The correlated z for at least one fitting pool class equals
+            # surface_spawn_z on the assigned fixture surface (NOT the bare table
+            # z). The correlated sample is a (class, z, planar_half, height)
+            # tuple, so match the (class, z, prefix.
+            cls0 = s.pool[0] if s.pool else plan.distractor_classes[0]
             z = surface_spawn_z(TABLE_SURFACE_Z, cls0, s.surface_class)
-            assert f'("{cls0}", {z:.4f})' in code
+            assert f'("{cls0}", {z:.4f}, ' in code
             # And it differs from the table z for the same class (fixture seats higher).
             z_table = surface_spawn_z(TABLE_SURFACE_Z, cls0, None)
             assert z > z_table
@@ -1316,16 +1318,20 @@ class TestDistractorObjectAABBClearance:
                 line = ln
                 break
         assert line is not None, "no distractor↔object SAT clause for wine_bottle_1"
-        # The emitted dx threshold equals (w_distractor + w_object)/2 from the
-        # measured dims — NOT a hardcoded 0.13.
+        # The emitted dx threshold is the object's measured half-width PLUS the
+        # per-class distractor planar half-extent ``_distractor_0_r`` (a sampled
+        # local threaded from the correlated (class, z, r, h) choice) — NOT a
+        # hardcoded scalar and NOT the radial 0.13. The literal part equals
+        # w_object / 2; the distractor footprint enters symbolically.
         wdims = get_dimensions("wine_bottle")
-        expected_dx = (0.08 + wdims[0]) / 2.0
+        expected_obj_half = wdims[0] / 2.0
         m = re.search(
-            r"abs\(distractor_0\.position\.x - wine_bottle_1\.position\.x\) > ([0-9.]+)",
+            r"abs\(distractor_0\.position\.x - wine_bottle_1\.position\.x\) "
+            r"> \(([0-9.]+) \+ _distractor_0_r\)",
             line,
         )
-        assert m is not None
-        assert abs(float(m.group(1)) - expected_dx) < 1e-3
+        assert m is not None, f"distractor↔object clause not in per-class form: {line}"
+        assert abs(float(m.group(1)) - expected_obj_half) < 1e-3
 
 
 class TestPerVariantSurfaceSpawnZ:
