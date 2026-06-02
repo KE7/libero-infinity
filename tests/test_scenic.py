@@ -787,10 +787,16 @@ class TestLiberoCorpusAudit:
         path = generate_scenic_file(bowl_config, perturbation="distractor")
         try:
             code = pathlib.Path(path).read_text()
-            assert "param distractor_0_class = Uniform(*_distractor_pool)" in code
+            # Fix 2 (option i): the distractor class is drawn from a correlated
+            # (class, resolved_spawn_z) Uniform so its measured seating height on
+            # its assigned support is sampled together with the class; the class
+            # STRING is still exposed as a param for the simulator's BDDL patch.
+            assert "_distractor_0_choice = Uniform(" in code
+            assert "param distractor_0_class = _distractor_0_choice[0]" in code
             assert "_n_distractors = globalParameters.n_distractors" in code
-            # Compiler now emits SAT-form AABB clearance for distractor↔fixture
-            # pairs (per-axis OR), gated by the cardinality guard. See PR #16.
+            # distractor_0 is always assigned to the table (support slot 0), so
+            # it is kept clear of every fixture via SAT-form AABB clearance
+            # (per-axis OR), gated by the cardinality guard.
             for fixture in ("wooden_cabinet_1", "flat_stove_1", "wine_rack_1"):
                 assert (
                     f"require (_n_distractors <= 0) or "
@@ -807,6 +813,48 @@ class TestLiberoCorpusAudit:
             assert len(dist) >= 1
         finally:
             os.unlink(path)
+
+    def test_distractor_fixture_assignment_emits_measured_z(self):
+        """Fix 2: a distractor assigned to a fixture emits the resolved per-
+        (class, fixture) spawn z (surface_spawn_z) and declares that support;
+        the table-assigned slot 0 declares no fixture support."""
+        from libero_infinity.asset_metadata import TABLE_SURFACE_Z, surface_spawn_z
+        from libero_infinity.ir.graph_builder import build_semantic_scene_graph
+        from libero_infinity.planner.composition import plan_perturbations
+        from libero_infinity.renderer.scenic_renderer import (
+            _distractor_slots,
+            render_scenic,
+        )
+        from libero_infinity.task_config import TaskConfig
+
+        bddl = BDDL_DIR / "libero_goal" / "put_the_bowl_on_the_stove.bddl"
+        cfg = TaskConfig.from_bddl(str(bddl))
+        graph = build_semantic_scene_graph(cfg)
+        plan = plan_perturbations(graph, "distractor")
+        slots = _distractor_slots(plan, graph)
+        code = render_scenic(plan, graph)
+
+        # Slot 0 is always the table (no fixture support declared).
+        assert slots[0].surface_class is None and slots[0].fixture_name is None
+        assert "distractor_0" in code
+
+        # At least one slot must be assigned to a (non-goal) fixture, and that
+        # distractor must declare the fixture support + emit the matching z pair.
+        fixture_slots = [s for s in slots if s.fixture_name is not None]
+        assert fixture_slots, "expected at least one fixture-assigned distractor"
+        for s in fixture_slots:
+            # The goal fixture (flat_stove_1) must never be a distractor support.
+            assert s.fixture_name != "flat_stove_1"
+            assert f'with support_surface_class "{s.surface_class}"' in code
+            assert f'with support_parent_name "{s.fixture_name}"' in code
+            # The correlated z for at least one pool class equals surface_spawn_z
+            # on the assigned fixture surface (NOT the bare table z).
+            cls0 = plan.distractor_classes[0]
+            z = surface_spawn_z(TABLE_SURFACE_Z, cls0, s.surface_class)
+            assert f'("{cls0}", {z:.4f})' in code
+            # And it differs from the table z for the same class (fixture seats higher).
+            z_table = surface_spawn_z(TABLE_SURFACE_Z, cls0, None)
+            assert z > z_table
 
     def test_distractor_pool_excludes_task_classes(self, bowl_config):
         from libero_infinity.compiler import generate_scenic

@@ -13,8 +13,18 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from libero_infinity.asset_metadata import TABLE_SURFACE_Z, surface_spawn_z
+from libero_infinity.asset_metadata import (
+    _FIXTURE_DIMS_FALLBACK,
+    TABLE_SURFACE_Z,
+    fixture_footprint,
+    fixture_height,
+    surface_spawn_z,
+)
+from libero_infinity.asset_metadata import (
+    FIXTURE_GEOMETRY as _AM_FIXTURE_GEOMETRY,
+)
 from libero_infinity.asset_registry import get_dimensions
+from libero_infinity.ir.goal_regions import resolve_goal_regions
 from libero_infinity.ir.nodes import (
     FixtureNode,
     MovableSupportNode,
@@ -216,35 +226,30 @@ def _should_emit_fixture_clearance(
 # Fixture footprint dimensions
 # ---------------------------------------------------------------------------
 
-# Conservative (width, length, height) estimates for LIBERO fixture classes.
-# Used for object-fixture clearance constraints.  Also exported via compiler.py
-# as _FIXTURE_DIMENSIONS for callers that need fixture footprint data.
-_FIXTURE_DIMS: dict[str, tuple[float, float, float]] = {
-    # MuJoCo-measured geom extents including door handles and protruding parts:
-    # wooden_cabinet: door handle extends to y=+0.130 m from centre → use (0.30, 0.30)
-    "wooden_cabinet": (0.30, 0.30, 0.24),
-    "white_cabinet": (0.30, 0.30, 0.24),
-    # flat_stove: x extends 0.15 m to the right of centre → use (0.36, 0.20)
-    "flat_stove": (0.36, 0.20, 0.08),
-    "wine_rack": (0.18, 0.12, 0.20),
-    "microwave": (0.24, 0.18, 0.16),
-    "bowl_drainer": (0.18, 0.14, 0.08),
-    # desk_caddy: corrected to match MJCF geom-union AABB (was 0.14, 0.10, 0.06,
-    # off by factor ~4 in y and ~3.5 in z) — see rca/g5_settle_drift_caddy.md §3.
-    "desk_caddy": (0.14, 0.42, 0.22),
-    "wooden_two_layer_shelf": (0.33, 0.20, 0.21),
-    "table": (0.80, 0.60, 0.05),
-    "kitchen_table": (0.80, 0.60, 0.05),
-    "living_room_table": (0.55, 0.65, 0.05),
-    "study_table": (0.50, 0.58, 0.05),
-    "floor": (0.50, 0.55, 0.01),
-}
-_FIXTURE_DIM_DEFAULT = (0.20, 0.18, 0.18)  # conservative fallback
-
-
+# Fixture (width, length, height) for object-fixture clearance constraints.
+#
+# Sourced from MEASURED geometry (``data/fixture_geometry.json`` via
+# ``asset_metadata.fixture_footprint`` / ``fixture_height``) so the footprint
+# matches the real MuJoCo geom AABB. The previous hand-coded ``_FIXTURE_DIMS``
+# under-estimated several fixtures (the cause of distractors slipping onto
+# fixtures unexpectedly); the measured table replaces them, with the same
+# conservative values retained only as the pre-measurement fallback inside
+# ``asset_metadata``.
 def _fixture_dims(fixture_class: str | None) -> tuple[float, float, float]:
-    """Return (width, length, height) for a fixture class."""
-    return _FIXTURE_DIMS.get(fixture_class or "", _FIXTURE_DIM_DEFAULT)
+    """Return measured (width, length, height) for a fixture class (m)."""
+    fw, fl = fixture_footprint(fixture_class)
+    return fw, fl, fixture_height(fixture_class)
+
+
+# Back-compat mapping (re-exported by compiler.py as ``_FIXTURE_DIMENSIONS``):
+# every known fixture class → measured-or-fallback (width, length, height).
+# Built lazily from the same single source of truth ``_fixture_dims`` reads, so
+# the static corpus audit (``fixture_classes <= set(_FIXTURE_DIMENSIONS)``)
+# stays satisfied while the values track the measured geometry.
+_FIXTURE_DIMS: dict[str, tuple[float, float, float]] = {
+    cls: _fixture_dims(cls)
+    for cls in set(_FIXTURE_DIMS_FALLBACK) | set(_AM_FIXTURE_GEOMETRY)
+}
 
 
 # ---------------------------------------------------------------------------
@@ -836,26 +841,177 @@ def _render_sensor_noise(plan: PerturbationPlan, graph: SemanticSceneGraph) -> s
     return "\n".join(lines)
 
 
+# Distractor footprint half-extent (m). Distractors are intentionally small,
+# uniform clutter objects; their declared bbox is 0.08 m per side.
+_DISTRACTOR_HALF: float = 0.04
+# Extra inset (m) so a distractor's footprint stays clear of a support's edge.
+_SUPPORT_EDGE_MARGIN: float = 0.01
+# Fraction of a fixture's measured footprint used for *placement* of an
+# on-fixture distractor. The full measured footprint is used for clearance
+# (so other objects avoid the fixture's true extent), but a distractor is
+# constrained to the central fraction of the top so it reliably settles on the
+# fixture's main resting surface rather than an off-centre post / lip / edge
+# (e.g. a wine rack's frame extends well above its shelf — the central region
+# lands on the shelf, the edge would catch a post at a different height).
+_SUPPORT_CENTRAL_FRAC: float = 0.6
+# Table-clutter sampling half-extents (m), mirroring ``SAFE_REGION`` in
+# ``scenic/libero_model.scenic`` (TABLE half 0.40/0.30 inset by 0.05 per side).
+# Used as the (x, y) centre range for table-assigned distractors so we can emit
+# an explicit resolved spawn z (instead of ``in SAFE_REGION``, which pins z to
+# the bare TABLE_Z and was the table-distractor pose_tolerance z-error source).
+_SAFE_X: float = 0.35
+_SAFE_Y: float = 0.25
+
+
+def _fixture_placement_half(fixture_class: str | None) -> tuple[float, float]:
+    """Central (x, y) half-range for placing a distractor on a fixture top.
+
+    The central fraction of the measured footprint minus the distractor's own
+    half-extent and an edge margin, so the distractor settles on the fixture's
+    main top surface (see ``_SUPPORT_CENTRAL_FRAC``).
+    """
+    fw, fl = fixture_footprint(fixture_class)
+    hx = fw / 2.0 * _SUPPORT_CENTRAL_FRAC - _DISTRACTOR_HALF - _SUPPORT_EDGE_MARGIN
+    hy = fl / 2.0 * _SUPPORT_CENTRAL_FRAC - _DISTRACTOR_HALF - _SUPPORT_EDGE_MARGIN
+    return hx, hy
+
+
+@dataclass(frozen=True)
+class _DistractorSlot:
+    """Resolved support assignment for one distractor slot (Fix 2, option i).
+
+    Each slot is deterministically assigned to a support — the workspace table
+    or a specific non-goal scene fixture — so the renderer can constrain the
+    distractor's (x, y) onto that support's footprint and emit the matching
+    measured spawn z (``surface_spawn_z`` resolves the per-(class, surface)
+    seating height). This is what makes the injected z equal the settled z for
+    distractors, closing the 0/41 distractor pose_tolerance residual.
+    """
+
+    index: int
+    surface_class: str | None  # None → workspace table
+    fixture_name: str | None
+    x_lo: float
+    x_hi: float
+    y_lo: float
+    y_hi: float
+    z_lo: float  # min spawn z over the distractor pool on this support
+    z_hi: float  # max spawn z over the distractor pool on this support
+
+
+def _assignable_fixtures(
+    plan: PerturbationPlan, graph: SemanticSceneGraph
+) -> list[FixtureNode]:
+    """Scene fixtures a distractor may be placed to rest ON.
+
+    Excludes (a) goal fixtures — a distractor on the goal fixture would block
+    the task (Fix 1), and (b) fixtures whose measured footprint is too small to
+    seat a distractor without overhanging the edge. Sorted by instance name for
+    deterministic round-robin assignment.
+    """
+    goal_fixtures = {gr.fixture_name for gr in resolve_goal_regions(graph) if gr.fixture_name}
+    out: list[FixtureNode] = []
+    for node in graph.nodes.values():
+        if not isinstance(node, FixtureNode):
+            continue
+        if node.init_x is None or node.init_y is None:
+            continue
+        if node.instance_name in goal_fixtures:
+            continue
+        hx, hy = _fixture_placement_half(node.object_class)
+        if hx <= 0.0 or hy <= 0.0:
+            continue
+        out.append(node)
+    out.sort(key=lambda f: f.instance_name)
+    return out
+
+
+def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list[_DistractorSlot]:
+    """Assign each distractor slot to a support (table or a non-goal fixture).
+
+    Round-robin over ``[table] + assignable fixtures`` so distractors spread
+    realistically across the table and the scene's fixtures (stove / cabinet /
+    rack) while never landing on the goal fixture. Pure function of plan+graph.
+    """
+    n = plan.distractor_budget
+    if n <= 0:
+        return []
+    pool = plan.distractor_classes or []
+    fixtures = _assignable_fixtures(plan, graph)
+    # supports[0] is the table (surface_class=None); the rest are fixtures.
+    supports: list[FixtureNode | None] = [None, *fixtures]
+    slots: list[_DistractorSlot] = []
+    for i in range(n):
+        support = supports[i % len(supports)]
+        if support is None:
+            surface_class: str | None = None
+            fixture_name: str | None = None
+            x_lo, x_hi = -_SAFE_X, _SAFE_X
+            y_lo, y_hi = -_SAFE_Y, _SAFE_Y
+        else:
+            surface_class = support.object_class or None
+            fixture_name = support.instance_name
+            hx, hy = _fixture_placement_half(support.object_class)
+            x_lo, x_hi = float(support.init_x) - hx, float(support.init_x) + hx
+            y_lo, y_hi = float(support.init_y) - hy, float(support.init_y) + hy
+        zs = [surface_spawn_z(TABLE_SURFACE_Z, c, surface_class) for c in pool] or [
+            surface_spawn_z(TABLE_SURFACE_Z, "distractor", surface_class)
+        ]
+        slots.append(
+            _DistractorSlot(
+                index=i,
+                surface_class=surface_class,
+                fixture_name=fixture_name,
+                x_lo=x_lo,
+                x_hi=x_hi,
+                y_lo=y_lo,
+                y_hi=y_hi,
+                z_lo=min(zs),
+                z_hi=max(zs),
+            )
+        )
+    return slots
+
+
 def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
-    del graph
     if plan.distractor_budget <= 0 or "distractor" not in plan.active_axes:
         return ""
     classes = plan.distractor_classes or []
     n = plan.distractor_budget
+    slots = _distractor_slots(plan, graph)
     lines = [
-        "# Distractor objects",
+        "# Distractor objects (Fix 2: each slot assigned to a measured support —",
+        "# the table or a non-goal fixture — with a resolved per-(class, surface)",
+        "# spawn z so injected z == settled z).",
         f"param n_distractors = DiscreteRange(1, {n})",
         "_n_distractors = globalParameters.n_distractors",
     ]
-    if classes:
-        cls_str = ", ".join(f'"{c}"' for c in classes)
-        lines.append(f"_distractor_pool = [{cls_str}]")
-    for i in range(n):
+    for slot in slots:
+        i = slot.index
+        support_desc = slot.fixture_name or "table"
+        lines.append(f"# distractor_{i} -> {support_desc}")
         if classes:
-            lines.append(f"param distractor_{i}_class = Uniform(*_distractor_pool)")
-        # Scenic 3: specifiers are comma-separated; libero_name is the declared property
+            # Correlated (class, resolved_spawn_z) pairs: the chosen class and
+            # its measured seating height on THIS support are drawn together
+            # from one sample (Scenic forbids branching on a random value).
+            pairs = ", ".join(
+                f'("{c}", {surface_spawn_z(TABLE_SURFACE_Z, c, slot.surface_class):.4f})'
+                for c in classes
+            )
+            lines.append(f"_distractor_{i}_choice = Uniform({pairs})")
+            # Expose the class STRING in params (the simulator reads
+            # ``params['distractor_i_class']`` to patch the BDDL); the spawn z is
+            # the second element of the same correlated sample.
+            lines.append(f"param distractor_{i}_class = _distractor_{i}_choice[0]")
+            z_expr = f"_distractor_{i}_choice[1]"
+        else:
+            z_expr = f"{surface_spawn_z(TABLE_SURFACE_Z, 'distractor', slot.surface_class):.4f}"
+        pos_spec = (
+            f"at Vector(Range({slot.x_lo:.4f}, {slot.x_hi:.4f}), "
+            f"Range({slot.y_lo:.4f}, {slot.y_hi:.4f}), {z_expr})"
+        )
         specifiers = [
-            "in SAFE_REGION",
+            pos_spec,
             f'with libero_name "distractor_{i}"',
             "with width 0.08",
             "with length 0.08",
@@ -864,6 +1020,19 @@ def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         ]
         if classes:
             specifiers.append(f"with asset_class globalParameters.distractor_{i}_class")
+        # Emit the assigned support-surface class so the simulator resolves the
+        # SAME per-(class, surface) spawn z the renderer used above (lockstep).
+        # Empty/absent → the default workspace table.
+        if slot.surface_class:
+            specifiers.append(f'with support_surface_class "{slot.surface_class}"')
+        # For a fixture-assigned distractor, declare the fixture as its support
+        # parent so the simulator's settled-position validator treats the
+        # intentional distractor↔fixture resting contact as expected (it skips
+        # contacts between an object and its declared support parent) instead of
+        # rejecting the sample. Table-assigned distractors have no support
+        # parent (their table contact is already whitelisted).
+        if slot.fixture_name:
+            specifiers.append(f'with support_parent_name "{slot.fixture_name}"')
         lines.append(f"distractor_{i} = new LIBEROObject " + ", ".join(specifiers))
     lines.append("")
     return "\n".join(lines)
@@ -1053,31 +1222,29 @@ def _render_robot_clearance(
 
     # Distractors (guarded by the active-count gate).
     if plan.distractor_budget > 0 and "distractor" in plan.active_axes:
-        dz_lo = footprint.table_world_z
-        dz_hi = footprint.table_world_z + 0.08
-        # FV SMT Finding G: the simulator instantiates each distractor at its
-        # world settle z (surface_spawn_z ~= 0.92), NOT the Scenic SAFE_REGION
-        # TABLE_Z (~0.82). Emitting `distractor_{i}.position.z` (the Scenic value)
-        # into the robot<->distractor z-term guarded a phantom ~100 mm below
-        # reality. Distractors rest on the table (surface_class=None) and their
-        # class is sampled at runtime, so emit the canonical-distractor world
-        # settle z as a constant; the static z-prune band [table_world_z, +0.08]
-        # bounds the residual per-class variation. The constraint variable and the
-        # prune band now live in the same (world) frame the simulator uses.
-        dz_world = surface_spawn_z(TABLE_SURFACE_Z, "distractor", None)
-        for i in range(plan.distractor_budget):
+        # Fix 2: each distractor is assigned to a measured support and emitted
+        # ``at Vector(..., resolved_spawn_z)``, so ``distractor_{i}.position.z``
+        # now equals the world settle z the simulator uses (same
+        # ``surface_spawn_z``). Reference it directly instead of a single
+        # canonical constant — a distractor resting on a fixture sits ~10 cm
+        # higher than one on the table, and a single constant z would mis-guard
+        # the robot↔distractor clause for fixture-assigned slots. The static
+        # z-prune band is the slot's per-pool spawn-z range padded by the
+        # distractor half-height.
+        for slot in _distractor_slots(plan, graph):
+            i = slot.index
             guard = f"(_n_distractors <= {i}) or "
             targets.append(
                 (
                     guard,
                     f"distractor_{i}.position.x",
                     f"distractor_{i}.position.y",
-                    f"{dz_world:.4f}",
-                    0.04,
-                    0.04,
-                    0.04,
-                    dz_lo,
-                    dz_hi,
+                    f"distractor_{i}.position.z",
+                    _DISTRACTOR_HALF,
+                    _DISTRACTOR_HALF,
+                    _DISTRACTOR_HALF,
+                    slot.z_lo - _DISTRACTOR_HALF,
+                    slot.z_hi + _DISTRACTOR_HALF,
                 )
             )
 
@@ -1281,31 +1448,25 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         lines.append("")
         lines.append('param anti_trivialization = "active"')
 
-    # Distractor clearance (fixed small margin — distractors are intentionally small).
-    # Distractors do not currently carry a PositionPlan with a declared support
-    # relation, so ``_should_emit_fixture_clearance`` for a synthetic
-    # distractor var would always return True; we keep the existing
-    # distractor-vs-fixture loop unconditional but wire it through the
-    # helper to remain forward-compatible if the planner is later extended
-    # to put distractors on a fixture.
+    # Distractor clearance. Under Fix 2 (option i) each distractor is assigned a
+    # support — the table or a specific non-goal fixture — and is constrained to
+    # rest ON it (its (x, y) range is the support footprint). So the distractor↔
+    # fixture clearance must SKIP the distractor's *assigned* fixture (the
+    # placement is intentional and the exclusion would be unsatisfiable), while
+    # keeping the exclusion against every OTHER fixture. Fix 1 adds a goal-region
+    # exclusion so no distractor blocks the goal object's required footprint.
     if plan.distractor_budget > 0 and "distractor" in plan.active_axes:
-        distractor_dims = (0.08, 0.08, 0.08)
+        distractor_dims = (2 * _DISTRACTOR_HALF, 2 * _DISTRACTOR_HALF, 2 * _DISTRACTOR_HALF)
         # Diagonal-radius clearance between two AABBs of equal half-extent h
         # is 2 * sqrt(2) * h ≈ 2.828 h. For h = 0.04 m this is ≈ 0.1131 m.
-        # The previous 0.06 threshold was the *axis-aligned* sum of half-
-        # widths only; two distractors aligned diagonally could satisfy
-        # `distance > 0.06` while their AABBs still overlapped on both axes.
         _DISTRACTOR_PAIR_CLEARANCE = math.sqrt(distractor_dims[0] ** 2 + distractor_dims[1] ** 2)
+        slots = _distractor_slots(plan, graph)
+        assigned_fixture = {s.index: s.fixture_name for s in slots}
         for i in range(plan.distractor_budget):
             d_var = f"distractor_{i}"
-            # Distractor↔object clearance: SAT-correct per-axis AABB OR-form,
-            # the same fix PR #16 applied to the fixture pairs. The previous
-            # ``distance from d to obj > 0.13`` was the radial point-distance
-            # bug family — a hardcoded scalar that both over-constrains along
-            # the axes and under-constrains on the diagonal, and ignored each
-            # object's measured footprint entirely. Use the measured object
-            # dims (NOT a hardcoded 0.13): two AABBs are non-overlapping iff
-            # their projections are disjoint on x OR y.
+            # Distractor↔object clearance: SAT-correct per-axis AABB OR-form.
+            # Use the measured object dims (NOT a hardcoded scalar): two AABBs
+            # are non-overlapping iff their projections are disjoint on x OR y.
             for var, dims, _n, _s in obj_info:
                 dx_min, dy_min = _footprint_clearance_aabb(distractor_dims, dims)
                 lines.append(
@@ -1325,22 +1486,46 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
                     continue
                 if fnode.init_x is None or fnode.init_y is None:
                     continue
+                # Skip the fixture this distractor is intentionally resting ON.
+                # Emitting a non-overlap clearance against the assigned support
+                # would carve out a measure-zero feasible region (the distractor
+                # IS inside that footprint by construction).
+                if assigned_fixture.get(i) == fnode.instance_name:
+                    continue
                 fvar = _to_var(fnode.instance_name)
-                # Distractors are always Scenic-sampled (they have no BDDL
-                # canonical position) and currently have no support relations,
-                # so the helper trivially returns True today.  Routing
-                # through the helper keeps a future planner extension
-                # (e.g., distractors-on-fixtures) automatically correct.
                 if not _should_emit_fixture_clearance(d_var, True, fvar, support_relations):
                     continue
                 fdims = _fixture_dims(fnode.object_class)
-                # SAT-correct AABB OR-form (see object↔fixture comment block
-                # above and rca/stage4_c1_addendum_10_task_footprint.md).
+                # SAT-correct AABB OR-form (see object↔fixture comment block above).
                 dx_min, dy_min = _footprint_clearance_aabb(fdims, distractor_dims)
                 lines.append(
                     f"require (_n_distractors <= {i}) "
                     f"or (abs({d_var}.position.x - {fvar}.position.x) > {dx_min:.4f}) "
                     f"or (abs({d_var}.position.y - {fvar}.position.y) > {dy_min:.4f})"
+                )
+
+        # Fix 1 — goal-feasibility: no distractor may occupy a goal-relevant
+        # region. A distractor in the place the goal object must end up (e.g. on
+        # the stove burner for ``On(bowl, flat_stove_1_cook_region)``) makes the
+        # task physically unsolvable. For each goal region we keep every
+        # distractor's footprint outside the region INFLATED by the goal
+        # object's footprint, so the goal object — placed at the region centre —
+        # always has a clear, non-overlapping spot (SAT-correct AABB OR-form).
+        goal_regions = resolve_goal_regions(graph)
+        if goal_regions:
+            lines.append(
+                "# Goal-feasibility (Fix 1): distractor must not block the goal object's"
+            )
+            lines.append("# required final footprint at any goal-relevant region.")
+        for gr in goal_regions:
+            cx_dx = gr.half_x + gr.obj_half_x + _DISTRACTOR_HALF
+            cx_dy = gr.half_y + gr.obj_half_y + _DISTRACTOR_HALF
+            for i in range(plan.distractor_budget):
+                d_var = f"distractor_{i}"
+                lines.append(
+                    f"require (_n_distractors <= {i}) "
+                    f"or (abs({d_var}.position.x - {gr.cx:.4f}) > {cx_dx:.4f}) "
+                    f"or (abs({d_var}.position.y - {gr.cy:.4f}) > {cx_dy:.4f})"
                 )
 
     # Robot link clearance (Fix 1): put the perturbed robot init pose into the

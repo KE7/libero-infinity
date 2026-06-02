@@ -268,6 +268,296 @@ def measure_variants() -> dict:
     }
 
 
+# Distractor-on-fixture measurement (Fix 2, option i)
+# -----------------------------------------------------
+# Per-(distractor_class, fixture_class) settled spawn clearance for distractors
+# that rest ON a scene fixture (stove burner, cabinet top, wine-rack shelf).
+# The clearance is MEASURED from a real settle (ground truth) and cross-checked,
+# loudly, against the fixture's actual top SURFACE the distractor contacts:
+#
+#   resting_center_z (settled body_xpos[2])  ==  contact_surface_z + body_origin_offset
+#
+# Both terms are measured from geometry. ``contact_surface_z`` is the world z of
+# the distractor↔fixture contact point (NOT the fixture's max geom z — a wine
+# rack's frame extends well above the shelf objects rest on, so max-geom-z would
+# be the wrong "top"). ``body_origin_offset`` is ``settled body z - distractor
+# bottom z`` (the body origin's height above its own lowest point at rest, which
+# is the frame-correct "half height" that does NOT assume the body origin is the
+# geometric centre — directly guarding the frame-confusion failure class). The
+# identity therefore reduces to the physical truth ``distractor_bottom_z ==
+# contact_surface_z`` (object bottom sits on the surface), asserted within
+# ``_FIXTURE_SETTLE_TOL`` per sample, or we fail loudly.
+
+# Tolerance (m) for the frame/stability assertion: the settled distractor's
+# bottom face must sit on the fixture geom it contacts. This is the frame-
+# correct restatement of the EA's "resting_center_z = fixture_top + half_height"
+# — with half_height = (settled center − settled bottom) measured AT REST, so it
+# makes no assumption that the body origin is the geometric centre (the exact
+# 40/43-asset frame-confusion class). A frame-conversion error manifests as a
+# ≥cm-scale gap; the bound is set generously enough to also tolerate irregular-
+# footprint distractors (e.g. a bowl_drainer / desk_caddy whose AABB extends
+# below its contact feet by a few cm). The precise injected==settled guarantee
+# is independently verified by the smoke's 5 mm pose_tolerance.
+_FIXTURE_SETTLE_TOL = 0.05
+
+# Distractor-on-fixture clearance must stay in a plausible physical band; a
+# sample outside it means the object bounced off the fixture rather than resting.
+_FIXTURE_CLEARANCE_MAX = 0.60
+
+_DISTRACTOR_FIXTURE_SEEDS = 16
+
+
+def _geom_world_aabb(sim, geom_id: int) -> tuple[float, float, float, float, float, float]:
+    """World-frame AABB (xmin,xmax,ymin,ymax,zmin,zmax) of a single geom."""
+    import numpy as np
+
+    model = sim.model
+    raw = model._model  # noqa: SLF001 — mujoco MjModel for geom_aabb
+    aabb = raw.geom_aabb[geom_id]
+    c_local = np.asarray(aabb[:3], dtype=float)
+    half = np.asarray(aabb[3:], dtype=float)
+    xpos = np.asarray(sim.data.geom_xpos[geom_id], dtype=float)
+    rot = np.asarray(sim.data.geom_xmat[geom_id], dtype=float).reshape(3, 3)
+    center = xpos + rot @ c_local
+    ext = np.array([sum(abs(rot[ax, k]) * half[k] for k in range(3)) for ax in range(3)])
+    lo = center - ext
+    hi = center + ext
+    return lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]
+
+
+def _body_world_aabb(sim, body_id: int):
+    """Union world AABB over all geoms of ``body_id``; None if it has none."""
+    model = sim.model
+    boxes = [
+        _geom_world_aabb(sim, g) for g in range(model.ngeom) if model.geom_bodyid[g] == body_id
+    ]
+    if not boxes:
+        return None
+    return (
+        min(b[0] for b in boxes),
+        max(b[1] for b in boxes),
+        min(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+        min(b[4] for b in boxes),
+        max(b[5] for b in boxes),
+    )
+
+
+def _fixture_body_ids(sim, fixture_instance: str) -> list[int]:
+    """Body ids of every body belonging to ``fixture_instance`` (subtree by name)."""
+    model = sim.model
+    ids: list[int] = []
+    for b in range(model.nbody):
+        nm = model.body_id2name(b) or ""
+        if nm == fixture_instance or nm.startswith(fixture_instance + "_"):
+            ids.append(b)
+    return ids
+
+
+def _fixture_world_aabb(sim, fixture_instance: str):
+    """Union world AABB over all geoms of every body of ``fixture_instance``."""
+    boxes = [
+        _body_world_aabb(sim, b) for b in _fixture_body_ids(sim, fixture_instance)
+    ]
+    boxes = [b for b in boxes if b is not None]
+    if not boxes:
+        return None
+    return (
+        min(b[0] for b in boxes),
+        max(b[1] for b in boxes),
+        min(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+        min(b[4] for b in boxes),
+        max(b[5] for b in boxes),
+    )
+
+
+def _distractor_fixture_contact_tops(
+    sim, distractor_bid: int, fixture_instance: str
+) -> list[float]:
+    """World-AABB top z of every fixture geom the distractor is in contact with.
+
+    Resolves the rest surface for multi-level fixtures (a wine rack's shelf vs
+    its post tops) by looking at the SPECIFIC geom the distractor touches, then
+    taking that geom's world-AABB top — the geometry the object sits on. We use
+    the geom AABB (which is reliable) rather than ``contact.pos`` (degenerate in
+    this robosuite/mujoco binding — it returns a broadcast scalar). Returns an
+    empty list when the distractor touches no fixture geom (floated / landed
+    elsewhere — not a valid on-fixture sample).
+    """
+    model = sim.model
+    data = sim.data
+    obj_geoms = frozenset(g for g in range(model.ngeom) if model.geom_bodyid[g] == distractor_bid)
+    fixture_bodies = frozenset(_fixture_body_ids(sim, fixture_instance))
+    tops: list[float] = []
+    for c in range(int(data.ncon)):
+        con = data.contact[c]
+        g1, g2 = int(con.geom1), int(con.geom2)
+        a_obj, b_obj = g1 in obj_geoms, g2 in obj_geoms
+        if a_obj == b_obj:
+            continue  # neither or both are the distractor → not an obj↔other pair
+        other = g2 if a_obj else g1
+        if model.geom_bodyid[other] not in fixture_bodies:
+            continue
+        tops.append(_geom_world_aabb(sim, other)[5])
+    return tops
+
+
+def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dict, dict]:
+    """Measure per-(distractor_class, fixture_class) on-fixture spawn clearance.
+
+    Returns ``(variant_rows, fixture_geometry)``:
+      * ``variant_rows`` — ``{"<class>|<fixture_class>": clearance}`` to merge
+        into ``spawn_clearances_variants.json`` (clearance = settled body z -
+        TABLE_Z).
+      * ``fixture_geometry`` — ``{fixture_class: {"footprint": [w,l], "top_z":
+        rest_top_above_table, "height": h}}`` for ``data/fixture_geometry.json``.
+        ``top_z`` is the REST surface (contact) height above the table — the
+        surface a distractor actually settles onto — and ``footprint``/``height``
+        are the measured geom-AABB extents (used for clearance exclusion).
+
+    Raises loudly if any settled distractor's bottom face does not coincide with
+    its fixture contact surface within ``_FIXTURE_SETTLE_TOL`` (frame error).
+    """
+
+    from libero_infinity.compiler import compile_task_to_scenario
+    from libero_infinity.gym_env import make_env
+    from libero_infinity.simulator import TABLE_Z
+    from libero_infinity.task_config import TaskConfig
+    from libero_infinity.validation.sweep import discover_all_tasks, resolve_task_path
+
+    avail = set(discover_all_tasks())
+    samples: dict[str, list[float]] = {}
+    fixture_footprints: dict[str, list[tuple[float, float, float]]] = {}
+    fixture_rest_tops: dict[str, list[float]] = {}
+    frame_offenders: list[str] = []
+    n_contact_miss = 0
+
+    for task_rel in MEASURE_TASKS:
+        if task_rel not in avail:
+            continue
+        bddl = str(resolve_task_path(task_rel))
+        for seed in range(_DISTRACTOR_FIXTURE_SEEDS):
+            try:
+                cfg = TaskConfig.from_bddl(bddl)
+                random.seed(seed)
+                scenario = compile_task_to_scenario(cfg, "distractor")
+                scene, _ = scenario.generate(maxIterations=8000)
+                env = make_env(scene, bddl_path=bddl)
+                env.reset()
+            except Exception as exc:  # noqa: BLE001 — measurement noise, recorded
+                print(f"# build failed {task_rel} [seed {seed}]: {exc}")
+                continue
+            sim = env._sim.libero_env.env.sim  # noqa: SLF001
+            active = getattr(env._sim, "_active_distractor_names", set())  # noqa: SLF001
+            for o in scene.objects:
+                nm = getattr(o, "libero_name", "")
+                if not nm.startswith("distractor_") or nm not in active:
+                    continue
+                surface_class = getattr(o, "support_surface_class", "") or ""
+                fixture_inst = getattr(o, "support_parent_name", "") or ""
+                if not surface_class or not fixture_inst:
+                    continue  # table-assigned distractor — measured elsewhere
+                cls = getattr(o, "asset_class", "") or ""
+                if not cls:
+                    continue
+                bid = None
+                for cand in (nm, nm + "_main"):
+                    try:
+                        bid = sim.model.body_name2id(cand)
+                        break
+                    except Exception:
+                        continue
+                if bid is None:
+                    continue
+                body_z = float(sim.data.body_xpos[bid][2])
+                box = _body_world_aabb(sim, bid)
+                tops = _distractor_fixture_contact_tops(sim, bid, fixture_inst)
+                if box is None or not tops:
+                    n_contact_miss += 1
+                    continue
+                bottom_z = box[4]
+                clearance = body_z - TABLE_Z
+                if not (0.0 <= clearance <= _FIXTURE_CLEARANCE_MAX):
+                    continue
+                # Rest surface: the top of the fixture geom the distractor sits on
+                # — the contacted geom whose top is nearest the distractor's bottom
+                # face (a side contact at another height is not the support).
+                nearest_top = min(tops, key=lambda t: abs(t - bottom_z))
+                rest_top_above_table = nearest_top - TABLE_Z
+                # Loud frame/stability cross-check (orientation-invariant): the
+                # distractor's settled bottom face must sit on the contacted
+                # fixture-geom top. settled_center = nearest_top + (center −
+                # bottom), i.e. the EA's fixture_top + half_height with the
+                # half-height MEASURED at rest (no body-origin-is-centre
+                # assumption). A frame error shows as a ≥cm gap here.
+                if abs(bottom_z - nearest_top) > _FIXTURE_SETTLE_TOL:
+                    body_half_above_bottom = body_z - bottom_z
+                    frame_offenders.append(
+                        f"{cls}|{surface_class} ({nm}@{task_rel} seed {seed}): "
+                        f"bottom_z={bottom_z:.4f} nearest_contact_geom_top={nearest_top:.4f} "
+                        f"(settled_center={body_z:.4f}, half_above_bottom="
+                        f"{body_half_above_bottom:.4f}) "
+                        f"|Δ|={abs(bottom_z - nearest_top) * 1000:.1f}mm > "
+                        f"{_FIXTURE_SETTLE_TOL * 1000:.0f}mm"
+                    )
+                samples.setdefault(f"{cls}|{surface_class}", []).append(round(clearance, 5))
+                fixture_rest_tops.setdefault(surface_class, []).append(
+                    round(rest_top_above_table, 5)
+                )
+                faabb = _fixture_world_aabb(sim, fixture_inst)
+                if faabb is not None:
+                    fixture_footprints.setdefault(surface_class, []).append(
+                        (
+                            round(faabb[1] - faabb[0], 5),
+                            round(faabb[3] - faabb[2], 5),
+                            round(faabb[5] - faabb[4], 5),
+                        )
+                    )
+            env.close()
+
+    if frame_offenders:
+        raise AssertionError(
+            "Distractor-on-fixture frame/stability check FAILED — a settled "
+            "distractor's bottom face must coincide with its fixture contact "
+            f"surface within {_FIXTURE_SETTLE_TOL * 1000:.0f} mm (a larger gap "
+            "means a frame-conversion error or an unstable settle):\n  "
+            + "\n  ".join(frame_offenders[:40])
+        )
+
+    variant_rows = {k: round(statistics.median(v), 5) for k, v in sorted(samples.items())}
+    fixture_geometry: dict[str, dict] = {}
+    for fclass in sorted(set(fixture_footprints) | set(fixture_rest_tops)):
+        fps = fixture_footprints.get(fclass, [])
+        tops = fixture_rest_tops.get(fclass, [])
+        entry: dict = {}
+        if fps:
+            entry["footprint"] = [
+                round(statistics.median(p[0] for p in fps), 5),
+                round(statistics.median(p[1] for p in fps), 5),
+            ]
+            entry["height"] = round(statistics.median(p[2] for p in fps), 5)
+        if tops:
+            entry["top_z"] = round(statistics.median(tops), 5)
+        if entry:
+            fixture_geometry[fclass] = entry
+
+    print(
+        f"\n# distractor-on-fixture: {len(variant_rows)} (class|fixture) rows, "
+        f"{len(fixture_geometry)} fixture classes, {n_contact_miss} contact-miss samples skipped"
+    )
+    for k, v in variant_rows.items():
+        cls, _, fclass = k.partition("|")
+        on_table = table_clearances.get(cls)
+        top = fixture_geometry.get(fclass, {}).get("top_z")
+        chk = ""
+        if on_table is not None and top is not None:
+            analytic = top + on_table
+            chk = f"  analytic(top+table)={analytic:.4f} Δ={abs(v - analytic) * 1000:.1f}mm"
+        print(f"  {k:44} {v:.4f} (n={len(samples[k])}){chk}")
+    return variant_rows, fixture_geometry
+
+
 def measure() -> dict:
     from libero_infinity.compiler import compile_task_to_scenario
     from libero_infinity.gym_env import make_env
@@ -348,10 +638,56 @@ def measure() -> dict:
     }
 
 
+def _run_distractor_fixtures_only() -> None:
+    """Measure ONLY the per-(distractor, fixture) clearances + fixture geometry
+    and merge them into the existing data files, leaving the already-validated
+    table-resting and object-axis variant rows untouched.
+
+    Used to extend the landed (table) measurement with the Fix 2 on-fixture
+    rows without re-running (and risking perturbing) the validated table/object
+    measurement.
+    """
+    from libero_infinity.simulator import TABLE_Z
+
+    table_path = pathlib.Path("src/libero_infinity/data/spawn_clearances.json")
+    table_clearances = json.loads(table_path.read_text()).get("clearances", {})
+
+    dist_rows, fixture_geometry = measure_distractor_fixtures(table_clearances)
+
+    vdest = pathlib.Path("src/libero_infinity/data/spawn_clearances_variants.json")
+    vdata = json.loads(vdest.read_text())
+    vdata["clearances"].update(dist_rows)
+    vdata["clearances"] = {k: vdata["clearances"][k] for k in sorted(vdata["clearances"])}
+    vdata["_meta"]["n_distractor_fixture_rows"] = len(dist_rows)
+    vdest.write_text(json.dumps(vdata, indent=2, sort_keys=False) + "\n")
+    print(f"\nMerged {len(dist_rows)} (class|fixture) rows into {vdest}")
+
+    fg_out = {
+        "_meta": {
+            "description": "Measured fixture geometry. footprint=[w,l] and height "
+            "are the geom-AABB world extents; top_z is the REST surface height "
+            "above TABLE_Z (the distractor↔fixture contact surface, NOT max geom "
+            "z). Generated by scripts/measure_spawn_clearances.py "
+            "(measure_distractor_fixtures).",
+            "table_z": TABLE_Z,
+        },
+        "fixtures": fixture_geometry,
+    }
+    fgdest = pathlib.Path("src/libero_infinity/data/fixture_geometry.json")
+    fgdest.write_text(json.dumps(fg_out, indent=2, sort_keys=True) + "\n")
+    print(f"Wrote {fgdest} with {len(fixture_geometry)} fixture classes:")
+    for fclass, g in sorted(fixture_geometry.items()):
+        print(f"  {fclass:24} {g}")
+
+
 if __name__ == "__main__":
     import sys
 
     from libero_infinity.simulator import TABLE_Z
+
+    if "--distractor-fixtures-only" in sys.argv:
+        _run_distractor_fixtures_only()
+        raise SystemExit(0)
 
     out = measure()
     out["_meta"]["table_z"] = TABLE_Z
@@ -370,8 +706,37 @@ if __name__ == "__main__":
         # if a non-table-resting sample leaked past the physical-support guard.
         _assert_table_rows_match_canonical(vout["clearances"], out["clearances"])
 
+        # Fix 2: per-(distractor_class, fixture_class) on-fixture clearances +
+        # measured fixture geometry. Merged into the same variant table so
+        # ``asset_metadata.surface_spawn_z`` resolves an on-fixture distractor's
+        # seating z exactly (renderer/simulator lockstep). Fails loudly if any
+        # settled distractor's bottom face does not sit on its fixture contact
+        # surface (frame error).
+        if "--no-distractor-fixtures" not in sys.argv:
+            dist_rows, fixture_geometry = measure_distractor_fixtures(out["clearances"])
+            vout["clearances"].update(dist_rows)
+            vout["clearances"] = {k: vout["clearances"][k] for k in sorted(vout["clearances"])}
+            vout["_meta"]["n_distractor_fixture_rows"] = len(dist_rows)
+
+            fg_out = {
+                "_meta": {
+                    "description": "Measured fixture geometry. footprint=[w,l] and "
+                    "height are the geom-AABB world extents; top_z is the REST "
+                    "surface height above TABLE_Z (the distractor↔fixture contact "
+                    "surface, NOT max geom z). Generated by "
+                    "scripts/measure_spawn_clearances.py (measure_distractor_fixtures).",
+                    "table_z": TABLE_Z,
+                },
+                "fixtures": fixture_geometry,
+            }
+            fgdest = pathlib.Path("src/libero_infinity/data/fixture_geometry.json")
+            fgdest.write_text(json.dumps(fg_out, indent=2, sort_keys=True) + "\n")
+            print(f"\nWrote {fgdest} with {len(fixture_geometry)} fixture classes:")
+            for fclass, g in sorted(fixture_geometry.items()):
+                print(f"  {fclass:24} {g}")
+
         vdest = pathlib.Path("src/libero_infinity/data/spawn_clearances_variants.json")
         vdest.write_text(json.dumps(vout, indent=2, sort_keys=False) + "\n")
         print(f"\nWrote {vdest} with {len(vout['clearances'])} (variant|surface) keys:")
         for key, v in vout["clearances"].items():
-            print(f"  {key:44} {v:.4f}  (n={vout['_meta']['n_samples'][key]})")
+            print(f"  {key:44} {v:.4f}  (n={vout['_meta']['n_samples'].get(key, '?')})")

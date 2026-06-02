@@ -135,26 +135,61 @@ def _default_clearance() -> float:
 DEFAULT_CLEARANCE: float = _default_clearance()
 
 
+# Workspace-table fixture classes — the arena tables objects rest on directly
+# (the TABLE_SURFACE_Z surface). A ``surface_class`` in this set is a *table*
+# (use the per-class / per-(class,table) clearance), whereas any other named
+# surface is an *elevated fixture* whose top sits ``fixture_top_z_above_table``
+# above the table — a distractor resting on it seats that much higher. Kept in
+# sync with ``ArticulationModel.root_workspace_fixtures``.
+_WORKSPACE_TABLE_CLASSES: frozenset[str] = frozenset(
+    {"table", "kitchen_table", "living_room_table", "study_table", "floor"}
+)
+
+
+def _is_fixture_surface(surface_class: str | None) -> bool:
+    """True iff ``surface_class`` names an elevated fixture (not a table).
+
+    A fixture surface is one that has known geometry (measured or fallback) and
+    is not one of the workspace-table classes.
+    """
+    if not surface_class or surface_class in _WORKSPACE_TABLE_CLASSES:
+        return False
+    return surface_class in FIXTURE_GEOMETRY or surface_class in _FIXTURE_DIMS_FALLBACK
+
+
 def spawn_clearance(asset_class: str, surface_class: str | None = None) -> float:
-    """Return the resting body-origin height (m) above the workspace surface.
+    """Return the resting body-origin height (m) above ``TABLE_SURFACE_Z``.
 
     Resolution order (most specific first), so an object-axis variant carries
     its own measured seating height on the *actual* support surface:
 
     1. The measured per-(variant, surface) clearance, when ``surface_class`` is
-       given and the pair was measured. This captures both Finding-A sub-causes:
-       geometry-different variants seat at a different height, and the *same*
-       class seats differently on different surfaces (stove vs cabinet top).
-    2. The measured per-canonical-class clearance (legacy table-resting table).
-    3. The median measured clearance (:data:`DEFAULT_CLEARANCE`) — a data-derived
+       given and the pair was measured. This captures both Finding-A sub-causes
+       (geometry-different variants and surface-dependent seating) AND the
+       measured per-(distractor, fixture) entries produced by Fix 2.
+    2. **On-fixture analytic** (Fix 2): when ``surface_class`` is an elevated
+       fixture not yet in the measured table, the distractor rests on the
+       fixture's top face, so its body origin sits
+       ``fixture_top_z_above_table(surface_class)`` higher than it would on the
+       table, plus its own table-resting body-origin offset
+       (``spawn_clearance(asset_class, None)``). Both terms are measured
+       geometry (or a conservative fallback), so the renderer and simulator
+       resolve the SAME on-fixture z even before the per-pair settle has been
+       recorded — no hardcoded fixture heights, no chicken-and-egg with the
+       measured table. The settle measurement validates this analytic value and,
+       once recorded, supersedes it via rule 1.
+    3. The measured per-canonical-class clearance (legacy table-resting table).
+    4. The median measured clearance (:data:`DEFAULT_CLEARANCE`) — a data-derived
        prior, NOT the discredited bounding-box approximation — so the function is
-       total for every (class, surface), including unmeasured OOD variants and
-       distractor-pool classes.
+       total for every (class, surface).
     """
     if surface_class is not None:
         measured = VARIANT_CLEARANCES.get(_variant_key(asset_class, surface_class))
         if measured is not None:
             return max(float(measured), _MIN_CLEARANCE)
+        if _is_fixture_surface(surface_class):
+            on_table = spawn_clearance(asset_class, None)
+            return max(fixture_top_z_above_table(surface_class) + on_table, _MIN_CLEARANCE)
     measured = SPAWN_CLEARANCES.get(asset_class)
     if measured is not None:
         return max(float(measured), _MIN_CLEARANCE)
@@ -181,3 +216,108 @@ def is_measured(asset_class: str, surface_class: str | None = None) -> bool:
     if surface_class is not None and _variant_key(asset_class, surface_class) in VARIANT_CLEARANCES:
         return True
     return asset_class in SPAWN_CLEARANCES
+
+
+# ---------------------------------------------------------------------------
+# Fixture geometry — measured footprints and top-surface heights
+# ---------------------------------------------------------------------------
+#
+# Under option (i) a distractor can be placed to rest ON a scene fixture (stove
+# burner, cabinet top, wine-rack shelf). Two pieces of fixture geometry are then
+# needed and must be MEASURED, not hand-guessed:
+#
+#   * footprint (width, length) — the xy area the distractor's sampled (x, y)
+#     must stay within so it actually lands on the fixture top. The previously
+#     hand-coded ``_FIXTURE_DIMS`` in the renderer under-estimated several
+#     fixtures (which is exactly why distractors slipped onto fixtures
+#     unexpectedly); the measured table replaces them.
+#   * top_z (above ``TABLE_SURFACE_Z``) — the height of the fixture's top face.
+#     The per-(distractor, fixture) spawn clearance is ``top_z + <body-origin
+#     offset>`` (see ``scripts/measure_spawn_clearances.py``), so the renderer
+#     and simulator inject the distractor exactly where it settles.
+#
+# Both are produced by ``scripts/measure_spawn_clearances.py`` into
+# ``data/fixture_geometry.json``. Until that file exists the conservative
+# fallback below keeps the renderer total (matching the legacy hand-coded
+# values), and ``surface_spawn_z`` falls back to the median prior — no crash.
+
+# Conservative fallback (width, length, height) in metres — used only when the
+# measured ``fixture_geometry.json`` is absent. Mirrors the legacy renderer
+# ``_FIXTURE_DIMS`` so behaviour is unchanged before the generator runs.
+_FIXTURE_DIMS_FALLBACK: dict[str, tuple[float, float, float]] = {
+    "wooden_cabinet": (0.30, 0.30, 0.24),
+    "white_cabinet": (0.30, 0.30, 0.24),
+    "flat_stove": (0.36, 0.20, 0.08),
+    "wine_rack": (0.18, 0.12, 0.20),
+    "microwave": (0.24, 0.18, 0.16),
+    "bowl_drainer": (0.18, 0.14, 0.08),
+    "desk_caddy": (0.14, 0.42, 0.22),
+    "wooden_two_layer_shelf": (0.33, 0.20, 0.21),
+    "table": (0.80, 0.60, 0.05),
+    "kitchen_table": (0.80, 0.60, 0.05),
+    "living_room_table": (0.55, 0.65, 0.05),
+    "study_table": (0.50, 0.58, 0.05),
+    "floor": (0.50, 0.55, 0.01),
+}
+_FIXTURE_DIM_DEFAULT: tuple[float, float, float] = (0.20, 0.18, 0.18)
+
+
+def _load_fixture_geometry() -> dict[str, dict]:
+    try:
+        raw = pkgutil.get_data("libero_infinity", "data/fixture_geometry.json")
+    except FileNotFoundError:
+        return {}
+    if raw is None:
+        return {}
+    data = json.loads(raw)
+    out: dict[str, dict] = {}
+    for k, v in data.get("fixtures", {}).items():
+        if isinstance(v, dict):
+            out[str(k)] = v
+    return out
+
+
+FIXTURE_GEOMETRY: dict[str, dict] = _load_fixture_geometry()
+
+
+def fixture_footprint(fixture_class: str | None) -> tuple[float, float]:
+    """Return the measured (width, length) xy footprint of a fixture class (m).
+
+    Falls back to the conservative legacy dimensions when the fixture is not in
+    the measured ``fixture_geometry.json`` table.
+    """
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is not None:
+        fp = geom.get("footprint")
+        if isinstance(fp, (list, tuple)) and len(fp) >= 2:
+            return float(fp[0]), float(fp[1])
+    dims = _FIXTURE_DIMS_FALLBACK.get(fixture_class or "", _FIXTURE_DIM_DEFAULT)
+    return dims[0], dims[1]
+
+
+def fixture_height(fixture_class: str | None) -> float:
+    """Return the measured z-extent (height, m) of a fixture class."""
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is not None and geom.get("height") is not None:
+        return float(geom["height"])
+    dims = _FIXTURE_DIMS_FALLBACK.get(fixture_class or "", _FIXTURE_DIM_DEFAULT)
+    return dims[2]
+
+
+def fixture_top_z_above_table(fixture_class: str | None) -> float:
+    """Return the fixture top-surface height above ``TABLE_SURFACE_Z`` (m).
+
+    This is the measured world-frame z of the fixture's top face minus the
+    table-surface constant — the surface a distractor settles onto. Falls back
+    to the fixture's height (i.e. assuming the fixture base sits at the table)
+    when no measured value is present.
+    """
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is not None and geom.get("top_z") is not None:
+        return float(geom["top_z"])
+    return fixture_height(fixture_class)
+
+
+def is_fixture_measured(fixture_class: str | None) -> bool:
+    """True iff ``fixture_class`` has measured geometry in the data table."""
+    return (fixture_class or "") in FIXTURE_GEOMETRY
