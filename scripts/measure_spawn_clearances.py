@@ -294,23 +294,68 @@ def measure_variants() -> dict:
 # contact_surface_z`` (object bottom sits on the surface), asserted within
 # ``_FIXTURE_SETTLE_TOL`` per sample, or we fail loudly.
 
-# Tolerance (m) for the frame/stability assertion: the settled distractor's
-# bottom face must sit on the fixture geom it contacts. This is the frame-
-# correct restatement of the EA's "resting_center_z = fixture_top + half_height"
-# — with half_height = (settled center − settled bottom) measured AT REST, so it
-# makes no assumption that the body origin is the geometric centre (the exact
-# 40/43-asset frame-confusion class). A frame-conversion error manifests as a
-# ≥cm-scale gap; the bound is set generously enough to also tolerate irregular-
-# footprint distractors (e.g. a bowl_drainer / desk_caddy whose AABB extends
-# below its contact feet by a few cm). The precise injected==settled guarantee
-# is independently verified by the smoke's 5 mm pose_tolerance.
-_FIXTURE_SETTLE_TOL = 0.05
+# Per-sample stability gate: RETIRED (validation_run2 RCA
+# `distractor_z_convergence.md`).
+#
+# The old gate asserted the settled distractor's AABB *bottom* sits on the
+# contacted fixture geom top within 50 mm. That silently assumes the body's AABB
+# bottom *is* its contact surface — FALSE for irregular open-bottom distractors:
+# a desk_caddy's open multi-compartment AABB hangs ~56 mm below its actual
+# contact feet, so the gate *excluded its stable settle*, and the sparse
+# surviving (atypical) sample under-stated the resting clearance by ~40 mm → the
+# renderer injected it that far too low → it penetrated the cabinet top and was
+# ejected (the "xy shove" Finding-B refuted).
+#
+# A live-stepping "is-it-quiescent?" replacement was tried and SEGFAULTS: the
+# irregular distractor↔cabinet contact set overflows MuJoCo's contact arena
+# (ncon = 5000) when stepped. So the gate is removed and its job is done two
+# stepping-free ways instead, exactly as the gate-free audit validated:
+#   * a per-sample admission of contact-existence + a physical clearance band
+#     (below), which already rejects floated / bounced samples; and
+#   * dominant-MODE aggregation over the pair's samples (``_dominant_mode``),
+#     which is robust to a lone atypical settle dragging the row — the row is the
+#     clearance the object rests at MOST often, i.e. the stable attractor the
+#     renderer's injection converges to.
+# The precise injected==settled guarantee remains independently verified by the
+# smoke's 5 mm pose_tolerance over the merged data (a residual frame error would
+# surface there). No tolerance was widened; the wrong criterion was removed.
+
+# A measured fixture row is rewritten only when it diverges from the stored row by
+# more than this (== the smoke's pose_tolerance). Rows within tolerance stay
+# byte-identical, so validated box / table / fixture rows are preserved by
+# construction and only genuinely-wrong rows are corrected.
+_POSE_TOLERANCE = 0.005
 
 # Distractor-on-fixture clearance must stay in a plausible physical band; a
 # sample outside it means the object bounced off the fixture rather than resting.
 _FIXTURE_CLEARANCE_MAX = 0.60
 
 _DISTRACTOR_FIXTURE_SEEDS = 16
+
+
+def _dominant_mode(values: list[float], *, bandwidth: float = 2 * _POSE_TOLERANCE) -> float:
+    """Median of the largest single-linkage cluster of settled clearances.
+
+    Robust to a lone atypical settle dragging the per-pair row. Irregular
+    distractors can produce an occasional off-mode sample; the dominant MODE is
+    the clearance the object rests at MOST often — the attractor the renderer's
+    injection converges to — so injected z == settled z for the common case. For
+    the tight (unimodal) box-distractor distributions the single cluster spans the
+    whole sample, so this reduces exactly to the median (no change / no regression).
+    """
+    vs = sorted(values)
+    if len(vs) <= 2:
+        return float(statistics.median(vs))
+    clusters: list[list[float]] = [[vs[0]]]
+    for x in vs[1:]:
+        if x - clusters[-1][-1] <= bandwidth:
+            clusters[-1].append(x)
+        else:
+            clusters.append([x])
+    # Largest cluster wins; ties → the tighter (smaller-spread) cluster, i.e. the
+    # more sharply-defined stable mode.
+    best = max(clusters, key=lambda c: (len(c), -(c[-1] - c[0])))
+    return float(statistics.median(best))
 
 
 def _geom_world_aabb(sim, geom_id: int) -> tuple[float, float, float, float, float, float]:
@@ -422,8 +467,11 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
         surface a distractor actually settles onto — and ``footprint``/``height``
         are the measured geom-AABB extents (used for clearance exclusion).
 
-    Raises loudly if any settled distractor's bottom face does not coincide with
-    its fixture contact surface within ``_FIXTURE_SETTLE_TOL`` (frame error).
+    Per-pair rows are the dominant settle MODE over contacted, in-band samples
+    (``_dominant_mode``); the retired AABB-bottom stability gate is gone (it
+    wrongly excluded irregular open-bottom distractors — see RCA
+    `distractor_z_convergence.md`). The injected==settled invariant is verified
+    independently by the smoke's 5 mm pose_tolerance.
     """
 
     from libero_infinity.compiler import compile_task_to_scenario
@@ -437,7 +485,6 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
     table_samples: dict[str, list[float]] = {}
     fixture_footprints: dict[str, list[tuple[float, float, float]]] = {}
     fixture_rest_tops: dict[str, list[float]] = {}
-    frame_offenders: list[str] = []
     n_contact_miss = 0
 
     for task_rel in MEASURE_TASKS:
@@ -508,35 +555,19 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
                 # face (a side contact at another height is not the support).
                 nearest_top = min(tops, key=lambda t: abs(t - bottom_z))
                 rest_top_above_table = nearest_top - TABLE_Z
-                # Loud frame/stability cross-check (orientation-invariant): the
-                # distractor's settled bottom face must sit on the contacted
-                # fixture-geom top. settled_center = nearest_top + (center −
-                # bottom), i.e. the EA's fixture_top + half_height with the
-                # half-height MEASURED at rest (no body-origin-is-centre
-                # assumption). A frame error shows as a ≥cm gap here.
-                #
-                # Convergence (validation_run2 RCA): this is a PER-SAMPLE
-                # stability gate, not a whole-run kill switch. A single distractor
-                # that settled askew on a fixture (an unstable settle, NOT a frame
-                # bug — the frame math is identical for every sample of a pair) must
-                # not abort a 45-min measurement. So we LOG the offender loudly and
-                # EXCLUDE that one sample from the pair's median rather than raising.
-                # This is per-sample scoping, not masking: the precise
-                # injected==settled frame guarantee is still enforced independently
-                # by the v4 smoke's 5 mm pose_tolerance over the merged data. A pair
-                # whose samples are ALL excluded simply produces no row and falls
-                # back to the analytic on-fixture z (asset_metadata rule 2).
-                if abs(bottom_z - nearest_top) > _FIXTURE_SETTLE_TOL:
-                    body_half_above_bottom = body_z - bottom_z
-                    frame_offenders.append(
-                        f"{cls}|{surface_class} ({nm}@{task_rel} seed {seed}): "
-                        f"bottom_z={bottom_z:.4f} nearest_contact_geom_top={nearest_top:.4f} "
-                        f"(settled_center={body_z:.4f}, half_above_bottom="
-                        f"{body_half_above_bottom:.4f}) "
-                        f"|Δ|={abs(bottom_z - nearest_top) * 1000:.1f}mm > "
-                        f"{_FIXTURE_SETTLE_TOL * 1000:.0f}mm"
-                    )
-                    continue  # unstable settle — exclude this sample, keep going
+                # Per-sample admission (validation_run2 RCA
+                # `distractor_z_convergence.md`): the sample is a valid on-fixture
+                # rest iff it is in fixture contact (``tops`` non-empty, checked
+                # above) and its clearance is in the physical band (checked above).
+                # The retired AABB-bottom-vs-contact-top stability gate wrongly
+                # excluded the stable settle of irregular open-bottom distractors
+                # (desk_caddy's AABB hangs 56 mm below its contact feet), and a
+                # live-stepping quiescence replacement SEGFAULTS on the irregular
+                # distractor↔cabinet contact set (ncon overflow), so per-sample
+                # stability is enforced instead by the dominant-MODE aggregation
+                # below (robust to a lone atypical settle) + the smoke's 5 mm
+                # pose_tolerance over the merged data (the independent
+                # injected==settled / frame-error check).
                 samples.setdefault(f"{cls}|{surface_class}", []).append(round(clearance, 5))
                 fixture_rest_tops.setdefault(surface_class, []).append(
                     round(rest_top_above_table, 5)
@@ -552,22 +583,7 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
                     )
             env.close()
 
-    if frame_offenders:
-        # Non-fatal: these samples were already excluded above. Surface them
-        # loudly so an unstable-settle pattern (or a genuine frame regression)
-        # is auditable, without aborting the run or polluting any median.
-        print(
-            f"\n# WARNING: {len(frame_offenders)} distractor-on-fixture sample(s) "
-            f"excluded — settled bottom face >{_FIXTURE_SETTLE_TOL * 1000:.0f} mm "
-            "from the contacted fixture-geom top (unstable settle; sample dropped, "
-            "not the whole run):"
-        )
-        for line in frame_offenders[:40]:
-            print(f"#   {line}")
-        if len(frame_offenders) > 40:
-            print(f"#   ... and {len(frame_offenders) - 40} more")
-
-    variant_rows = {k: round(statistics.median(v), 5) for k, v in sorted(samples.items())}
+    variant_rows = {k: round(_dominant_mode(v), 5) for k, v in sorted(samples.items())}
     table_rows = {c: round(statistics.median(v), 5) for c, v in sorted(table_samples.items())}
     fixture_geometry: dict[str, dict] = {}
     for fclass in sorted(set(fixture_footprints) | set(fixture_rest_tops)):
@@ -722,6 +738,32 @@ def _merge_distractor_table_rows(table_path: pathlib.Path, table_rows: dict[str,
     return added
 
 
+def _merge_fixture_rows(
+    existing: dict[str, float],
+    dist_rows: dict[str, float],
+    *,
+    tol: float = _POSE_TOLERANCE,
+) -> dict[str, float]:
+    """Merge measured (class|fixture) rows into ``existing`` IN PLACE, rewriting a
+    stored row only when the new value diverges from it by more than ``tol``.
+
+    A row is "wrong" exactly when injected (== stored) z differs from the measured
+    settled z by more than the smoke's pose_tolerance. Within-tolerance rows are
+    left BYTE-IDENTICAL, so the validated box / fixture rows (and any pair whose
+    re-measurement only jittered by physics noise) are preserved by construction;
+    only genuinely-divergent rows (the irregular desk_caddy / bowl_drainer cabinet
+    rows) are corrected. New pairs absent from ``existing`` are always added.
+    Returns the dict of rows actually written (added or corrected).
+    """
+    changed: dict[str, float] = {}
+    for k, v in sorted(dist_rows.items()):
+        old = existing.get(k)
+        if old is None or abs(v - old) > tol:
+            existing[k] = v
+            changed[k] = v
+    return changed
+
+
 def _run_distractor_fixtures_only() -> None:
     """Measure ONLY the per-(distractor, fixture) clearances + fixture geometry
     and merge them into the existing data files, leaving the already-validated
@@ -731,8 +773,6 @@ def _run_distractor_fixtures_only() -> None:
     rows without re-running (and risking perturbing) the validated table/object
     measurement.
     """
-    from libero_infinity.simulator import TABLE_Z
-
     table_path = pathlib.Path("src/libero_infinity/data/spawn_clearances.json")
     table_clearances = json.loads(table_path.read_text()).get("clearances", {})
 
@@ -741,28 +781,26 @@ def _run_distractor_fixtures_only() -> None:
 
     vdest = pathlib.Path("src/libero_infinity/data/spawn_clearances_variants.json")
     vdata = json.loads(vdest.read_text())
-    vdata["clearances"].update(dist_rows)
+    changed = _merge_fixture_rows(vdata["clearances"], dist_rows)
     vdata["clearances"] = {k: vdata["clearances"][k] for k in sorted(vdata["clearances"])}
     vdata["_meta"]["n_distractor_fixture_rows"] = len(dist_rows)
     vdest.write_text(json.dumps(vdata, indent=2, sort_keys=False) + "\n")
-    print(f"\nMerged {len(dist_rows)} (class|fixture) rows into {vdest}")
+    print(f"\nMerged {len(dist_rows)} measured (class|fixture) rows into {vdest}; "
+          f"{len(changed)} rewritten (>{_POSE_TOLERANCE * 1000:.0f}mm divergence), "
+          f"rest preserved byte-identical:")
+    for k, v in changed.items():
+        print(f"  REWROTE {k:40} -> {v:.5f}")
 
-    fg_out = {
-        "_meta": {
-            "description": "Measured fixture geometry. footprint=[w,l] and height "
-            "are the geom-AABB world extents; top_z is the REST surface height "
-            "above TABLE_Z (the distractor↔fixture contact surface, NOT max geom "
-            "z). Generated by scripts/measure_spawn_clearances.py "
-            "(measure_distractor_fixtures).",
-            "table_z": TABLE_Z,
-        },
-        "fixtures": fixture_geometry,
-    }
+    # Preserve the validated fixture geometry (deterministic, already validated;
+    # the clearance ROWS are what the z-data fix corrects, not the geometry). Only
+    # ADD fixtures entirely missing from the stored file.
     fgdest = pathlib.Path("src/libero_infinity/data/fixture_geometry.json")
-    fgdest.write_text(json.dumps(fg_out, indent=2, sort_keys=True) + "\n")
-    print(f"Wrote {fgdest} with {len(fixture_geometry)} fixture classes:")
-    for fclass, g in sorted(fixture_geometry.items()):
-        print(f"  {fclass:24} {g}")
+    fg_existing = json.loads(fgdest.read_text())
+    added_fix = {f: g for f, g in fixture_geometry.items() if f not in fg_existing["fixtures"]}
+    fg_existing["fixtures"].update(added_fix)
+    fgdest.write_text(json.dumps(fg_existing, indent=2, sort_keys=True) + "\n")
+    print(f"Fixture geometry: {len(added_fix)} new fixture(s) added "
+          f"({sorted(added_fix)}), {len(fg_existing['fixtures']) - len(added_fix)} preserved.")
 
 
 if __name__ == "__main__":
@@ -794,9 +832,9 @@ if __name__ == "__main__":
         # Fix 2: per-(distractor_class, fixture_class) on-fixture clearances +
         # measured fixture geometry. Merged into the same variant table so
         # ``asset_metadata.surface_spawn_z`` resolves an on-fixture distractor's
-        # seating z exactly (renderer/simulator lockstep). Fails loudly if any
-        # settled distractor's bottom face does not sit on its fixture contact
-        # surface (frame error).
+        # seating z exactly (renderer/simulator lockstep). Rows are the dominant
+        # settle MODE over contacted, in-band samples; the injected==settled
+        # invariant is verified by the smoke's 5 mm pose_tolerance.
         if "--no-distractor-fixtures" not in sys.argv:
             dist_rows, fixture_geometry, table_rows = measure_distractor_fixtures(out["clearances"])
             vout["clearances"].update(dist_rows)

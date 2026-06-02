@@ -34,7 +34,7 @@
       "white_yellow_mug|kitchen_table": 9,
       "wooden_tray|kitchen_table": 12
     },
-    "n_distractor_fixture_rows": 21
+    "n_distractor_fixture_rows": 22
   },
   "clearances": {
     "akita_black_bowl|kitchen_table": 0.10094,
@@ -46,7 +46,7 @@
     "bbq_sauce|kitchen_table": 0.13375,
     "bowl_drainer|flat_stove": 0.23908,
     "bowl_drainer|microwave": 0.39101,
-    "bowl_drainer|white_cabinet": 0.39012,
+    "bowl_drainer|white_cabinet": 0.41234,
     "bowl_drainer|wooden_cabinet": 0.41234,
     "butter|flat_stove": 0.15304,
     "butter|kitchen_table": 0.08738,
@@ -67,7 +67,7 @@
     "cream_cheese|table": 0.08672,
     "cream_cheese|white_cabinet": 0.32921,
     "cream_cheese|wooden_cabinet": 0.3274,
-    "desk_caddy|wooden_cabinet": 0.37098,
+    "desk_caddy|wooden_cabinet": 0.41148,
     "glazed_rim_porcelain_ramekin|kitchen_table": 0.10043,
     "glazed_rim_porcelain_ramekin|table": 0.10043,
     "ketchup|kitchen_table": 0.1522,
