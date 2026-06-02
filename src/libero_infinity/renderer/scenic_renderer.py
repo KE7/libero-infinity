@@ -911,6 +911,20 @@ def _pool_fit_half_max(pool: list[str]) -> float:
     return max((distractor_fit_half(c) for c in pool), default=_DEFAULT_DISTRACTOR_FIT)
 
 
+def _pool_fit_half_min(pool: list[str]) -> float:
+    """Smallest resting-orientation fit half-extent over a class pool.
+
+    The widest table centre range that still keeps the SMALLEST pool class on the
+    table is inset by this minimum (so a static ``Range`` is the union of every
+    class's feasible region); the per-class on-table containment is enforced
+    per-sample by an explicit ``require`` using the sampled radius — see
+    :func:`_render_constraints`. Insetting by the worst-case (largest) class
+    instead would starve every small distractor of the table when the pool holds
+    one oversized outlier (e.g. desk_caddy).
+    """
+    return min((distractor_fit_half(c) for c in pool), default=_DEFAULT_DISTRACTOR_FIT)
+
+
 def _pool_half_height_max(pool: list[str]) -> float:
     """Worst-case (largest) half-height over a class pool."""
     return max((distractor_half_height(c) for c in pool), default=_DEFAULT_DISTRACTOR_H / 2.0)
@@ -1017,12 +1031,17 @@ def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list
             surface_class: str | None = None
             fixture_name: str | None = None
             slot_pool = list(pool)
-            # Inset the table centre range by the worst-case resting fit
-            # half-extent so even the largest distractor (e.g. desk_caddy) stays
-            # on the table.
-            r_max = _pool_fit_half_max(slot_pool) if slot_pool else _DEFAULT_DISTRACTOR_FIT
-            hx = max(_TABLE_HALF_X - _SUPPORT_EDGE_MARGIN - r_max, 0.0)
-            hy = max(_TABLE_HALF_Y - _SUPPORT_EDGE_MARGIN - r_max, 0.0)
+            # Inset the table centre range by the SMALLEST pool fit half-extent so
+            # the static Range is the union of every class's feasible region (the
+            # smallest distractor may use the whole table). Per-class on-table
+            # containment for the actually-sampled class is enforced per-sample by
+            # an explicit require in _render_constraints using _distractor_i_r.
+            # Insetting by the worst-case class here would shrink the table to the
+            # largest outlier (desk_caddy) for EVERY sample, starving the common
+            # small distractors of placement room.
+            r_min = _pool_fit_half_min(slot_pool) if slot_pool else _DEFAULT_DISTRACTOR_FIT
+            hx = max(_TABLE_HALF_X - _SUPPORT_EDGE_MARGIN - r_min, 0.0)
+            hy = max(_TABLE_HALF_Y - _SUPPORT_EDGE_MARGIN - r_min, 0.0)
             x_lo, x_hi = -hx, hx
             y_lo, y_hi = -hy, hy
         else:
@@ -1340,9 +1359,7 @@ def _render_robot_clearance(
             guard = f"(_n_distractors <= {i}) or "
             r_slot = _pool_radius_max(list(slot.pool)) if slot.pool else _DEFAULT_DISTRACTOR_R
             hh_slot = (
-                _pool_half_height_max(list(slot.pool))
-                if slot.pool
-                else _DEFAULT_DISTRACTOR_H / 2.0
+                _pool_half_height_max(list(slot.pool)) if slot.pool else _DEFAULT_DISTRACTOR_H / 2.0
             )
             targets.append(
                 (
@@ -1580,18 +1597,36 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
 
         slots = _distractor_slots(plan, graph)
         assigned_fixture = {s.index: s.fixture_name for s in slots}
+        slot_by_index = {s.index: s for s in slots}
         for i in range(plan.distractor_budget):
             d_var = f"distractor_{i}"
             r_i = _r_tok(i)
+            # On-table containment (table-assigned slots only): the SAMPLED class
+            # must keep its full footprint on the workspace table. The static
+            # placement Range is inset by only the SMALLEST pool fit-half (so small
+            # distractors may use the whole table); this per-sample require trims
+            # the actually-sampled class by its own radius r_i, so an oversized
+            # class (desk_caddy) is confined to — or rejected from — the table by
+            # its real footprint instead of shrinking the table for everyone.
+            slot_i = slot_by_index.get(i)
+            if slot_i is not None and slot_i.fixture_name is None:
+                cx_b = _TABLE_HALF_X - _SUPPORT_EDGE_MARGIN
+                cy_b = _TABLE_HALF_Y - _SUPPORT_EDGE_MARGIN
+                lines.append(
+                    f"require (_n_distractors <= {i}) "
+                    f"or ((abs({d_var}.position.x) < ({cx_b:.4f} - {r_i})) "
+                    f"and (abs({d_var}.position.y) < ({cy_b:.4f} - {r_i})))"
+                )
             # Distractor↔object clearance: SAT-correct per-axis AABB OR-form.
             # Two AABBs are non-overlapping iff disjoint on x OR y; the distractor
             # half-extent is its per-class radius r_i, the object's is its
             # measured half-footprint.
             for var, dims, _n, _s in obj_info:
+                ohx, ohy = dims[0] / 2.0, dims[1] / 2.0
                 lines.append(
                     f"require (_n_distractors <= {i}) "
-                    f"or (abs({d_var}.position.x - {var}.position.x) > ({dims[0] / 2.0:.4f} + {r_i})) "
-                    f"or (abs({d_var}.position.y - {var}.position.y) > ({dims[1] / 2.0:.4f} + {r_i}))"
+                    f"or (abs({d_var}.position.x - {var}.position.x) > ({ohx:.4f} + {r_i})) "
+                    f"or (abs({d_var}.position.y - {var}.position.y) > ({ohy:.4f} + {r_i}))"
                 )
             for j in range(i + 1, plan.distractor_budget):
                 # Distractor↔distractor: SAT-correct AABB OR-form using both
@@ -1618,11 +1653,12 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
                 if not _should_emit_fixture_clearance(d_var, True, fvar, support_relations):
                     continue
                 fdims = _fixture_dims(fnode.object_class)
+                fhx, fhy = fdims[0] / 2.0, fdims[1] / 2.0
                 # SAT-correct AABB OR-form (see object↔fixture comment block above).
                 lines.append(
                     f"require (_n_distractors <= {i}) "
-                    f"or (abs({d_var}.position.x - {fvar}.position.x) > ({fdims[0] / 2.0:.4f} + {r_i})) "
-                    f"or (abs({d_var}.position.y - {fvar}.position.y) > ({fdims[1] / 2.0:.4f} + {r_i}))"
+                    f"or (abs({d_var}.position.x - {fvar}.position.x) > ({fhx:.4f} + {r_i})) "
+                    f"or (abs({d_var}.position.y - {fvar}.position.y) > ({fhy:.4f} + {r_i}))"
                 )
 
         # Fix 1 — goal-feasibility: no distractor may occupy a goal-relevant

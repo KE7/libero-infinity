@@ -145,6 +145,7 @@ def _assert_table_rows_match_canonical(
             "non-table-resting sample polluted the bucket):\n  " + "\n  ".join(offenders)
         )
 
+
 # Kitchen tasks whose workspace table sits at the canonical TABLE_Z frame.
 # Chosen for broad movable-class coverage (bowls, plates, bottles, boxes,
 # cans, pots). Non-kitchen suites (e.g. living-room tables at a different
@@ -331,10 +332,6 @@ _POSE_TOLERANCE = 0.005
 _FIXTURE_CLEARANCE_MAX = 0.60
 
 _DISTRACTOR_FIXTURE_SEEDS = 16
-# Seeds for the per-class distractor footprint sweep. Larger than the fixture
-# sweep so every one of the 10 pool classes (uniformly sampled into a few slots
-# per scene) is observed across the measurement task set.
-_DISTRACTOR_FOOTPRINT_SEEDS = 24
 
 
 def _dominant_mode(values: list[float], *, bandwidth: float = 2 * _POSE_TOLERANCE) -> float:
@@ -411,9 +408,7 @@ def _fixture_body_ids(sim, fixture_instance: str) -> list[int]:
 
 def _fixture_world_aabb(sim, fixture_instance: str):
     """Union world AABB over all geoms of every body of ``fixture_instance``."""
-    boxes = [
-        _body_world_aabb(sim, b) for b in _fixture_body_ids(sim, fixture_instance)
-    ]
+    boxes = [_body_world_aabb(sim, b) for b in _fixture_body_ids(sim, fixture_instance)]
     boxes = [b for b in boxes if b is not None]
     if not boxes:
         return None
@@ -626,29 +621,99 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
     )
     for c, v in table_rows.items():
         prior = table_clearances.get(c)
-        chk = f"  canonical={prior:.4f} Δ={abs(v - prior) * 1000:.1f}mm" if prior is not None else "  (NEW — no canonical row; was DEFAULT prior)"
+        chk = (
+            f"  canonical={prior:.4f} Δ={abs(v - prior) * 1000:.1f}mm"
+            if prior is not None
+            else "  (NEW — no canonical row; was DEFAULT prior)"
+        )
         print(f"  {c:28} {v:.4f} (n={len(table_samples[c])}){chk}")
     return variant_rows, fixture_geometry, table_rows
 
 
+def _isolated_object_world_aabb(asset_class: str):
+    """Union world-frame AABB of one distractor class loaded IN ISOLATION.
+
+    Builds a minimal MuJoCo model containing only an ``EmptyArena`` and a single
+    instance of ``asset_class`` (resolved from LIBERO's ``OBJECTS_DICT``), runs
+    ``mj_forward`` (NO dynamics, NO settle, NO contacts), and unions the
+    world-frame AABB over every geom belonging to the object. Returns
+    ``(wx, wy, hz)`` extents in metres, or ``None`` if the class will not load.
+
+    A distractor footprint is STATIC asset geometry — the geom-AABB extents of the
+    loaded mesh — so this needs no scene generation and CANNOT overflow MuJoCo's
+    contact arena (the failure mode that killed the prior scene-generation
+    approach; see RCA ``proxy_footprint_measure.md``).
+    """
+    import math as _math
+
+    import mujoco
+    import numpy as np
+    from libero.libero.envs.objects import get_object_fn
+    from robosuite.models.arenas import EmptyArena
+    from robosuite.models.world import MujocoWorldBase
+
+    try:
+        obj = get_object_fn(asset_class)(name=f"{asset_class}_probe")
+    except Exception as exc:  # noqa: BLE001 — unloadable class, recorded by caller
+        print(f"# isolate build failed {asset_class}: {exc}")
+        return None
+
+    world = MujocoWorldBase()
+    world.merge(EmptyArena())
+    world.merge_assets(obj)
+    world.worldbody.append(obj.get_obj())
+    model = world.get_model(mode="mujoco")
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+
+    mins = np.full(3, _math.inf)
+    maxs = np.full(3, -_math.inf)
+    found = 0
+    for gid in range(model.ngeom):
+        gname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+        # Object geoms are name-prefixed with the instance name; arena geoms
+        # (floor/walls) never contain the asset class token.
+        if gname is None or asset_class not in gname:
+            continue
+        # geom_aabb is the LOCAL (center, half) box; rotate into world via
+        # geom_xmat/geom_xpos — identical method to ``_geom_world_aabb``.
+        aabb = model.geom_aabb[gid]
+        c_local = np.asarray(aabb[:3], dtype=float)
+        half = np.asarray(aabb[3:], dtype=float)
+        xpos = np.asarray(data.geom_xpos[gid], dtype=float)
+        rot = np.asarray(data.geom_xmat[gid], dtype=float).reshape(3, 3)
+        center = xpos + rot @ c_local
+        ext = np.array([sum(abs(rot[ax, k]) * half[k] for k in range(3)) for ax in range(3)])
+        mins = np.minimum(mins, center - ext)
+        maxs = np.maximum(maxs, center + ext)
+        found += 1
+
+    if found == 0:
+        return None
+    wx, wy, hz = (maxs - mins).tolist()
+    return round(wx, 5), round(wy, 5), round(hz, 5)
+
+
 def measure_distractor_footprints() -> dict:
-    """Measure per-class distractor footprints (settled geom-AABB extents).
+    """Measure per-class distractor footprints from the STATIC asset geometry.
 
-    For every active distractor in the measurement scenes (on the table OR on a
-    fixture — the body's own AABB excludes the support, so the support does not
-    contaminate the extents), record the settled world-AABB:
+    A distractor footprint is fixed by the asset XML — it is the geom-AABB extent
+    of the loaded mesh, not a scene-dependent quantity. So each pool class is
+    loaded IN ISOLATION (``_isolated_object_world_aabb``: EmptyArena + the single
+    object, ``mj_forward``, read the geom world-AABB) and we record:
 
-        wx = xmax-xmin,  wy = ymax-ymin,  hz = zmax-zmin
+        wx = xmax-xmin,  wy = ymax-ymin,  hz = zmax-zmin   (canonical resting pose)
 
-    and the per-sample circumscribed planar half-extent ``r = 0.5·sqrt(wx²+wy²)``
-    — a yaw-ROBUST half-extent that bounds the footprint under any settle yaw and
-    the consistent ~90° settle tip (RCA ``distractor_z_convergence.md``). The
-    per-class ``radius`` / ``height`` are the dominant settle MODE
-    (``_dominant_mode``) so a lone atypical settle cannot drag the row, mirroring
-    the on-fixture clearance aggregation. NO live-stepping of the irregular
-    distractor↔fixture contact set (it overflows MuJoCo's ncon arena and
-    segfaults — see the RCA); the reset-settle the env already performs is the
-    measurement.
+    and the circumscribed planar half-extent ``r = 0.5·sqrt(wx²+wy²)`` — the
+    yaw-ROBUST half-extent threaded into every clearance constraint
+    (``asset_metadata.distractor_planar_half``). The LIBERO assets are authored in
+    their resting pose, and the pool-fit rejection (the structural fix) keeps
+    oversized irregular classes off undersized fixtures — so they rest flat on the
+    table in this canonical pose and the static footprint is exactly what the
+    settled object presents. This replaces the prior scene-generation measurement,
+    which overflowed MuJoCo's ncon contact arena settling irregular distractors
+    onto fixtures (RCA ``proxy_footprint_measure.md``). Measurement is
+    deterministic — one observation per class (``n = 1``).
 
     Writes ``data/distractor_geometry.json`` consumed by
     ``asset_metadata.distractor_footprint`` / ``distractor_planar_half``.
@@ -656,75 +721,23 @@ def measure_distractor_footprints() -> dict:
     import math as _math
 
     from libero_infinity.asset_registry import DEFAULT_DISTRACTOR_POOL
-    from libero_infinity.compiler import compile_task_to_scenario
-    from libero_infinity.gym_env import make_env
-    from libero_infinity.task_config import TaskConfig
-    from libero_infinity.validation.sweep import discover_all_tasks, resolve_task_path
-
-    avail = set(discover_all_tasks())
-    radii: dict[str, list[float]] = {}
-    heights: dict[str, list[float]] = {}
-    wxs: dict[str, list[float]] = {}
-    wys: dict[str, list[float]] = {}
-
-    for task_rel in MEASURE_TASKS:
-        if task_rel not in avail:
-            continue
-        bddl = str(resolve_task_path(task_rel))
-        for seed in range(_DISTRACTOR_FOOTPRINT_SEEDS):
-            try:
-                cfg = TaskConfig.from_bddl(bddl)
-                random.seed(seed)
-                scenario = compile_task_to_scenario(cfg, "distractor")
-                scene, _ = scenario.generate(maxIterations=8000)
-                env = make_env(scene, bddl_path=bddl)
-                env.reset()
-            except Exception as exc:  # noqa: BLE001 — measurement noise, recorded
-                print(f"# build failed {task_rel} [seed {seed}]: {exc}")
-                continue
-            sim = env._sim.libero_env.env.sim  # noqa: SLF001
-            active = getattr(env._sim, "_active_distractor_names", set())  # noqa: SLF001
-            for o in scene.objects:
-                nm = getattr(o, "libero_name", "")
-                if not nm.startswith("distractor_") or nm not in active:
-                    continue
-                cls = getattr(o, "asset_class", "") or ""
-                if not cls:
-                    continue
-                bid = None
-                for cand in (nm, nm + "_main"):
-                    try:
-                        bid = sim.model.body_name2id(cand)
-                        break
-                    except Exception:
-                        continue
-                if bid is None:
-                    continue
-                box = _body_world_aabb(sim, bid)
-                if box is None:
-                    continue
-                wx = round(box[1] - box[0], 5)
-                wy = round(box[3] - box[2], 5)
-                hz = round(box[5] - box[4], 5)
-                # Reject degenerate / un-loaded AABBs.
-                if not (0.0 < wx < 1.0 and 0.0 < wy < 1.0 and 0.0 < hz < 1.0):
-                    continue
-                radii.setdefault(cls, []).append(round(0.5 * _math.hypot(wx, wy), 5))
-                heights.setdefault(cls, []).append(hz)
-                wxs.setdefault(cls, []).append(wx)
-                wys.setdefault(cls, []).append(wy)
-            env.close()
 
     distractors: dict[str, dict] = {}
-    for cls in sorted(set(radii)):
+    for cls in sorted(DEFAULT_DISTRACTOR_POOL):
+        extents = _isolated_object_world_aabb(cls)
+        if extents is None:
+            print(f"# WARNING: no geom AABB for distractor class {cls!r}")
+            continue
+        wx, wy, hz = extents
+        # Reject degenerate / un-loaded AABBs.
+        if not (0.0 < wx < 1.0 and 0.0 < wy < 1.0 and 0.0 < hz < 1.0):
+            print(f"# WARNING: degenerate AABB for {cls!r}: {extents}")
+            continue
         distractors[cls] = {
-            "footprint": [
-                round(statistics.median(wxs[cls]), 5),
-                round(statistics.median(wys[cls]), 5),
-            ],
-            "height": round(_dominant_mode(heights[cls]), 5),
-            "radius": round(_dominant_mode(radii[cls]), 5),
-            "n": len(radii[cls]),
+            "footprint": [wx, wy],
+            "height": hz,
+            "radius": round(0.5 * _math.hypot(wx, wy), 5),
+            "n": 1,
         }
 
     missing = [c for c in DEFAULT_DISTRACTOR_POOL if c not in distractors]
@@ -735,14 +748,15 @@ def measure_distractor_footprints() -> dict:
             f"footprint={g['footprint']} (n={g['n']})"
         )
     if missing:
-        print(f"# WARNING: pool classes never sampled (no footprint row): {missing}")
+        print(f"# WARNING: pool classes with no footprint row: {missing}")
 
     return {
         "_meta": {
             "description": "Measured per-class distractor footprints. footprint=[w,l] "
-            "and height are settled geom-AABB world extents (m); radius is the "
-            "yaw-robust circumscribed planar half-extent 0.5*sqrt(wx^2+wy^2) "
-            "(dominant settle mode) threaded into renderer clearance + support-fit. "
+            "and height are the STATIC geom-AABB world extents (m) of the asset loaded "
+            "in isolation (EmptyArena + object, mj_forward — no scene, no settle); "
+            "radius is the yaw-robust circumscribed planar half-extent "
+            "0.5*sqrt(w^2+l^2) threaded into renderer clearance + support-fit. "
             "Generated by scripts/measure_spawn_clearances.py "
             "(measure_distractor_footprints).",
             "n_classes": len(distractors),
@@ -858,15 +872,16 @@ def _merge_distractor_table_rows(table_path: pathlib.Path, table_rows: dict[str,
     existing = canon.get("clearances", {})
     added = {c: z for c, z in sorted(table_rows.items()) if c not in existing}
     if not added:
-        print(f"\nNo new distractor-only table rows to merge into {table_path} "
-              f"(all {len(table_rows)} measured classes already have canonical rows).")
+        print(
+            f"\nNo new distractor-only table rows to merge into {table_path} "
+            f"(all {len(table_rows)} measured classes already have canonical rows)."
+        )
         return {}
     existing.update(added)
     canon["clearances"] = {k: existing[k] for k in sorted(existing)}
     canon.setdefault("_meta", {})["n_distractor_table_rows"] = len(added)
     table_path.write_text(json.dumps(canon, indent=2, sort_keys=False) + "\n")
-    print(f"\nMerged {len(added)} distractor-only table clearance row(s) into "
-          f"{table_path}:")
+    print(f"\nMerged {len(added)} distractor-only table clearance row(s) into {table_path}:")
     for c, z in added.items():
         print(f"  {c:28} {z:.4f}")
     return added
@@ -919,9 +934,11 @@ def _run_distractor_fixtures_only() -> None:
     vdata["clearances"] = {k: vdata["clearances"][k] for k in sorted(vdata["clearances"])}
     vdata["_meta"]["n_distractor_fixture_rows"] = len(dist_rows)
     vdest.write_text(json.dumps(vdata, indent=2, sort_keys=False) + "\n")
-    print(f"\nMerged {len(dist_rows)} measured (class|fixture) rows into {vdest}; "
-          f"{len(changed)} rewritten (>{_POSE_TOLERANCE * 1000:.0f}mm divergence), "
-          f"rest preserved byte-identical:")
+    print(
+        f"\nMerged {len(dist_rows)} measured (class|fixture) rows into {vdest}; "
+        f"{len(changed)} rewritten (>{_POSE_TOLERANCE * 1000:.0f}mm divergence), "
+        f"rest preserved byte-identical:"
+    )
     for k, v in changed.items():
         print(f"  REWROTE {k:40} -> {v:.5f}")
 
@@ -933,8 +950,10 @@ def _run_distractor_fixtures_only() -> None:
     added_fix = {f: g for f, g in fixture_geometry.items() if f not in fg_existing["fixtures"]}
     fg_existing["fixtures"].update(added_fix)
     fgdest.write_text(json.dumps(fg_existing, indent=2, sort_keys=True) + "\n")
-    print(f"Fixture geometry: {len(added_fix)} new fixture(s) added "
-          f"({sorted(added_fix)}), {len(fg_existing['fixtures']) - len(added_fix)} preserved.")
+    print(
+        f"Fixture geometry: {len(added_fix)} new fixture(s) added "
+        f"({sorted(added_fix)}), {len(fg_existing['fixtures']) - len(added_fix)} preserved."
+    )
 
 
 if __name__ == "__main__":
