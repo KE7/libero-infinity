@@ -166,6 +166,12 @@ MEASURE_TASKS = [
     "libero_90/KITCHEN_SCENE7_put_the_white_bowl_on_the_plate.bddl",
     "libero_90/KITCHEN_SCENE10_put_the_butter_at_the_front_in_the_top_drawer_of_the_cabinet_and_close_it.bddl",
     "libero_90/KITCHEN_SCENE10_put_the_chocolate_pudding_in_the_top_drawer_of_the_cabinet_and_close_it.bddl",
+    # white_cabinet only ever appears as the GOAL fixture in the cabinet tasks
+    # above (goal fixtures are excluded from distractor assignment), so it
+    # produced no on-fixture rows. This SCENE5 task has white_cabinet as a
+    # NON-goal fixture (goal is the plate), so distractors get assigned to it
+    # and we measure real white_cabinet (class|fixture) rows + footprint/top_z.
+    "libero_90/KITCHEN_SCENE5_put_the_black_bowl_on_the_plate.bddl",
 ]
 
 SUBSETS = ["position", "position,object"]
@@ -428,6 +434,7 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
 
     avail = set(discover_all_tasks())
     samples: dict[str, list[float]] = {}
+    table_samples: dict[str, list[float]] = {}
     fixture_footprints: dict[str, list[tuple[float, float, float]]] = {}
     fixture_rest_tops: dict[str, list[float]] = {}
     frame_offenders: list[str] = []
@@ -456,8 +463,6 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
                     continue
                 surface_class = getattr(o, "support_surface_class", "") or ""
                 fixture_inst = getattr(o, "support_parent_name", "") or ""
-                if not surface_class or not fixture_inst:
-                    continue  # table-assigned distractor — measured elsewhere
                 cls = getattr(o, "asset_class", "") or ""
                 if not cls:
                     continue
@@ -471,6 +476,24 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
                 if bid is None:
                     continue
                 body_z = float(sim.data.body_xpos[bid][2])
+                if not surface_class or not fixture_inst:
+                    # Table-assigned distractor. Capture its clean table-resting
+                    # body-origin clearance so the renderer's table slot resolves
+                    # a MEASURED z instead of the DEFAULT_CLEARANCE prior. The
+                    # distractor-only pool classes (desk_caddy, bowl_drainer,
+                    # cookies, popcorn, alphabet_soup) are never task objects, so
+                    # measure_variants/measure() never sees them — the distractor
+                    # placement path is the ONLY way to measure their table z.
+                    # That gap is the dominant table-distractor z error (e.g.
+                    # desk_caddy injected 0.10 vs settled 0.42 = -320 mm).
+                    # Guard with the physical table-contact check so a distractor
+                    # whose (x, y) landed over a fixture and perched on it (the
+                    # known table-distractor churn) is EXCLUDED, not mis-bucketed
+                    # as a table rest.
+                    clr = body_z - TABLE_Z
+                    if 0.0 <= clr <= _FIXTURE_CLEARANCE_MAX and _settled_on_table_surface(env, nm):
+                        table_samples.setdefault(cls, []).append(round(clr, 5))
+                    continue
                 box = _body_world_aabb(sim, bid)
                 tops = _distractor_fixture_contact_tops(sim, bid, fixture_inst)
                 if box is None or not tops:
@@ -545,6 +568,7 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
             print(f"#   ... and {len(frame_offenders) - 40} more")
 
     variant_rows = {k: round(statistics.median(v), 5) for k, v in sorted(samples.items())}
+    table_rows = {c: round(statistics.median(v), 5) for c, v in sorted(table_samples.items())}
     fixture_geometry: dict[str, dict] = {}
     for fclass in sorted(set(fixture_footprints) | set(fixture_rest_tops)):
         fps = fixture_footprints.get(fclass, [])
@@ -574,7 +598,17 @@ def measure_distractor_fixtures(table_clearances: dict[str, float]) -> tuple[dic
             analytic = top + on_table
             chk = f"  analytic(top+table)={analytic:.4f} Δ={abs(v - analytic) * 1000:.1f}mm"
         print(f"  {k:44} {v:.4f} (n={len(samples[k])}){chk}")
-    return variant_rows, fixture_geometry
+
+    print(
+        f"\n# distractor-on-TABLE: {len(table_rows)} class rows "
+        f"(measured via the table-distractor slot — the only path that covers "
+        f"distractor-only pool classes):"
+    )
+    for c, v in table_rows.items():
+        prior = table_clearances.get(c)
+        chk = f"  canonical={prior:.4f} Δ={abs(v - prior) * 1000:.1f}mm" if prior is not None else "  (NEW — no canonical row; was DEFAULT prior)"
+        print(f"  {c:28} {v:.4f} (n={len(table_samples[c])}){chk}")
+    return variant_rows, fixture_geometry, table_rows
 
 
 def measure() -> dict:
@@ -657,6 +691,37 @@ def measure() -> dict:
     }
 
 
+def _merge_distractor_table_rows(table_path: pathlib.Path, table_rows: dict[str, float]) -> dict:
+    """Add measured table-distractor clearances for distractor-only pool classes
+    that are MISSING from the canonical per-class table.
+
+    Only adds classes absent from the canonical table — never overwrites a
+    validated task-object measurement (those rows have many samples from the
+    object axis; the distractor path is a single-orientation observation). The
+    renderer's table-distractor slot resolves ``surface_class=None`` →
+    ``SPAWN_CLEARANCES`` (this canonical table), so adding the missing classes
+    (desk_caddy, bowl_drainer, cookies, popcorn, alphabet_soup, …) makes the
+    table-distractor injected z match the settled z instead of the DEFAULT prior.
+    Returns the dict of rows actually added.
+    """
+    canon = json.loads(table_path.read_text())
+    existing = canon.get("clearances", {})
+    added = {c: z for c, z in sorted(table_rows.items()) if c not in existing}
+    if not added:
+        print(f"\nNo new distractor-only table rows to merge into {table_path} "
+              f"(all {len(table_rows)} measured classes already have canonical rows).")
+        return {}
+    existing.update(added)
+    canon["clearances"] = {k: existing[k] for k in sorted(existing)}
+    canon.setdefault("_meta", {})["n_distractor_table_rows"] = len(added)
+    table_path.write_text(json.dumps(canon, indent=2, sort_keys=False) + "\n")
+    print(f"\nMerged {len(added)} distractor-only table clearance row(s) into "
+          f"{table_path}:")
+    for c, z in added.items():
+        print(f"  {c:28} {z:.4f}")
+    return added
+
+
 def _run_distractor_fixtures_only() -> None:
     """Measure ONLY the per-(distractor, fixture) clearances + fixture geometry
     and merge them into the existing data files, leaving the already-validated
@@ -671,7 +736,8 @@ def _run_distractor_fixtures_only() -> None:
     table_path = pathlib.Path("src/libero_infinity/data/spawn_clearances.json")
     table_clearances = json.loads(table_path.read_text()).get("clearances", {})
 
-    dist_rows, fixture_geometry = measure_distractor_fixtures(table_clearances)
+    dist_rows, fixture_geometry, table_rows = measure_distractor_fixtures(table_clearances)
+    _merge_distractor_table_rows(table_path, table_rows)
 
     vdest = pathlib.Path("src/libero_infinity/data/spawn_clearances_variants.json")
     vdata = json.loads(vdest.read_text())
@@ -732,10 +798,13 @@ if __name__ == "__main__":
         # settled distractor's bottom face does not sit on its fixture contact
         # surface (frame error).
         if "--no-distractor-fixtures" not in sys.argv:
-            dist_rows, fixture_geometry = measure_distractor_fixtures(out["clearances"])
+            dist_rows, fixture_geometry, table_rows = measure_distractor_fixtures(out["clearances"])
             vout["clearances"].update(dist_rows)
             vout["clearances"] = {k: vout["clearances"][k] for k in sorted(vout["clearances"])}
             vout["_meta"]["n_distractor_fixture_rows"] = len(dist_rows)
+            # Add table-distractor clearances for distractor-only pool classes
+            # missing from the canonical table (dest already written above).
+            _merge_distractor_table_rows(dest, table_rows)
 
             fg_out = {
                 "_meta": {

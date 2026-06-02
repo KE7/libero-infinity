@@ -20,6 +20,14 @@
       "height": 0.1905,
       "top_z": 0.288
     },
+    "white_cabinet": {
+      "footprint": [
+        0.25682,
+        0.38671
+      ],
+      "height": 0.22541,
+      "top_z": 0.30799
+    },
     "wooden_cabinet": {
       "footprint": [
         0.25682,
