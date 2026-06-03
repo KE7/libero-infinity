@@ -796,13 +796,32 @@ class TestLiberoCorpusAudit:
             assert "_n_distractors = globalParameters.n_distractors" in code
             # distractor_0 is always assigned to the table (support slot 0), so
             # it is kept clear of every fixture via SAT-form AABB clearance
-            # (per-axis OR), gated by the cardinality guard.
+            # (per-axis OR), gated by the cardinality guard. The clearance is
+            # offset-aware: centered fixtures guard `fixture.position.{x,y}`
+            # directly, while a fixture whose collision geom is offset from its
+            # body origin (e.g. flat_stove) guards `(fixture.position.x + dx)`
+            # so the real geom footprint is covered (offset_fix / RCA
+            # robot_distractor_settle.md). Assert the cardinality-gated
+            # distractor_0<->fixture clearance require exists per fixture on
+            # both axes, tolerant of an optional measured offset term.
+            require_lines = [
+                ln
+                for ln in code.splitlines()
+                if ln.startswith("require (_n_distractors <= 0) or")
+                and "distractor_0.position.x" in ln
+            ]
             for fixture in ("wooden_cabinet_1", "flat_stove_1", "wine_rack_1"):
-                assert (
-                    f"require (_n_distractors <= 0) or "
-                    f"(abs(distractor_0.position.x - {fixture}.position.x)"
-                ) in code
-                assert f"abs(distractor_0.position.y - {fixture}.position.y)" in code
+                clause = next(
+                    (
+                        ln
+                        for ln in require_lines
+                        if f"{fixture}.position.x" in ln and f"{fixture}.position.y" in ln
+                    ),
+                    None,
+                )
+                assert clause is not None, f"missing distractor_0<->{fixture} clearance require"
+                assert "abs(distractor_0.position.x -" in clause
+                assert "abs(distractor_0.position.y -" in clause
             scenario = sc.scenarioFromFile(path)
             scene, _ = scenario.generate(maxIterations=2000, verbosity=0)
             assert "n_distractors" in scene.params
