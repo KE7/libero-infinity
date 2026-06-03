@@ -22,6 +22,7 @@ from libero_infinity.asset_metadata import (
     distractor_planar_half,
     fixture_footprint,
     fixture_height,
+    fixture_offset,
     surface_spawn_z,
 )
 from libero_infinity.asset_metadata import (
@@ -244,6 +245,17 @@ def _fixture_dims(fixture_class: str | None) -> tuple[float, float, float]:
     """Return measured (width, length, height) for a fixture class (m)."""
     fw, fl = fixture_footprint(fixture_class)
     return fw, fl, fixture_height(fixture_class)
+
+
+def _offset_axis_expr(pos_expr: str, off: float) -> str:
+    """Offset-aware fixture clearance center on one axis.
+
+    A fixture's clearance box must be centered on its real geom-AABB center, not
+    its body position — irregular fixtures (flat_stove) carry geometry offset
+    ~100 mm from the body origin. Returns ``pos_expr`` unchanged when the offset
+    is ~0 (centered fixtures → byte-identical emission, zero behaviour change).
+    """
+    return pos_expr if abs(off) < 1e-6 else f"({pos_expr} + {off:.5f})"
 
 
 # Back-compat mapping (re-exported by compiler.py as ``_FIXTURE_DIMENSIONS``):
@@ -1384,11 +1396,14 @@ def _render_robot_clearance(
         fdims = _fixture_dims(fnode.object_class)
         fh = fdims[2]
         fz_center = footprint.table_world_z + fh / 2.0
+        # Offset-aware center (real geom-AABB center vs body origin) — see
+        # RCA robot_distractor_settle.md; (0,0) for centered fixtures.
+        fox, foy = fixture_offset(fnode.object_class)
         targets.append(
             (
                 "",
-                f"{fnode.init_x:.4f}",
-                f"{fnode.init_y:.4f}",
+                f"{fnode.init_x + fox:.4f}",
+                f"{fnode.init_y + foy:.4f}",
                 f"{fz_center:.4f}",
                 fdims[0] / 2.0,
                 fdims[1] / 2.0,
@@ -1561,13 +1576,16 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             continue
         fvar = _to_var(fnode.instance_name)
         fdims = _fixture_dims(fnode.object_class)
+        fox, foy = fixture_offset(fnode.object_class)
+        fcx = _offset_axis_expr(f"{fvar}.position.x", fox)
+        fcy = _offset_axis_expr(f"{fvar}.position.y", foy)
         for var_name, dims, _name, sampled in obj_info:
             if not _should_emit_fixture_clearance(var_name, sampled, fvar, support_relations):
                 continue
             dx_min, dy_min = _footprint_clearance_aabb(fdims, dims)
             lines.append(
-                f"require (abs({var_name}.position.x - {fvar}.position.x) > {dx_min:.4f}) "
-                f"or (abs({var_name}.position.y - {fvar}.position.y) > {dy_min:.4f})"
+                f"require (abs({var_name}.position.x - {fcx}) > {dx_min:.4f}) "
+                f"or (abs({var_name}.position.y - {fcy}) > {dy_min:.4f})"
             )
 
     # Anti-trivialization: note in params that it's active
@@ -1654,11 +1672,19 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
                     continue
                 fdims = _fixture_dims(fnode.object_class)
                 fhx, fhy = fdims[0] / 2.0, fdims[1] / 2.0
+                # Offset-aware center: guard the real geom-AABB center, not the
+                # body origin — an offset fixture (flat_stove, +95 mm in x) would
+                # otherwise leave a strip of its real footprint unguarded, and the
+                # table distractor sampled there is injected penetrating it →
+                # contact-solver launch (RCA robot_distractor_settle.md).
+                fox, foy = fixture_offset(fnode.object_class)
+                fcx = _offset_axis_expr(f"{fvar}.position.x", fox)
+                fcy = _offset_axis_expr(f"{fvar}.position.y", foy)
                 # SAT-correct AABB OR-form (see object↔fixture comment block above).
                 lines.append(
                     f"require (_n_distractors <= {i}) "
-                    f"or (abs({d_var}.position.x - {fvar}.position.x) > ({fhx:.4f} + {r_i})) "
-                    f"or (abs({d_var}.position.y - {fvar}.position.y) > ({fhy:.4f} + {r_i}))"
+                    f"or (abs({d_var}.position.x - {fcx}) > ({fhx:.4f} + {r_i})) "
+                    f"or (abs({d_var}.position.y - {fcy}) > ({fhy:.4f} + {r_i}))"
                 )
 
         # Fix 1 — goal-feasibility: no distractor may occupy a goal-relevant

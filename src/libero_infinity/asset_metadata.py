@@ -296,6 +296,25 @@ def fixture_footprint(fixture_class: str | None) -> tuple[float, float]:
     return dims[0], dims[1]
 
 
+def fixture_offset(fixture_class: str | None) -> tuple[float, float]:
+    """Return the (dx, dy) of a fixture's geom-AABB center relative to its body
+    position (the value the renderer emits as ``<fixture>.position``).
+
+    Irregular fixtures (e.g. ``flat_stove``) carry collision geometry offset
+    ~100 mm from the body origin; an origin-centered clearance box then misses
+    part of the real fixture and a table distractor is injected penetrating it,
+    causing the contact solver to launch it (RCA ``robot_distractor_settle.md``).
+    Returns (0.0, 0.0) when no offset is recorded — so centered fixtures are
+    unaffected. Measured by ``scripts/measure_fixture_offsets.py``.
+    """
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is not None:
+        off = geom.get("offset")
+        if isinstance(off, (list, tuple)) and len(off) >= 2:
+            return float(off[0]), float(off[1])
+    return 0.0, 0.0
+
+
 def fixture_height(fixture_class: str | None) -> float:
     """Return the measured z-extent (height, m) of a fixture class."""
     geom = FIXTURE_GEOMETRY.get(fixture_class or "")
