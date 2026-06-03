@@ -20,18 +20,30 @@
       "white_yellow_mug": 1,
       "wine_bottle": 7
     },
-    "n_distractor_table_rows": 6
+    "n_distractor_table_rows": 6,
+    "distractor_table_corrections": {
+      "butter": {
+        "old": 0.08738,
+        "new": 0.09861,
+        "n": 33
+      },
+      "cream_cheese": {
+        "old": 0.08672,
+        "new": 0.10031,
+        "n": 10
+      }
+    }
   },
   "clearances": {
     "akita_black_bowl": 0.10094,
     "alphabet_soup": 0.11815,
     "bbq_sauce": 0.13375,
     "bowl_drainer": 0.17579,
-    "butter": 0.08738,
+    "butter": 0.09861,
     "chefmate_8_frypan": 0.10039,
     "chocolate_pudding": 0.10023,
     "cookies": 0.12098,
-    "cream_cheese": 0.08672,
+    "cream_cheese": 0.10031,
     "desk_caddy": 0.26659,
     "glazed_rim_porcelain_ramekin": 0.10043,
     "ketchup": 0.1522,

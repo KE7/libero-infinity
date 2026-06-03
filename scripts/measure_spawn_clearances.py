@@ -956,6 +956,160 @@ def _run_distractor_fixtures_only() -> None:
     )
 
 
+def measure_distractor_table(
+    table_clearances: dict[str, float], *, seeds: int = _DISTRACTOR_FIXTURE_SEEDS
+) -> dict[str, list[float]]:
+    """Measure per-class TABLE-resting distractor settled clearance distributions.
+
+    Generates the SAME ``"distractor"`` scenes as :func:`measure_distractor_fixtures`
+    but collects ONLY table-resting distractor samples — it never touches the
+    on-fixture contact/AABB machinery, so it cannot perturb the validated
+    per-(class|fixture) rows and (with the 0660e57 pool-fit rejection routing the
+    oversized irregular classes desk_caddy/bowl_drainer to the table) never settles
+    an irregular distractor onto an undersized fixture (the contact-arena overflow).
+
+    Admission is GATE-FREE per RCA ``distractor_z_convergence.md`` /
+    ``distractor_table_z_recover.md``: a sample is admitted iff it is in the
+    physical clearance band ``[0, _FIXTURE_CLEARANCE_MAX]`` AND makes a real
+    workspace-table contact (:func:`_settled_on_table_surface`). No AABB-bottom
+    gate, no live-stepping of irregular distractors. Returns the raw per-class
+    sample lists; the caller aggregates by dominant settle MODE (:func:`_dominant_mode`).
+
+    The renderer injects table distractors at IDENTITY orientation with
+    ``preserve_default_z=False`` → ``surface_spawn_z(.., surface_class=None)`` →
+    this canonical table. So the distractor-path settle measured here is exactly
+    the height the renderer must inject to make injected z == settled z for a
+    distractor — which can differ from a class's natural-orientation object-axis
+    clearance (the stale ``measure()`` value for classes that are also task
+    objects, e.g. butter). Task objects resting at table level keep LIBERO's
+    default z (``preserve_default_z=True``) and never read this table, so
+    correcting a row here cannot move the TASK pose-tolerance metric.
+    """
+    from libero_infinity.compiler import compile_task_to_scenario
+    from libero_infinity.gym_env import make_env
+    from libero_infinity.simulator import TABLE_Z
+    from libero_infinity.task_config import TaskConfig
+    from libero_infinity.validation.sweep import discover_all_tasks, resolve_task_path
+
+    avail = set(discover_all_tasks())
+    table_samples: dict[str, list[float]] = {}
+
+    tasks = [t for t in MEASURE_TASKS if t in avail]
+    for ti, task_rel in enumerate(tasks):
+        print(f"# [PROGRESS] task {ti + 1}/{len(tasks)} ({seeds} seeds): {task_rel}", flush=True)
+        bddl = str(resolve_task_path(task_rel))
+        for seed in range(seeds):
+            try:
+                cfg = TaskConfig.from_bddl(bddl)
+                random.seed(seed)
+                scenario = compile_task_to_scenario(cfg, "distractor")
+                scene, _ = scenario.generate(maxIterations=8000)
+                env = make_env(scene, bddl_path=bddl)
+                env.reset()
+            except Exception as exc:  # noqa: BLE001 — measurement noise, recorded
+                print(f"# build failed {task_rel} [seed {seed}]: {exc}")
+                continue
+            sim = env._sim.libero_env.env.sim  # noqa: SLF001
+            active = getattr(env._sim, "_active_distractor_names", set())  # noqa: SLF001
+            for o in scene.objects:
+                nm = getattr(o, "libero_name", "")
+                if not nm.startswith("distractor_") or nm not in active:
+                    continue
+                surface_class = getattr(o, "support_surface_class", "") or ""
+                fixture_inst = getattr(o, "support_parent_name", "") or ""
+                cls = getattr(o, "asset_class", "") or ""
+                if not cls or (surface_class and fixture_inst):
+                    continue  # on-fixture distractor → out of scope (table-only)
+                bid = None
+                for cand in (nm, nm + "_main"):
+                    try:
+                        bid = sim.model.body_name2id(cand)
+                        break
+                    except Exception:
+                        continue
+                if bid is None:
+                    continue
+                body_z = float(sim.data.body_xpos[bid][2])
+                clr = body_z - TABLE_Z
+                if 0.0 <= clr <= _FIXTURE_CLEARANCE_MAX and _settled_on_table_surface(env, nm):
+                    table_samples.setdefault(cls, []).append(round(clr, 5))
+            env.close()
+    return table_samples
+
+
+def _merge_distractor_table_corrective(
+    table_path: pathlib.Path,
+    table_samples: dict[str, list[float]],
+    *,
+    tol: float = _POSE_TOLERANCE,
+) -> dict[str, tuple]:
+    """Merge measured table-distractor clearances, CORRECTING divergent rows.
+
+    Unlike :func:`_merge_distractor_table_rows` (add-missing-only — which is why
+    the stale butter/popcorn/cookies rows were never re-measured), this rewrites a
+    row whenever the dominant-MODE measured clearance diverges from the stored
+    value by more than ``tol`` (the smoke's 5 mm pose_tolerance), and ADDS classes
+    absent from the table. Within-tolerance rows are left BYTE-IDENTICAL, so every
+    validated row is preserved by construction; only genuinely-wrong rows move.
+
+    Returns ``{class: (old_or_None, new, n_samples)}`` for rows actually written.
+    """
+    canon = json.loads(table_path.read_text())
+    existing = canon.get("clearances", {})
+    rows = {c: round(_dominant_mode(v), 5) for c, v in sorted(table_samples.items())}
+    changed: dict[str, tuple] = {}
+    for c, z in rows.items():
+        old = existing.get(c)
+        if old is None or abs(z - float(old)) > tol:
+            existing[c] = z
+            changed[c] = (old, z, len(table_samples[c]))
+    if not changed:
+        print(
+            f"\nNo distractor-table rows diverged > {tol * 1000:.0f}mm — "
+            f"all {len(rows)} measured classes within tolerance, file untouched."
+        )
+        return {}
+    canon["clearances"] = {k: existing[k] for k in sorted(existing)}
+    meta = canon.setdefault("_meta", {})
+    # NOTE: ``n_distractor_table_rows`` counts the distractor-ONLY rows present in
+    # the table (added by ``_merge_distractor_table_rows``); this corrective merge
+    # only rewrites existing object-axis rows (butter/cream_cheese) and adds none,
+    # so that count is left untouched.
+    # Transparent provenance: record the distractor-path correction for each row
+    # rewritten (old → new, sample count), so the stale object-axis n_samples for
+    # a corrected class (e.g. butter) is not silently misread as fresh.
+    meta["distractor_table_corrections"] = {
+        c: {"old": (None if old is None else round(float(old), 5)), "new": z, "n": n}
+        for c, (old, z, n) in sorted(changed.items())
+    }
+    table_path.write_text(json.dumps(canon, indent=2, sort_keys=False) + "\n")
+    print(
+        f"\nCorrected {len(changed)} table-distractor clearance row(s) in {table_path} "
+        f"(>{tol * 1000:.0f}mm divergence; rest byte-identical):"
+    )
+    for c, (old, z, n) in sorted(changed.items()):
+        delta = "NEW" if old is None else f"{(z - float(old)) * 1000:+.1f}mm"
+        print(f"  {c:24} {('—' if old is None else f'{float(old):.5f}'):>9} -> {z:.5f}  (n={n}, Δ={delta})")
+    return changed
+
+
+def _run_distractor_table_only(seeds: int = _DISTRACTOR_FIXTURE_SEEDS) -> None:
+    """Measure ONLY the per-class TABLE distractor clearances and corrective-merge
+    them into ``spawn_clearances.json``. Touches NO other data file (footprints,
+    fixture geometry, on-fixture variant rows are all untouched)."""
+    table_path = pathlib.Path("src/libero_infinity/data/spawn_clearances.json")
+    existing = json.loads(table_path.read_text()).get("clearances", {})
+    samples = measure_distractor_table(existing, seeds=seeds)
+    print(f"\n# distractor-table samples per class (n): "
+          f"{ {c: len(v) for c, v in sorted(samples.items())} }")
+    for c, v in sorted(samples.items()):
+        mode = _dominant_mode(v)
+        old = existing.get(c)
+        chk = f"stored={float(old):.5f} Δ={abs(mode - float(old)) * 1000:.1f}mm" if old is not None else "(NEW)"
+        print(f"  {c:24} mode={mode:.5f} med={statistics.median(v):.5f} n={len(v)}  {chk}")
+    _merge_distractor_table_corrective(table_path, samples)
+
+
 if __name__ == "__main__":
     import sys
 
@@ -967,6 +1121,14 @@ if __name__ == "__main__":
 
     if "--distractor-fixtures-only" in sys.argv:
         _run_distractor_fixtures_only()
+        raise SystemExit(0)
+
+    if "--distractor-table-only" in sys.argv:
+        _seeds = _DISTRACTOR_FIXTURE_SEEDS
+        for _a in sys.argv:
+            if _a.startswith("--seeds="):
+                _seeds = int(_a.split("=", 1)[1])
+        _run_distractor_table_only(seeds=_seeds)
         raise SystemExit(0)
 
     out = measure()
