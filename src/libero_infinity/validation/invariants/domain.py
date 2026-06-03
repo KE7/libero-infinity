@@ -52,6 +52,7 @@ __all__ = [
     "assert_on_predicates_z",
     "assert_goal_false_at_reset",
     "assert_goal_reachable_soft",
+    "assert_goal_region_admits_object",
     "assert_domain",
 ]
 
@@ -563,6 +564,129 @@ def assert_goal_reachable_soft(bddl: Any, scene: Any) -> AssertionResult:
 
 
 # ---------------------------------------------------------------------------
+# B7 — goal region must still admit the goal object (no distractor blocks it)
+# ---------------------------------------------------------------------------
+
+
+# Distractor footprint half-extent (m) — mirrors the renderer's _DISTRACTOR_HALF.
+_DISTRACTOR_HALF = 0.04
+
+
+def _scene_distractor_positions(scene: Any) -> list[tuple[str, tuple[float, float, float]]]:
+    """Return (name, position) for every ACTIVE distractor object in the scene.
+
+    Inactive distractor slots (index ≥ ``n_distractors``) exist in
+    ``scene.objects`` with unconstrained sampled positions but are never
+    injected into MuJoCo (and the renderer's require clauses are gated by
+    ``_n_distractors <= i``, so their positions are not constrained). Scoring
+    them would raise spurious goal-block failures, so we honour the same active
+    count the simulator uses.
+    """
+    params = getattr(scene, "params", {}) or {}
+    n_active = params.get("n_distractors")
+    try:
+        n_active = int(n_active) if n_active is not None else None
+    except (TypeError, ValueError):
+        n_active = None
+    out: list[tuple[str, tuple[float, float, float]]] = []
+    for o in _iter_scene_objects(scene):
+        name = resolve_object_name(o)
+        if not name.startswith("distractor_"):
+            continue
+        if n_active is not None:
+            try:
+                idx = int(name.rsplit("_", 1)[1])
+            except (ValueError, IndexError):
+                idx = None
+            if idx is not None and idx >= n_active:
+                continue  # inactive slot — not injected into MuJoCo
+        pos = _obj_position(o)
+        if pos is not None:
+            out.append((name, pos))
+    return out
+
+
+def assert_goal_region_admits_object(bddl: Any, scene: Any) -> AssertionResult:
+    """No distractor may occupy a goal-relevant region (Fix 1).
+
+    The dual of "no accidental trivialization": *goal impossibilization*. A
+    distractor placed where the goal object must end up (e.g. on the stove
+    burner for ``On(bowl, flat_stove_1_cook_region)``) makes the task
+    physically unsolvable — a generator-validity violation. We re-derive the
+    goal-relevant regions from the BDDL (the SAME resolver the renderer uses to
+    emit the goal-feasibility ``require``) and assert that every active
+    distractor's footprint stays outside each region INFLATED by the goal
+    object's own footprint, so the goal object — placed at the region centre —
+    always has a clear, non-overlapping spot.
+
+    ``passed=None`` only when there is nothing to check (no resolvable goal
+    region, or no distractors in the scene).
+    """
+    try:
+        from libero_infinity.ir.goal_regions import resolve_goal_regions
+        from libero_infinity.ir.graph_builder import build_semantic_scene_graph
+
+        graph = build_semantic_scene_graph(bddl)
+        goal_regions = resolve_goal_regions(graph)
+    except Exception as exc:  # noqa: BLE001 — surfaced, not masked
+        return AssertionResult(
+            name="goal_region_admits_object",
+            passed=None,
+            detail=f"Could not resolve goal regions: {type(exc).__name__}: {exc}",
+            payload={},
+        )
+    if not goal_regions:
+        return AssertionResult(
+            name="goal_region_admits_object",
+            passed=None,
+            detail="No resolvable goal-relevant region for this task.",
+            payload={},
+        )
+    distractors = _scene_distractor_positions(scene)
+    if not distractors:
+        return AssertionResult(
+            name="goal_region_admits_object",
+            passed=None,
+            detail="No distractors in scene — goal region trivially admits the object.",
+            payload={"goal_regions": [gr.target_name for gr in goal_regions]},
+        )
+    blocked: list[dict[str, Any]] = []
+    for gr in goal_regions:
+        thr_x = gr.half_x + gr.obj_half_x + _DISTRACTOR_HALF
+        thr_y = gr.half_y + gr.obj_half_y + _DISTRACTOR_HALF
+        for name, pos in distractors:
+            if abs(pos[0] - gr.cx) <= thr_x and abs(pos[1] - gr.cy) <= thr_y:
+                blocked.append(
+                    {
+                        "distractor": name,
+                        "goal_target": gr.target_name,
+                        "goal_obj": gr.goal_obj_name,
+                        "region_center": [gr.cx, gr.cy],
+                        "distractor_xy": [pos[0], pos[1]],
+                    }
+                )
+    if blocked:
+        return AssertionResult(
+            name="goal_region_admits_object",
+            passed=False,
+            detail=(
+                f"{len(blocked)} distractor(s) occupy a goal-relevant region — "
+                "goal object cannot be placed (task unsolvable)."
+            ),
+            payload={"blocked": blocked},
+        )
+    return AssertionResult(
+        name="goal_region_admits_object",
+        passed=True,
+        detail=(
+            f"All {len(distractors)} distractor(s) clear of "
+            f"{len(goal_regions)} goal-relevant region(s)."
+        ),
+        payload={"goal_regions": [gr.target_name for gr in goal_regions]},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Aggregator
 # ---------------------------------------------------------------------------
 
@@ -574,6 +698,7 @@ DOMAIN_ASSERTIONS: tuple[str, ...] = (
     "on_predicates_z",
     "goal_false_at_reset",
     "goal_reachable_soft",
+    "goal_region_admits_object",
 )
 
 
@@ -596,4 +721,5 @@ def assert_domain(
         assert_on_predicates_z(bddl, scene, tol=tol),
         assert_goal_false_at_reset(bddl, env, goal_evaluator=goal_evaluator),
         assert_goal_reachable_soft(bddl, scene),
+        assert_goal_region_admits_object(bddl, scene),
     ]

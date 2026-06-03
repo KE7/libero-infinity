@@ -13,8 +13,23 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from libero_infinity.asset_metadata import TABLE_SURFACE_Z, surface_spawn_z
+from libero_infinity.asset_metadata import (
+    _FIXTURE_DIMS_FALLBACK,
+    TABLE_SURFACE_Z,
+    distractor_fit_half,
+    distractor_footprint,
+    distractor_half_height,
+    distractor_planar_half,
+    fixture_footprint,
+    fixture_height,
+    fixture_offset,
+    surface_spawn_z,
+)
+from libero_infinity.asset_metadata import (
+    FIXTURE_GEOMETRY as _AM_FIXTURE_GEOMETRY,
+)
 from libero_infinity.asset_registry import get_dimensions
+from libero_infinity.ir.goal_regions import resolve_goal_regions
 from libero_infinity.ir.nodes import (
     FixtureNode,
     MovableSupportNode,
@@ -22,6 +37,7 @@ from libero_infinity.ir.nodes import (
 )
 from libero_infinity.ir.scene_graph import SemanticSceneGraph
 from libero_infinity.planner.types import PerturbationPlan
+from libero_infinity.robot_metadata import RobotFootprint, RobotLink, get_robot_footprint
 
 if TYPE_CHECKING:
     pass
@@ -215,35 +231,41 @@ def _should_emit_fixture_clearance(
 # Fixture footprint dimensions
 # ---------------------------------------------------------------------------
 
-# Conservative (width, length, height) estimates for LIBERO fixture classes.
-# Used for object-fixture clearance constraints.  Also exported via compiler.py
-# as _FIXTURE_DIMENSIONS for callers that need fixture footprint data.
-_FIXTURE_DIMS: dict[str, tuple[float, float, float]] = {
-    # MuJoCo-measured geom extents including door handles and protruding parts:
-    # wooden_cabinet: door handle extends to y=+0.130 m from centre → use (0.30, 0.30)
-    "wooden_cabinet": (0.30, 0.30, 0.24),
-    "white_cabinet": (0.30, 0.30, 0.24),
-    # flat_stove: x extends 0.15 m to the right of centre → use (0.36, 0.20)
-    "flat_stove": (0.36, 0.20, 0.08),
-    "wine_rack": (0.18, 0.12, 0.20),
-    "microwave": (0.24, 0.18, 0.16),
-    "bowl_drainer": (0.18, 0.14, 0.08),
-    # desk_caddy: corrected to match MJCF geom-union AABB (was 0.14, 0.10, 0.06,
-    # off by factor ~4 in y and ~3.5 in z) — see rca/g5_settle_drift_caddy.md §3.
-    "desk_caddy": (0.14, 0.42, 0.22),
-    "wooden_two_layer_shelf": (0.33, 0.20, 0.21),
-    "table": (0.80, 0.60, 0.05),
-    "kitchen_table": (0.80, 0.60, 0.05),
-    "living_room_table": (0.55, 0.65, 0.05),
-    "study_table": (0.50, 0.58, 0.05),
-    "floor": (0.50, 0.55, 0.01),
-}
-_FIXTURE_DIM_DEFAULT = (0.20, 0.18, 0.18)  # conservative fallback
 
-
+# Fixture (width, length, height) for object-fixture clearance constraints.
+#
+# Sourced from MEASURED geometry (``data/fixture_geometry.json`` via
+# ``asset_metadata.fixture_footprint`` / ``fixture_height``) so the footprint
+# matches the real MuJoCo geom AABB. The previous hand-coded ``_FIXTURE_DIMS``
+# under-estimated several fixtures (the cause of distractors slipping onto
+# fixtures unexpectedly); the measured table replaces them, with the same
+# conservative values retained only as the pre-measurement fallback inside
+# ``asset_metadata``.
 def _fixture_dims(fixture_class: str | None) -> tuple[float, float, float]:
-    """Return (width, length, height) for a fixture class."""
-    return _FIXTURE_DIMS.get(fixture_class or "", _FIXTURE_DIM_DEFAULT)
+    """Return measured (width, length, height) for a fixture class (m)."""
+    fw, fl = fixture_footprint(fixture_class)
+    return fw, fl, fixture_height(fixture_class)
+
+
+def _offset_axis_expr(pos_expr: str, off: float) -> str:
+    """Offset-aware fixture clearance center on one axis.
+
+    A fixture's clearance box must be centered on its real geom-AABB center, not
+    its body position — irregular fixtures (flat_stove) carry geometry offset
+    ~100 mm from the body origin. Returns ``pos_expr`` unchanged when the offset
+    is ~0 (centered fixtures → byte-identical emission, zero behaviour change).
+    """
+    return pos_expr if abs(off) < 1e-6 else f"({pos_expr} + {off:.5f})"
+
+
+# Back-compat mapping (re-exported by compiler.py as ``_FIXTURE_DIMENSIONS``):
+# every known fixture class → measured-or-fallback (width, length, height).
+# Built lazily from the same single source of truth ``_fixture_dims`` reads, so
+# the static corpus audit (``fixture_classes <= set(_FIXTURE_DIMENSIONS)``)
+# stays satisfied while the values track the measured geometry.
+_FIXTURE_DIMS: dict[str, tuple[float, float, float]] = {
+    cls: _fixture_dims(cls) for cls in set(_FIXTURE_DIMS_FALLBACK) | set(_AM_FIXTURE_GEOMETRY)
+}
 
 
 # ---------------------------------------------------------------------------
@@ -411,33 +433,118 @@ def _render_fixtures(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     return "\n".join(lines)
 
 
+def _resolve_surface_class(
+    node: "ObjectNode | MovableSupportNode",
+    plan: PerturbationPlan,
+    graph: SemanticSceneGraph,
+) -> str | None:
+    """Resolve the class of the support surface ``node`` rests on, at codegen.
+
+    The support is known from the BDDL ``:init`` semantics carried in the plan /
+    graph: the position plan's ``support_name`` (when the planner anchored the
+    object to a support) or, failing that, a declared ``supported_by`` /
+    ``contained_in`` / ``stacked_on`` edge. Returns the support's object class
+    (e.g. ``"flat_stove"``, ``"wooden_cabinet"``) so the per-(variant, surface)
+    clearance table can resolve the object's settled z for *this* surface
+    context (Finding A: clearance is not surface-invariant). Returns ``None`` for
+    objects resting directly on the default workspace table — the legacy
+    class-only clearance applies there.
+    """
+    pp = plan.position_plans.get(node.instance_name)
+    support_name = pp.support_name if (pp is not None and pp.support_name) else None
+    if support_name is None:
+        # Try the node's own id and its instance name (the graph may key the
+        # node under either) when scanning declared support/containment edges.
+        candidate_ids = [getattr(node, "node_id", None), node.instance_name]
+        for cid in candidate_ids:
+            if cid is None:
+                continue
+            for edge in graph.edges_from(cid):
+                if edge.label in {"supported_by", "contained_in", "stacked_on"}:
+                    support_name = edge.dst_id
+                    break
+            if support_name is not None:
+                break
+    if support_name is None:
+        return None
+    support_node = graph.get_node(support_name)
+    if support_node is None:
+        return None
+    return support_node.object_class or None
+
+
+def _spawn_z_expr(
+    obj_class: str,
+    surface_class: str | None,
+    scenic_class: str | None,
+    variants: list[str] | None,
+) -> str:
+    """Return a Scenic expression string for an object's resolved spawn z.
+
+    When the ``object`` axis substitutes this object's identity (``scenic_class``
+    is the ``_chosen_<class>`` sampler and ``variants`` is its pool), the z is
+    emitted as a conditional chain on the *same* sampled variable, so the chosen
+    variant carries ITS measured seating height on the current surface — Scenic
+    picks the (class, z) pair together (Fix 3 / Finding A). Otherwise a single
+    measured float is emitted, as before.
+    """
+    if scenic_class and variants:
+        # The variant chooser is a Uniform over (class, z) pairs, so the chosen
+        # variant's measured spawn z is the second element of the SAME sample.
+        # Indexing with a constant subscript is a deterministic op on a random
+        # value (allowed by Scenic), unlike an `if`/`==` branch (forbidden).
+        del obj_class, surface_class  # folded into the pair at chooser build time
+        return f"{scenic_class}[1]"
+    return f"{surface_spawn_z(TABLE_SURFACE_Z, obj_class, surface_class):.4f}"
+
+
 def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     lines = ["# Object declarations"]
 
     # Asset variant sampling (object axis)
-    seen_classes: set[str] = set()
-    asset_var_map: dict[str, str] = {}  # object_class -> scenic var name
+    seen_instances: set[str] = set()
+    asset_var_map: dict[str, str] = {}  # instance_name -> scenic chooser var name
+    inst_class: dict[str, str] = {}  # instance_name -> canonical class (for params)
 
     if "object" in plan.active_axes and plan.object_substitutions:
         lines.append("# Asset variant sampling")
+        # Each chooser is a single Uniform over (asset_class, resolved_spawn_z)
+        # PAIRS, so the chosen variant and its measured seating height are drawn
+        # together from ONE sample (Scenic forbids branching on a random value,
+        # so a per-variant ternary is illegal; correlated tuples are the
+        # idiomatic substitute). ``_chosen_X[0]`` is the asset class; the
+        # object's z spec reads ``_chosen_X[1]`` (Fix 3 / Finding A). The z is
+        # resolved against the support surface of the first object of this class.
+        # FV MC #3: key per object INSTANCE, not per class. Two same-class objects
+        # on different supports must each resolve their OWN surface z, and each
+        # instance draws its variant identity independently (intentional: two
+        # same-class objects need not collapse to the same OOD variant, and a
+        # shared per-class chooser would otherwise bind the second instance to the
+        # first instance's surface z).
         for obj_name, variants in plan.object_substitutions.items():
             node = graph.get_node(obj_name)
             if node is None:
                 continue
+            inst = node.instance_name
             obj_class = node.object_class or obj_name
-            if obj_class in seen_classes:
+            if inst in seen_instances:
                 continue
-            seen_classes.add(obj_class)
-            var_name = f"_chosen_{_sanitize(obj_class)}"
-            variants_str = ", ".join(f'"{v}"' for v in variants)
-            lines.append(f"{var_name} = Uniform({variants_str})")
-            asset_var_map[obj_class] = var_name
+            seen_instances.add(inst)
+            var_name = f"_chosen_{_sanitize(inst)}"
+            surface_class = _resolve_surface_class(node, plan, graph)
+            pairs = ", ".join(
+                f'("{v}", {surface_spawn_z(TABLE_SURFACE_Z, v, surface_class):.4f})'
+                for v in variants
+            )
+            lines.append(f"{var_name} = Uniform({pairs})")
+            asset_var_map[inst] = var_name
+            inst_class[inst] = obj_class
 
         if asset_var_map:
-            first_class = next(iter(asset_var_map))
-            first_var = asset_var_map[first_class]
-            lines.append(f'param perturb_class = "{first_class}"')
-            lines.append(f"param chosen_asset = {first_var}")
+            first_inst = next(iter(asset_var_map))
+            first_var = asset_var_map[first_inst]
+            lines.append(f'param perturb_class = "{inst_class[first_inst]}"')
+            lines.append(f"param chosen_asset = {first_var}[0]")
         lines.append("")
 
     # Object placements — topologically sorted so support objects are
@@ -483,7 +590,7 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         obj_name = node.instance_name
         obj_class = node.object_class or obj_name
         var_name = _to_var(obj_name)
-        scenic_class = asset_var_map.get(obj_class)
+        scenic_class = asset_var_map.get(obj_name)
 
         # Position plan
         pos_plan = plan.position_plans.get(obj_name)
@@ -495,10 +602,19 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         # and the simulator silently overrode the z, so pose_tolerance failed on
         # an 8–18 cm z-frame mismatch. We now emit the concrete resolved z via
         # the shared ``surface_spawn_z`` helper — the same function the simulator
-        # calls — so the override becomes a no-op for agreeing objects. The
-        # canonical ``obj_class`` drives the clearance; under an active object
-        # axis the instantiated variant shares its canonical class's clearance.
-        spawn_z = surface_spawn_z(TABLE_SURFACE_Z, obj_class)
+        # calls — so the override becomes a no-op for agreeing objects.
+        #
+        # Fix 3 (Finding A): the clearance is resolved against the object's
+        # ACTUAL support surface (stove vs cabinet top settle ~50 mm apart), and
+        # under an active ``object`` axis the spawn z is emitted as a conditional
+        # on the sampled variant identity, so the instantiated variant carries
+        # its OWN measured seating height instead of inheriting the canonical
+        # class's z. Scenic thus picks the (class, z) pair together.
+        surface_class = _resolve_surface_class(node, plan, graph)
+        object_axis_variants = (
+            plan.object_substitutions.get(obj_name) if "object" in plan.active_axes else None
+        )
+        spawn_z_expr = _spawn_z_expr(obj_class, surface_class, scenic_class, object_axis_variants)
 
         if pos_plan is not None and not pos_plan.use_relative_positioning:
             x_lo = pos_plan.x_envelope.lo
@@ -507,7 +623,7 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
             y_hi = pos_plan.y_envelope.hi
             pos_spec = (
                 f"at Vector(Range({x_lo:.4f}, {x_hi:.4f}), "
-                f"Range({y_lo:.4f}, {y_hi:.4f}), {spawn_z:.4f})"
+                f"Range({y_lo:.4f}, {y_hi:.4f}), {spawn_z_expr})"
             )
         elif pos_plan is not None and pos_plan.use_relative_positioning:
             support_var = _to_var(pos_plan.support_name)
@@ -523,7 +639,7 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
                 f"Range({y_lo:.4f}, {y_hi:.4f}), 0.0)"
             )
         elif node.init_x is not None and node.init_y is not None:
-            pos_spec = f"at Vector({node.init_x:.4f}, {node.init_y:.4f}, {spawn_z:.4f})"
+            pos_spec = f"at Vector({node.init_x:.4f}, {node.init_y:.4f}, {spawn_z_expr})"
         else:
             # No position info — use workspace center
             pos_spec = "in SAFE_REGION"
@@ -540,7 +656,8 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         # instantiated, not the canonical one. Otherwise it is the canonical
         # asset class from the TaskConfig / scene graph.
         if scenic_class:
-            specifiers.append(f"with asset_class {scenic_class}")
+            # ``_chosen_X`` is a (class, z) pair; element [0] is the class.
+            specifiers.append(f"with asset_class {scenic_class}[0]")
         else:
             specifiers.append(f'with asset_class "{obj_class}"')
         specifiers.append(f'with libero_name "{obj_name}"')
@@ -556,6 +673,12 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         # relative) sampling for the child.
         if pos_plan is not None and pos_plan.support_name:
             specifiers.append(f'with support_parent_name "{pos_plan.support_name}"')
+        # Emit the resolved support-surface class so the simulator resolves the
+        # object's settle z through the SAME per-(variant, surface) clearance the
+        # renderer used for spawn_z_expr above — keeping the two in lockstep
+        # (Fix 3 / Finding A). Empty/None means the default workspace table.
+        if surface_class:
+            specifiers.append(f'with support_surface_class "{surface_class}"')
 
         lines.append(f"{var_name} = new LIBEROObject " + ", ".join(specifiers))
 
@@ -620,9 +743,17 @@ def _render_robot(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         dir_terms.append(f"_robot_dir_{idx}")
     norm_expr = " + ".join(f"({_term} * {_term})" for _term in dir_terms)
     lines.append(f"_robot_dir_norm = (({norm_expr}) + 1e-12) ** 0.5")
+    # Per-joint perturbation delta (qpos - canonical), exposed as a reusable
+    # Scenic local so the robot-clearance constraints in ``_render_constraints``
+    # can express each link's *perturbed* world position as a linear function of
+    # the SAME sampled deltas the qpos params consume (Fix 1: robot in the
+    # require graph). Keeping one delta local avoids re-deriving the spherical
+    # sample and guarantees the constraint graph and the applied qpos agree.
+    for idx in range(len(rp.canonical_qpos)):
+        lines.append(f"_robot_dq_{idx} = (_robot_radius * _robot_dir_{idx}) / _robot_dir_norm")
     qpos_refs: list[str] = []
     for idx, qpos in enumerate(rp.canonical_qpos):
-        expr = f"{qpos:.8f} + ((_robot_radius * _robot_dir_{idx}) / _robot_dir_norm)"
+        expr = f"{qpos:.8f} + _robot_dq_{idx}"
         lines.append(f"param robot_init_qpos_{idx} = {expr}")
         qpos_refs.append(f"globalParameters.robot_init_qpos_{idx}")
     lines.append("param robot_init_radius = _robot_radius")
@@ -726,34 +857,313 @@ def _render_sensor_noise(plan: PerturbationPlan, graph: SemanticSceneGraph) -> s
     return "\n".join(lines)
 
 
+# Fallback distractor footprint extents (m), used ONLY when a distractor slot
+# has no sampled class pool (so no measured per-class footprint applies) — the
+# legacy uniform 8 cm-cube proxy (radius = 0.5·sqrt(0.08²+0.08²) ≈ 0.0566). With
+# a class pool the renderer threads each class's MEASURED yaw-robust planar
+# half-extent (``asset_metadata.distractor_planar_half``) instead.
+_DEFAULT_DISTRACTOR_R: float = distractor_planar_half(None)
+_DEFAULT_DISTRACTOR_FIT: float = distractor_fit_half(None)
+_DEFAULT_DISTRACTOR_H: float = distractor_footprint(None)[2]
+# Extra inset (m) so a distractor's footprint stays clear of a support's edge.
+_SUPPORT_EDGE_MARGIN: float = 0.01
+# Fraction of a fixture's measured footprint used for *placement* of an
+# on-fixture distractor. The full measured footprint is used for clearance
+# (so other objects avoid the fixture's true extent), but a distractor is
+# constrained to the central fraction of the top so it reliably settles on the
+# fixture's main resting surface rather than an off-centre post / lip / edge
+# (e.g. a wine rack's frame extends well above its shelf — the central region
+# lands on the shelf, the edge would catch a post at a different height).
+_SUPPORT_CENTRAL_FRAC: float = 0.6
+# Workspace-table half-extents (m) from ``scenic/libero_model.scenic`` (TABLE
+# is 0.40×0.30 about the workspace origin). A table-assigned distractor's centre
+# range is the table half inset by an edge margin and the (per-pool worst-case)
+# footprint radius so even the largest distractor stays on the table.
+_TABLE_HALF_X: float = 0.40
+_TABLE_HALF_Y: float = 0.30
+
+
+def _distractor_fits_fixture(asset_class: str, fixture_class: str | None) -> bool:
+    """True iff a distractor of ``asset_class`` fits the central placement region
+    of ``fixture_class``'s top without overhanging.
+
+    The structural fix (RCA ``distractor_z_convergence.md``): a distractor whose
+    REAL measured footprint cannot sit within the central fraction of a fixture
+    top (minus an edge margin) must not be seated there — otherwise it overhangs,
+    tilts, and settles at an xy-dependent height no single clearance-z can match.
+    Such a class falls back to the (large) workspace table instead.
+    """
+    fw, fl = fixture_footprint(fixture_class)
+    r = distractor_fit_half(asset_class)
+    hx = fw / 2.0 * _SUPPORT_CENTRAL_FRAC - r - _SUPPORT_EDGE_MARGIN
+    hy = fl / 2.0 * _SUPPORT_CENTRAL_FRAC - r - _SUPPORT_EDGE_MARGIN
+    return hx > 0.0 and hy > 0.0
+
+
+def _fitting_pool(classes: list[str], fixture_class: str | None) -> list[str]:
+    """Subset of ``classes`` whose measured footprint fits on ``fixture_class``.
+
+    For the workspace table (``fixture_class is None``) every class fits (the
+    table is large). For a fixture, only classes passing
+    :func:`_distractor_fits_fixture` are kept — the oversized-on-undersized
+    rejection that is the structural win.
+    """
+    if fixture_class is None:
+        return list(classes)
+    return [c for c in classes if _distractor_fits_fixture(c, fixture_class)]
+
+
+def _pool_radius_max(pool: list[str]) -> float:
+    """Worst-case (largest) yaw-robust clearance radius over a class pool."""
+    return max((distractor_planar_half(c) for c in pool), default=_DEFAULT_DISTRACTOR_R)
+
+
+def _pool_fit_half_max(pool: list[str]) -> float:
+    """Worst-case (largest) resting-orientation fit half-extent over a pool."""
+    return max((distractor_fit_half(c) for c in pool), default=_DEFAULT_DISTRACTOR_FIT)
+
+
+def _pool_fit_half_min(pool: list[str]) -> float:
+    """Smallest resting-orientation fit half-extent over a class pool.
+
+    The widest table centre range that still keeps the SMALLEST pool class on the
+    table is inset by this minimum (so a static ``Range`` is the union of every
+    class's feasible region); the per-class on-table containment is enforced
+    per-sample by an explicit ``require`` using the sampled radius — see
+    :func:`_render_constraints`. Insetting by the worst-case (largest) class
+    instead would starve every small distractor of the table when the pool holds
+    one oversized outlier (e.g. desk_caddy).
+    """
+    return min((distractor_fit_half(c) for c in pool), default=_DEFAULT_DISTRACTOR_FIT)
+
+
+def _pool_half_height_max(pool: list[str]) -> float:
+    """Worst-case (largest) half-height over a class pool."""
+    return max((distractor_half_height(c) for c in pool), default=_DEFAULT_DISTRACTOR_H / 2.0)
+
+
+def _fixture_placement_half(
+    fixture_class: str | None, pool: list[str] | None = None
+) -> tuple[float, float]:
+    """Central (x, y) half-range for placing a distractor on a fixture top.
+
+    The central fraction of the measured footprint minus the worst-case (largest)
+    resting-orientation fit half-extent over the slot's fitting class ``pool`` and
+    an edge margin, so EVERY class that may be sampled into the slot settles on
+    the fixture's main top surface (see ``_SUPPORT_CENTRAL_FRAC``). With no pool
+    the legacy uniform proxy half-extent is used.
+    """
+    fw, fl = fixture_footprint(fixture_class)
+    r = _pool_fit_half_max(pool) if pool else _DEFAULT_DISTRACTOR_FIT
+    hx = fw / 2.0 * _SUPPORT_CENTRAL_FRAC - r - _SUPPORT_EDGE_MARGIN
+    hy = fl / 2.0 * _SUPPORT_CENTRAL_FRAC - r - _SUPPORT_EDGE_MARGIN
+    return hx, hy
+
+
+@dataclass(frozen=True)
+class _DistractorSlot:
+    """Resolved support assignment for one distractor slot (Fix 2, option i).
+
+    Each slot is deterministically assigned to a support — the workspace table
+    or a specific non-goal scene fixture — so the renderer can constrain the
+    distractor's (x, y) onto that support's footprint and emit the matching
+    measured spawn z (``surface_spawn_z`` resolves the per-(class, surface)
+    seating height). This is what makes the injected z equal the settled z for
+    distractors, closing the 0/41 distractor pose_tolerance residual.
+    """
+
+    index: int
+    surface_class: str | None  # None → workspace table
+    fixture_name: str | None
+    x_lo: float
+    x_hi: float
+    y_lo: float
+    y_hi: float
+    z_lo: float  # min spawn z over the slot's fitting pool on this support
+    z_hi: float  # max spawn z over the slot's fitting pool on this support
+    # The slot's FITTING class pool — the subset of the distractor pool whose
+    # measured footprint fits this support (the full pool on the table; oversized
+    # classes excluded on a fixture). Empty tuple → no class pool (generic slot).
+    pool: tuple[str, ...] = ()
+    # Classes excluded from this fixture slot because they overhang it (they fall
+    # back to the table). Recorded for the per-slot comment + report.
+    excluded: tuple[str, ...] = ()
+
+
+def _assignable_fixtures(
+    plan: PerturbationPlan, graph: SemanticSceneGraph, pool: list[str]
+) -> list[FixtureNode]:
+    """Scene fixtures a distractor may be placed to rest ON.
+
+    Excludes (a) goal fixtures — a distractor on the goal fixture would block
+    the task (Fix 1), and (b) fixtures on which NO pool class fits without
+    overhanging (the structural rejection — see :func:`_distractor_fits_fixture`).
+    Sorted by instance name for deterministic round-robin assignment.
+    """
+    goal_fixtures = {gr.fixture_name for gr in resolve_goal_regions(graph) if gr.fixture_name}
+    fit_pool = pool or ["distractor"]
+    out: list[FixtureNode] = []
+    for node in graph.nodes.values():
+        if not isinstance(node, FixtureNode):
+            continue
+        if node.init_x is None or node.init_y is None:
+            continue
+        if node.instance_name in goal_fixtures:
+            continue
+        # Assignable iff at least one pool class physically fits the fixture top.
+        if not any(_distractor_fits_fixture(c, node.object_class) for c in fit_pool):
+            continue
+        out.append(node)
+    out.sort(key=lambda f: f.instance_name)
+    return out
+
+
+def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list[_DistractorSlot]:
+    """Assign each distractor slot to a support (table or a non-goal fixture).
+
+    Round-robin over ``[table] + assignable fixtures`` so distractors spread
+    realistically across the table and the scene's fixtures (stove / cabinet /
+    rack) while never landing on the goal fixture. For a fixture slot the class
+    pool is filtered to classes whose MEASURED footprint fits that fixture top
+    (oversized-on-undersized rejection — the structural win); excluded classes
+    still appear on the table slot. Pure function of plan+graph.
+    """
+    n = plan.distractor_budget
+    if n <= 0:
+        return []
+    pool = plan.distractor_classes or []
+    fixtures = _assignable_fixtures(plan, graph, pool)
+    # supports[0] is the table (surface_class=None); the rest are fixtures.
+    supports: list[FixtureNode | None] = [None, *fixtures]
+    slots: list[_DistractorSlot] = []
+    for i in range(n):
+        support = supports[i % len(supports)]
+        excluded: tuple[str, ...] = ()
+        if support is None:
+            surface_class: str | None = None
+            fixture_name: str | None = None
+            slot_pool = list(pool)
+            # Inset the table centre range by the SMALLEST pool fit half-extent so
+            # the static Range is the union of every class's feasible region (the
+            # smallest distractor may use the whole table). Per-class on-table
+            # containment for the actually-sampled class is enforced per-sample by
+            # an explicit require in _render_constraints using _distractor_i_r.
+            # Insetting by the worst-case class here would shrink the table to the
+            # largest outlier (desk_caddy) for EVERY sample, starving the common
+            # small distractors of placement room.
+            r_min = _pool_fit_half_min(slot_pool) if slot_pool else _DEFAULT_DISTRACTOR_FIT
+            hx = max(_TABLE_HALF_X - _SUPPORT_EDGE_MARGIN - r_min, 0.0)
+            hy = max(_TABLE_HALF_Y - _SUPPORT_EDGE_MARGIN - r_min, 0.0)
+            x_lo, x_hi = -hx, hx
+            y_lo, y_hi = -hy, hy
+        else:
+            surface_class = support.object_class or None
+            fixture_name = support.instance_name
+            slot_pool = _fitting_pool(pool, surface_class)
+            excluded = tuple(c for c in pool if c not in slot_pool)
+            # Defensive: a fixture is only assignable if ≥1 class fits, so this is
+            # non-empty — but guard against an empty pool to keep z-range total.
+            if not slot_pool:
+                slot_pool = list(pool)
+            hx, hy = _fixture_placement_half(support.object_class, slot_pool)
+            x_lo, x_hi = float(support.init_x) - hx, float(support.init_x) + hx
+            y_lo, y_hi = float(support.init_y) - hy, float(support.init_y) + hy
+        zs = [surface_spawn_z(TABLE_SURFACE_Z, c, surface_class) for c in slot_pool] or [
+            surface_spawn_z(TABLE_SURFACE_Z, "distractor", surface_class)
+        ]
+        slots.append(
+            _DistractorSlot(
+                index=i,
+                surface_class=surface_class,
+                fixture_name=fixture_name,
+                x_lo=x_lo,
+                x_hi=x_hi,
+                y_lo=y_lo,
+                y_hi=y_hi,
+                z_lo=min(zs),
+                z_hi=max(zs),
+                pool=tuple(slot_pool),
+                excluded=excluded,
+            )
+        )
+    return slots
+
+
 def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
-    del graph
     if plan.distractor_budget <= 0 or "distractor" not in plan.active_axes:
         return ""
     classes = plan.distractor_classes or []
     n = plan.distractor_budget
+    slots = _distractor_slots(plan, graph)
     lines = [
-        "# Distractor objects",
+        "# Distractor objects (Fix 2: each slot assigned to a measured support —",
+        "# the table or a non-goal fixture — with a resolved per-(class, surface)",
+        "# spawn z so injected z == settled z).",
         f"param n_distractors = DiscreteRange(1, {n})",
         "_n_distractors = globalParameters.n_distractors",
     ]
-    if classes:
-        cls_str = ", ".join(f'"{c}"' for c in classes)
-        lines.append(f"_distractor_pool = [{cls_str}]")
-    for i in range(n):
-        if classes:
-            lines.append(f"param distractor_{i}_class = Uniform(*_distractor_pool)")
-        # Scenic 3: specifiers are comma-separated; libero_name is the declared property
+    for slot in slots:
+        i = slot.index
+        support_desc = slot.fixture_name or "table"
+        excl = f"; excluded(oversized→table): {', '.join(slot.excluded)}" if slot.excluded else ""
+        lines.append(f"# distractor_{i} -> {support_desc} [pool: {', '.join(slot.pool)}{excl}]")
+        # Class pool for this slot — the fitting subset (oversized classes already
+        # filtered out for a fixture; full pool on the table).
+        slot_classes = list(slot.pool) if slot.pool else classes
+        if slot_classes:
+            # Correlated (class, resolved_spawn_z, planar_half, height) tuples: the
+            # chosen class and its MEASURED seating height + footprint on THIS
+            # support are drawn together from one sample (Scenic forbids branching
+            # on a random value), so every clearance/declaration sees the real
+            # per-class footprint instead of a uniform 8 cm proxy.
+            pairs = ", ".join(
+                f'("{c}", {surface_spawn_z(TABLE_SURFACE_Z, c, slot.surface_class):.4f}, '
+                f"{distractor_planar_half(c):.4f}, {distractor_footprint(c)[2]:.4f})"
+                for c in slot_classes
+            )
+            lines.append(f"_distractor_{i}_choice = Uniform({pairs})")
+            # Expose the class STRING in params (the simulator reads
+            # ``params['distractor_i_class']`` to patch the BDDL); z / planar-half /
+            # height are the correlated elements of the same sample.
+            lines.append(f"param distractor_{i}_class = _distractor_{i}_choice[0]")
+            lines.append(f"_distractor_{i}_r = _distractor_{i}_choice[2]")
+            lines.append(f"_distractor_{i}_h = _distractor_{i}_choice[3]")
+            z_expr = f"_distractor_{i}_choice[1]"
+            w_expr = f"(2 * _distractor_{i}_r)"
+            l_expr = f"(2 * _distractor_{i}_r)"
+            h_expr = f"_distractor_{i}_h"
+        else:
+            z_expr = f"{surface_spawn_z(TABLE_SURFACE_Z, 'distractor', slot.surface_class):.4f}"
+            w_expr = f"{2 * _DEFAULT_DISTRACTOR_R:.4f}"
+            l_expr = f"{2 * _DEFAULT_DISTRACTOR_R:.4f}"
+            h_expr = f"{_DEFAULT_DISTRACTOR_H:.4f}"
+        pos_spec = (
+            f"at Vector(Range({slot.x_lo:.4f}, {slot.x_hi:.4f}), "
+            f"Range({slot.y_lo:.4f}, {slot.y_hi:.4f}), {z_expr})"
+        )
         specifiers = [
-            "in SAFE_REGION",
+            pos_spec,
             f'with libero_name "distractor_{i}"',
-            "with width 0.08",
-            "with length 0.08",
-            "with height 0.08",
+            f"with width {w_expr}",
+            f"with length {l_expr}",
+            f"with height {h_expr}",
             "with preserve_default_z False",
         ]
-        if classes:
+        if slot_classes:
             specifiers.append(f"with asset_class globalParameters.distractor_{i}_class")
+        # Emit the assigned support-surface class so the simulator resolves the
+        # SAME per-(class, surface) spawn z the renderer used above (lockstep).
+        # Empty/absent → the default workspace table.
+        if slot.surface_class:
+            specifiers.append(f'with support_surface_class "{slot.surface_class}"')
+        # For a fixture-assigned distractor, declare the fixture as its support
+        # parent so the simulator's settled-position validator treats the
+        # intentional distractor↔fixture resting contact as expected (it skips
+        # contacts between an object and its declared support parent) instead of
+        # rejecting the sample. Table-assigned distractors have no support
+        # parent (their table contact is already whitelisted).
+        if slot.fixture_name:
+            specifiers.append(f'with support_parent_name "{slot.fixture_name}"')
         lines.append(f"distractor_{i} = new LIBEROObject " + ", ".join(specifiers))
     lines.append("")
     return "\n".join(lines)
@@ -848,6 +1258,193 @@ def _clearance_relationship(
     return "independent"
 
 
+def _link_pos_exprs(link: RobotLink, n_dof: int) -> tuple[str, str, str]:
+    """Scenic expressions for a link's *perturbed* world position.
+
+    Each coordinate is the canonical origin plus the linearized FK contribution
+    of the sampled joint deltas: ``c0 + Σ_k J_k * _robot_dq_k`` (near-zero
+    Jacobian terms are dropped for compactness). The same ``_robot_dq_k`` locals
+    drive the applied ``robot_init_qpos_k`` params, so the constraint graph and
+    the simulator's applied pose are derived from one sample.
+    """
+
+    def _build(c0: float, jrow: tuple[float, ...]) -> str:
+        terms = [f"{c0:.6f}"]
+        for k in range(min(n_dof, len(jrow))):
+            coef = jrow[k]
+            if abs(coef) < 1e-6:
+                continue
+            terms.append(f"({coef:.6f} * _robot_dq_{k})")
+        return " + ".join(terms)
+
+    return _build(link.x0, link.jx), _build(link.y0, link.jy), _build(link.z0, link.jz)
+
+
+def _render_robot_clearance(
+    footprint: RobotFootprint, plan: PerturbationPlan, graph: SemanticSceneGraph
+) -> list[str]:
+    """Emit 3-D SAT clearance clauses between every movable robot link and every
+    placed object / distractor / fixture (Fix 1; RCA Finding B).
+
+    The z term is required, not optional: at the home pose the arm sits ~30 cm
+    above the table, so a pure-xy shadow would reject every object beneath the
+    (stationary) arm. The z projection only rejects samples where the perturbed
+    link actually dips into the target's slab. A static z prune drops (link,
+    target) pairs whose measured swept-z ranges can never overlap.
+    """
+    rp = plan.robot_plan
+    if rp is None:
+        return []
+    active_links = footprint.active_links()
+    if not active_links:
+        return []
+    n_dof = footprint.n_dof or len(rp.canonical_qpos)
+
+    # target = (guard_prefix, cx_expr, cy_expr, cz_expr, thx, thy, thz, z_lo, z_hi)
+    targets: list[tuple[str, str, str, str, float, float, float, float | None, float | None]] = []
+
+    # Task objects / movable supports.
+    for node_id, node in graph.nodes.items():
+        if not isinstance(node, (ObjectNode, MovableSupportNode)):
+            continue
+        if isinstance(node, ObjectNode) and node.contained:
+            continue
+        var = _to_var(node.instance_name)
+        obj_class = node.object_class or node.instance_name
+        # FV MC #6: a substituted OOD variant may be WIDER (and taller) than the
+        # canonical class. The clearance half-extents must bound the widest
+        # footprint the object axis can instantiate -- mirroring the max-over-pool
+        # already done for z (zs) below -- or canonical-only thx/thy admit an AABB
+        # overlap for wide variants that the simulator must then shove.
+        variants = (
+            plan.object_substitutions.get(node.instance_name)
+            if "object" in plan.active_axes
+            else None
+        )
+        pool_classes = [obj_class] + list(variants or [])
+        thx = max(get_dimensions(c)[0] for c in pool_classes) / 2.0
+        thy = max(get_dimensions(c)[1] for c in pool_classes) / 2.0
+        thz = max(get_dimensions(c)[2] for c in pool_classes) / 2.0
+        pp = plan.position_plans.get(node.instance_name)
+        surface_class = _resolve_surface_class(node, plan, graph)
+        if pp is not None and pp.use_relative_positioning:
+            # Support-inherited z: not statically known, so never prune; the
+            # dynamic z term still guards correctly.
+            z_lo = z_hi = None
+        else:
+            zs = [surface_spawn_z(TABLE_SURFACE_Z, obj_class, surface_class)]
+            if variants:
+                zs.extend(surface_spawn_z(TABLE_SURFACE_Z, v, surface_class) for v in variants)
+            z_lo = min(zs) - thz
+            z_hi = max(zs) + thz
+        targets.append(
+            (
+                "",
+                f"{var}.position.x",
+                f"{var}.position.y",
+                f"{var}.position.z",
+                thx,
+                thy,
+                thz,
+                z_lo,
+                z_hi,
+            )
+        )
+
+    # Distractors (guarded by the active-count gate).
+    if plan.distractor_budget > 0 and "distractor" in plan.active_axes:
+        # Fix 2: each distractor is assigned to a measured support and emitted
+        # ``at Vector(..., resolved_spawn_z)``, so ``distractor_{i}.position.z``
+        # now equals the world settle z the simulator uses (same
+        # ``surface_spawn_z``). Reference it directly instead of a single
+        # canonical constant — a distractor resting on a fixture sits ~10 cm
+        # higher than one on the table, and a single constant z would mis-guard
+        # the robot↔distractor clause for fixture-assigned slots. The static
+        # z-prune band is the slot's per-pool spawn-z range padded by the
+        # worst-case distractor half-height. The robot-clearance half-extents are
+        # the slot's worst-case (largest) MEASURED footprint radius/half-height —
+        # a static over-bound that keeps the robot↔distractor clause SAT-correct
+        # for whatever class is sampled into the slot (robot is ≥100 mm clear in
+        # practice — RCA finding_b_robot_shove — so this never over-constrains).
+        for slot in _distractor_slots(plan, graph):
+            i = slot.index
+            guard = f"(_n_distractors <= {i}) or "
+            r_slot = _pool_radius_max(list(slot.pool)) if slot.pool else _DEFAULT_DISTRACTOR_R
+            hh_slot = (
+                _pool_half_height_max(list(slot.pool)) if slot.pool else _DEFAULT_DISTRACTOR_H / 2.0
+            )
+            targets.append(
+                (
+                    guard,
+                    f"distractor_{i}.position.x",
+                    f"distractor_{i}.position.y",
+                    f"distractor_{i}.position.z",
+                    r_slot,
+                    r_slot,
+                    hh_slot,
+                    slot.z_lo - hh_slot,
+                    slot.z_hi + hh_slot,
+                )
+            )
+
+    # Fixtures (immovable; world-z slab from the measured table height + height).
+    for _node_id, fnode in graph.nodes.items():
+        if not isinstance(fnode, FixtureNode):
+            continue
+        if fnode.init_x is None or fnode.init_y is None:
+            continue
+        fdims = _fixture_dims(fnode.object_class)
+        fh = fdims[2]
+        fz_center = footprint.table_world_z + fh / 2.0
+        # Offset-aware center (real geom-AABB center vs body origin) — see
+        # RCA robot_distractor_settle.md; (0,0) for centered fixtures.
+        fox, foy = fixture_offset(fnode.object_class)
+        targets.append(
+            (
+                "",
+                f"{fnode.init_x + fox:.4f}",
+                f"{fnode.init_y + foy:.4f}",
+                f"{fz_center:.4f}",
+                fdims[0] / 2.0,
+                fdims[1] / 2.0,
+                fh / 2.0,
+                footprint.table_world_z,
+                footprint.table_world_z + fh,
+            )
+        )
+
+    if not targets:
+        return []
+
+    lines = [
+        "",
+        "# Robot link clearance (Fix 1: perturbed robot init pose in the require graph).",
+        "# Each link's perturbed world position is a linear (Jacobian) function of the",
+        "# sampled joint deltas _robot_dq_k; the SAT-correct 3-D AABB clause keeps every",
+        "# placed object, distractor and fixture out of the link's measured world AABB so",
+        "# MuJoCo settle need not shove them (RCA Finding B). Footprints are measured by",
+        "# scripts/measure_robot_link_footprints.py.",
+    ]
+    for link in active_links:
+        lx, ly, lz = _link_pos_exprs(link, n_dof)
+        sv = _sanitize(link.name)
+        lines.append(f"_rc_{sv}_x = {lx}")
+        lines.append(f"_rc_{sv}_y = {ly}")
+        lines.append(f"_rc_{sv}_z = {lz}")
+        for guard, cx, cy, cz, thx, thy, thz, z_lo, z_hi in targets:
+            if z_lo is not None and (link.z_min > z_hi or link.z_max < z_lo):
+                continue
+            dx = link.hx + thx
+            dy = link.hy + thy
+            dz = link.hz + thz
+            lines.append(
+                f"require {guard}(abs(_rc_{sv}_x - {cx}) > {dx:.4f}) "
+                f"or (abs(_rc_{sv}_y - {cy}) > {dy:.4f}) "
+                f"or (abs(_rc_{sv}_z - {cz}) > {dz:.4f})"
+            )
+    return lines
+
+
 def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     lines = ["# Distance constraints"]
 
@@ -882,7 +1479,17 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             continue
         var_name = _to_var(node.instance_name)
         obj_class = node.object_class or node.instance_name
-        dims = get_dimensions(obj_class)
+        # FV MC #6: bound the footprint by the WIDEST variant the object axis can
+        # substitute, not just the canonical class (a wider OOD variant otherwise
+        # slips through the pairwise / fixture / distractor AABB clearance and the
+        # simulator shoves it). Mirrors the max-over-pool the robot-clearance
+        # z-prune already does.
+        _pool = [obj_class] + (
+            list(plan.object_substitutions.get(node.instance_name) or [])
+            if "object" in plan.active_axes
+            else []
+        )
+        dims = tuple(max(get_dimensions(c)[k] for c in _pool) for k in range(3))
         sampled = _is_sampled(node, plan)
         obj_info.append((var_name, dims, node.instance_name, sampled))
 
@@ -969,13 +1576,16 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             continue
         fvar = _to_var(fnode.instance_name)
         fdims = _fixture_dims(fnode.object_class)
+        fox, foy = fixture_offset(fnode.object_class)
+        fcx = _offset_axis_expr(f"{fvar}.position.x", fox)
+        fcy = _offset_axis_expr(f"{fvar}.position.y", foy)
         for var_name, dims, _name, sampled in obj_info:
             if not _should_emit_fixture_clearance(var_name, sampled, fvar, support_relations):
                 continue
             dx_min, dy_min = _footprint_clearance_aabb(fdims, dims)
             lines.append(
-                f"require (abs({var_name}.position.x - {fvar}.position.x) > {dx_min:.4f}) "
-                f"or (abs({var_name}.position.y - {fvar}.position.y) > {dy_min:.4f})"
+                f"require (abs({var_name}.position.x - {fcx}) > {dx_min:.4f}) "
+                f"or (abs({var_name}.position.y - {fcy}) > {dy_min:.4f})"
             )
 
     # Anti-trivialization: note in params that it's active
@@ -983,57 +1593,132 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         lines.append("")
         lines.append('param anti_trivialization = "active"')
 
-    # Distractor clearance (fixed small margin — distractors are intentionally small).
-    # Distractors do not currently carry a PositionPlan with a declared support
-    # relation, so ``_should_emit_fixture_clearance`` for a synthetic
-    # distractor var would always return True; we keep the existing
-    # distractor-vs-fixture loop unconditional but wire it through the
-    # helper to remain forward-compatible if the planner is later extended
-    # to put distractors on a fixture.
-    obj_vars = [var for var, _, _n, _s in obj_info]
+    # Distractor clearance. Under Fix 2 (option i) each distractor is assigned a
+    # support — the table or a specific non-goal fixture — and is constrained to
+    # rest ON it (its (x, y) range is the support footprint). So the distractor↔
+    # fixture clearance must SKIP the distractor's *assigned* fixture (the
+    # placement is intentional and the exclusion would be unsatisfiable), while
+    # keeping the exclusion against every OTHER fixture. Fix 1 adds a goal-region
+    # exclusion so no distractor blocks the goal object's required footprint.
     if plan.distractor_budget > 0 and "distractor" in plan.active_axes:
-        distractor_dims = (0.08, 0.08, 0.08)
-        # Diagonal-radius clearance between two AABBs of equal half-extent h
-        # is 2 * sqrt(2) * h ≈ 2.828 h. For h = 0.04 m this is ≈ 0.1131 m.
-        # The previous 0.06 threshold was the *axis-aligned* sum of half-
-        # widths only; two distractors aligned diagonally could satisfy
-        # `distance > 0.06` while their AABBs still overlapped on both axes.
-        _DISTRACTOR_PAIR_CLEARANCE = math.sqrt(distractor_dims[0] ** 2 + distractor_dims[1] ** 2)
+        # Each distractor's footprint enters clearance through its MEASURED
+        # yaw-robust planar half-extent ``_distractor_{i}_r`` (the correlated
+        # element of its (class, z, r, h) sample — emitted by _render_distractors),
+        # NOT a uniform 8 cm proxy. ``_distractor_{i}_r`` is a circumscribed
+        # radius, so it bounds the footprint under any settle yaw / the ~90° tip;
+        # using it as the half-extent on BOTH axes is the SAT-correct over-bound.
+        # When the plan has no class pool, fall back to the legacy proxy radius.
+        have_classes = bool(plan.distractor_classes)
+
+        def _r_tok(idx: int) -> str:
+            return f"_distractor_{idx}_r" if have_classes else f"{_DEFAULT_DISTRACTOR_R:.4f}"
+
+        slots = _distractor_slots(plan, graph)
+        assigned_fixture = {s.index: s.fixture_name for s in slots}
+        slot_by_index = {s.index: s for s in slots}
         for i in range(plan.distractor_budget):
             d_var = f"distractor_{i}"
-            for var in obj_vars:
+            r_i = _r_tok(i)
+            # On-table containment (table-assigned slots only): the SAMPLED class
+            # must keep its full footprint on the workspace table. The static
+            # placement Range is inset by only the SMALLEST pool fit-half (so small
+            # distractors may use the whole table); this per-sample require trims
+            # the actually-sampled class by its own radius r_i, so an oversized
+            # class (desk_caddy) is confined to — or rejected from — the table by
+            # its real footprint instead of shrinking the table for everyone.
+            slot_i = slot_by_index.get(i)
+            if slot_i is not None and slot_i.fixture_name is None:
+                cx_b = _TABLE_HALF_X - _SUPPORT_EDGE_MARGIN
+                cy_b = _TABLE_HALF_Y - _SUPPORT_EDGE_MARGIN
                 lines.append(
-                    f"require (_n_distractors <= {i}) or ((distance from {d_var} to {var}) > 0.13)"
+                    f"require (_n_distractors <= {i}) "
+                    f"or ((abs({d_var}.position.x) < ({cx_b:.4f} - {r_i})) "
+                    f"and (abs({d_var}.position.y) < ({cy_b:.4f} - {r_i})))"
+                )
+            # Distractor↔object clearance: SAT-correct per-axis AABB OR-form.
+            # Two AABBs are non-overlapping iff disjoint on x OR y; the distractor
+            # half-extent is its per-class radius r_i, the object's is its
+            # measured half-footprint.
+            for var, dims, _n, _s in obj_info:
+                ohx, ohy = dims[0] / 2.0, dims[1] / 2.0
+                lines.append(
+                    f"require (_n_distractors <= {i}) "
+                    f"or (abs({d_var}.position.x - {var}.position.x) > ({ohx:.4f} + {r_i})) "
+                    f"or (abs({d_var}.position.y - {var}.position.y) > ({ohy:.4f} + {r_i}))"
                 )
             for j in range(i + 1, plan.distractor_budget):
+                # Distractor↔distractor: SAT-correct AABB OR-form using both
+                # sampled per-class radii (replaces the old fixed diagonal radius).
+                r_j = _r_tok(j)
                 lines.append(
                     f"require (_n_distractors <= {i}) "
                     f"or (_n_distractors <= {j}) "
-                    f"or ((distance from {d_var} to distractor_{j}) "
-                    f"> {_DISTRACTOR_PAIR_CLEARANCE:.4f})"
+                    f"or (abs({d_var}.position.x - distractor_{j}.position.x) > ({r_i} + {r_j})) "
+                    f"or (abs({d_var}.position.y - distractor_{j}.position.y) > ({r_i} + {r_j}))"
                 )
             for node_id, fnode in graph.nodes.items():
                 if not isinstance(fnode, FixtureNode):
                     continue
                 if fnode.init_x is None or fnode.init_y is None:
                     continue
+                # Skip the fixture this distractor is intentionally resting ON.
+                # Emitting a non-overlap clearance against the assigned support
+                # would carve out a measure-zero feasible region (the distractor
+                # IS inside that footprint by construction).
+                if assigned_fixture.get(i) == fnode.instance_name:
+                    continue
                 fvar = _to_var(fnode.instance_name)
-                # Distractors are always Scenic-sampled (they have no BDDL
-                # canonical position) and currently have no support relations,
-                # so the helper trivially returns True today.  Routing
-                # through the helper keeps a future planner extension
-                # (e.g., distractors-on-fixtures) automatically correct.
                 if not _should_emit_fixture_clearance(d_var, True, fvar, support_relations):
                     continue
                 fdims = _fixture_dims(fnode.object_class)
-                # SAT-correct AABB OR-form (see object↔fixture comment block
-                # above and rca/stage4_c1_addendum_10_task_footprint.md).
-                dx_min, dy_min = _footprint_clearance_aabb(fdims, distractor_dims)
+                fhx, fhy = fdims[0] / 2.0, fdims[1] / 2.0
+                # Offset-aware center: guard the real geom-AABB center, not the
+                # body origin — an offset fixture (flat_stove, +95 mm in x) would
+                # otherwise leave a strip of its real footprint unguarded, and the
+                # table distractor sampled there is injected penetrating it →
+                # contact-solver launch (RCA robot_distractor_settle.md).
+                fox, foy = fixture_offset(fnode.object_class)
+                fcx = _offset_axis_expr(f"{fvar}.position.x", fox)
+                fcy = _offset_axis_expr(f"{fvar}.position.y", foy)
+                # SAT-correct AABB OR-form (see object↔fixture comment block above).
                 lines.append(
                     f"require (_n_distractors <= {i}) "
-                    f"or (abs({d_var}.position.x - {fvar}.position.x) > {dx_min:.4f}) "
-                    f"or (abs({d_var}.position.y - {fvar}.position.y) > {dy_min:.4f})"
+                    f"or (abs({d_var}.position.x - {fcx}) > ({fhx:.4f} + {r_i})) "
+                    f"or (abs({d_var}.position.y - {fcy}) > ({fhy:.4f} + {r_i}))"
                 )
+
+        # Fix 1 — goal-feasibility: no distractor may occupy a goal-relevant
+        # region. A distractor in the place the goal object must end up (e.g. on
+        # the stove burner for ``On(bowl, flat_stove_1_cook_region)``) makes the
+        # task physically unsolvable. For each goal region we keep every
+        # distractor's footprint outside the region INFLATED by the goal
+        # object's footprint, so the goal object — placed at the region centre —
+        # always has a clear, non-overlapping spot (SAT-correct AABB OR-form).
+        goal_regions = resolve_goal_regions(graph)
+        if goal_regions:
+            lines.append("# Goal-feasibility (Fix 1): distractor must not block the goal object's")
+            lines.append("# required final footprint at any goal-relevant region.")
+        for gr in goal_regions:
+            cx_dx = gr.half_x + gr.obj_half_x
+            cx_dy = gr.half_y + gr.obj_half_y
+            for i in range(plan.distractor_budget):
+                d_var = f"distractor_{i}"
+                r_i = _r_tok(i)
+                lines.append(
+                    f"require (_n_distractors <= {i}) "
+                    f"or (abs({d_var}.position.x - {gr.cx:.4f}) > ({cx_dx:.4f} + {r_i})) "
+                    f"or (abs({d_var}.position.y - {gr.cy:.4f}) > ({cx_dy:.4f} + {r_i}))"
+                )
+
+    # Robot link clearance (Fix 1): put the perturbed robot init pose into the
+    # require graph so Scenic rejects samples where a perturbed arm link's volume
+    # intersects a placed object/distractor/fixture (otherwise MuJoCo settle
+    # resolves the penetration by shoving the object 40–260 mm in xy — the
+    # dominant pose_tolerance failure in RCA Finding B).
+    if plan.robot_plan is not None and "robot" in plan.active_axes:
+        footprint = get_robot_footprint(plan.robot_plan.robot_model)
+        if footprint is not None:
+            lines.extend(_render_robot_clearance(footprint, plan, graph))
 
     lines.append("")
     return "\n".join(lines)

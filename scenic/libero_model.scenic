@@ -39,13 +39,13 @@ Scenic 3 notes
 # ──────────────────────────────────────────────────────────────────────────────
 # Physical constants (metres, matching LIBERO arena XML)
 # ──────────────────────────────────────────────────────────────────────────────
-TABLE_Z      = 0.82      # table-surface height in MuJoCo world frame (floor → 0)
-TABLE_WIDTH  = 0.80      # full extent in x
-TABLE_LENGTH = 0.60      # full extent in y
-TABLE_X_MIN  = -0.40
-TABLE_X_MAX  =  0.40
-TABLE_Y_MIN  = -0.30
-TABLE_Y_MAX  =  0.30
+TABLE_Z = 0.82  # table-surface height in MuJoCo world frame (floor → 0)
+TABLE_WIDTH = 0.80  # full extent in x
+TABLE_LENGTH = 0.60  # full extent in y
+TABLE_X_MIN = -0.40
+TABLE_X_MAX = 0.40
+TABLE_Y_MIN = -0.30
+TABLE_Y_MAX = 0.30
 
 # Minimum object-object clearance for the rejection sampler (metres)
 MIN_OBJ_CLEARANCE = 0.10
@@ -77,20 +77,29 @@ TABLE_REGION = BoxRegion(
 # Objects placed `in SAFE_REGION` have their centre ≥ WORKSPACE_MARGIN from
 # workspace edges, ensuring robot reachability without explicit boundary requires.
 SAFE_REGION = BoxRegion(
-    dimensions=(TABLE_WIDTH - 2 * WORKSPACE_MARGIN, TABLE_LENGTH - 2 * WORKSPACE_MARGIN, TABLE_REGION_Z_THICKNESS),
+    dimensions=(
+        TABLE_WIDTH - 2 * WORKSPACE_MARGIN,
+        TABLE_LENGTH - 2 * WORKSPACE_MARGIN,
+        TABLE_REGION_Z_THICKNESS,
+    ),
     position=Vector(0.0, 0.0, TABLE_Z),
 )
 
 # Wider-margin safe region for large objects (plates, etc.) that need extra
 # edge clearance so their footprint does not overhang the table boundary.
 PLATE_SAFE_REGION = BoxRegion(
-    dimensions=(TABLE_WIDTH - 2 * PLATE_WORKSPACE_MARGIN, TABLE_LENGTH - 2 * PLATE_WORKSPACE_MARGIN, TABLE_REGION_Z_THICKNESS),
+    dimensions=(
+        TABLE_WIDTH - 2 * PLATE_WORKSPACE_MARGIN,
+        TABLE_LENGTH - 2 * PLATE_WORKSPACE_MARGIN,
+        TABLE_REGION_Z_THICKNESS,
+    ),
     position=Vector(0.0, 0.0, TABLE_Z),
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Object classes
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class LIBEROObject(Object):
     """A movable object on the workspace table.
@@ -124,16 +133,25 @@ class LIBEROObject(Object):
         Optional Scenic-level support parent for support-preserving perturbation.
         Used for debugging/tests; empty string means this object is sampled as
         an independent root object.
+
+    support_surface_class : str
+        Class of the support surface this object rests on at init (e.g.
+        "flat_stove", "wooden_cabinet"); empty string means the default
+        workspace table. The simulator passes it to ``surface_spawn_z`` so the
+        renderer's emitted spawn z and the simulator's settle z resolve the
+        SAME per-(variant, surface) clearance (Fix 3 / Finding A).
     """
-    libero_name:     ""
-    asset_class:     ""
-    graspable:       True
+
+    libero_name: ""
+    asset_class: ""
+    graspable: True
     allowCollisions: True
     preserve_default_z: True
     support_parent_name: ""
-    width:           0.08
-    length:          0.08
-    height:          0.06
+    support_surface_class: ""
+    width: 0.08
+    length: 0.08
+    height: 0.06
 
 
 class LIBEROFixture(Object):
@@ -144,13 +162,14 @@ class LIBEROFixture(Object):
     Their positions come from the BDDL :fixtures block and are injected
     by LIBEROSimulation.setup() via body_pos, not via free joints.
     """
-    libero_name:  ""
-    asset_class:  ""
-    graspable:    False
+
+    libero_name: ""
+    asset_class: ""
+    graspable: False
     allowCollisions: True
-    width:        0.20
-    length:       0.30
-    height:       0.40
+    width: 0.20
+    length: 0.30
+    height: 0.40
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -160,7 +179,13 @@ class LIBEROFixture(Object):
 import json as _json
 import pathlib as _pathlib
 
-_asset_json_path = _pathlib.Path(__file__).resolve().parent.parent / "src" / "libero_infinity" / "data" / "asset_variants.json"
+_asset_json_path = (
+    _pathlib.Path(__file__).resolve().parent.parent
+    / "src"
+    / "libero_infinity"
+    / "data"
+    / "asset_variants.json"
+)
 _asset_data = _json.loads(_asset_json_path.read_text())
 ASSET_VARIANTS = _asset_data["variants"]
 OBJECT_DIMENSIONS = _asset_data.get("dimensions", {})
@@ -175,7 +200,12 @@ DISTRACTOR_POOL = _asset_data.get("distractor_pool", [])
 # ──────────────────────────────────────────────────────────────────────────────
 _LIBERO_TEXTURE_DIR = (
     _pathlib.Path(__file__).resolve().parent.parent
-    / "vendor" / "libero" / "libero" / "libero" / "assets" / "textures"
+    / "vendor"
+    / "libero"
+    / "libero"
+    / "libero"
+    / "assets"
+    / "textures"
 )
 LIBERO_BACKGROUND_TEXTURES = (
     sorted([_p.stem for _p in _LIBERO_TEXTURE_DIR.glob("*.png")])

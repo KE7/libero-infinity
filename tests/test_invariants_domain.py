@@ -378,7 +378,7 @@ def test_goal_reachable_soft_skip_no_goal():
 # ---------------------------------------------------------------------------
 
 
-def test_assert_domain_runs_all_six():
+def test_assert_domain_runs_all_seven():
     bddl = _BDDL(
         movable_objects=[_BDDLObj("bowl_1", "akita_black_bowl")],
         init_text="(On bowl_1 plate_1)",
@@ -391,7 +391,7 @@ def test_assert_domain_runs_all_six():
         ]
     )
     results = assert_domain(bddl, scene, registry={"akita_black_bowl", "plate"}, env=_Env(False))
-    assert len(results) == 6
+    assert len(results) == 7
     names = [r.name for r in results]
     assert names == [
         "bddl_objects_present",
@@ -400,8 +400,12 @@ def test_assert_domain_runs_all_six():
         "on_predicates_z",
         "goal_false_at_reset",
         "goal_reachable_soft",
+        "goal_region_admits_object",  # skip (fake BDDL → no resolvable region)
     ]
-    # Mujoco skipped, but everything else passes.
+    # Mujoco skipped (None); goal_region_admits_object skips (None) here because
+    # the fake _BDDL is not a TaskConfig, so no goal region resolves.
     statuses = {r.name: r.passed for r in results}
     assert statuses["no_initial_collisions"] is None
-    assert all(statuses[k] is True for k in statuses if k != "no_initial_collisions")
+    assert statuses["goal_region_admits_object"] is None
+    skipped = {"no_initial_collisions", "goal_region_admits_object"}
+    assert all(statuses[k] is True for k in statuses if k not in skipped)

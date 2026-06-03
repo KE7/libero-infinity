@@ -149,16 +149,17 @@ def _scenic_quat(scenic_orientation) -> np.ndarray:
         return DEFAULT_ORIENTATIONS["_default"].copy()
 
 
-def _surface_spawn_z(surface_z: float, asset_class: str) -> float:
+def _surface_spawn_z(surface_z: float, asset_class: str, surface_class: str | None = None) -> float:
     """Resolved object-centre z for spawning directly on a root surface.
 
     Thin delegate to the shared, pure :func:`asset_metadata.surface_spawn_z` so
     the simulator and the Scenic renderer resolve byte-identical spawn z for the
-    same ``(surface_z, asset_class)`` — the G4 family-C ``pose_tolerance``
-    invariant relies on both sides agreeing (see ``asset_metadata`` docstring
-    and ``rca/stage1_g4_consistency_pose_frame_mismatch.md``).
+    same ``(surface_z, asset_class, surface_class)`` — the G4 family-C
+    ``pose_tolerance`` invariant relies on both sides agreeing (see
+    ``asset_metadata`` docstring and
+    ``rca/stage1_g4_consistency_pose_frame_mismatch.md``).
     """
-    return _shared_surface_spawn_z(surface_z, asset_class)
+    return _shared_surface_spawn_z(surface_z, asset_class, surface_class)
 
 
 def _bddl_contained_object_names(bddl_path: str) -> set[str]:
@@ -980,9 +981,14 @@ class LIBEROSimulation(Simulation):
             ):
                 pos[2] = default_pose[libero_name][2]
             else:
+                # surface_class lets the variant table resolve a per-(variant,
+                # surface) clearance identical to the renderer's emitted spawn z
+                # (Fix 3 / Finding A). Empty string → default workspace table.
+                _surface_class = getattr(obj, "support_surface_class", "") or None
                 pos[2] = _surface_spawn_z(
                     root_surface_z,
                     getattr(obj, "asset_class", "_default"),
+                    _surface_class,
                 )
                 table_spawned_names.add(libero_name)
             self._inject_object_pose(libero_name, pos, obj)

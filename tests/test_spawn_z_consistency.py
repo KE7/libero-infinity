@@ -101,7 +101,16 @@ def test_renderer_emits_concrete_resolved_z_for_table_objects() -> None:
 
     # The akita_black_bowl is placed absolutely on the table; its resolved z
     # must appear as a concrete literal in the bowl's placement vector.
-    bowl_z = surface_spawn_z(TABLE_SURFACE_Z, "akita_black_bowl")
+    #
+    # PR #24 (FV Finding A, per-(variant, surface) clearance): ``main_table`` is
+    # a WorkspaceNode whose object class is ``"table"``, so the renderer resolves
+    # the bowl's support-surface class to ``"table"`` and emits the measured
+    # per-(variant, surface) settled z for ``("akita_black_bowl"|"table")`` — not
+    # the legacy class-only value. Resolve the expected z through the SAME call
+    # the renderer uses (surface_class="table"), so the test tracks the resolved
+    # spawn z regardless of whether the variant table is populated (the renderer
+    # and this assertion fall back identically when it is absent).
+    bowl_z = surface_spawn_z(TABLE_SURFACE_Z, "akita_black_bowl", "table")
     z_literal = f"{bowl_z:.4f}"
     obj_lines = [
         ln for ln in src.splitlines() if "new LIBEROObject" in ln and "akita_black_bowl_1" in ln
