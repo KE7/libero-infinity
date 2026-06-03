@@ -34,7 +34,25 @@
       "white_yellow_mug|kitchen_table": 9,
       "wooden_tray|kitchen_table": 12
     },
-    "n_distractor_fixture_rows": 22
+    "n_distractor_fixture_rows": 28,
+    "flat_stove_box_rows_v9": {
+      "description": "box\u00d7flat_stove rows added v9. The analytic fallback (top_z+table) over-estimated by ~77-80mm because flat_stove AABB top_z=0.135 is the highest geom, not the burner-grate rest surface (~0.055 above table). Measured directly in-scene (crash-safe subprocess-isolated measurement). cream_cheese|flat_stove derived from sibling rest surface (0 direct RNG samples).",
+      "chocolate_pudding|flat_stove": {
+        "value": 0.15795,
+        "n": 12,
+        "method": "direct"
+      },
+      "popcorn|flat_stove": {
+        "value": 0.15462,
+        "n": 4,
+        "method": "direct"
+      },
+      "cream_cheese|flat_stove": {
+        "value": 0.15474,
+        "n": 0,
+        "method": "derived(rest+table)"
+      }
+    }
   },
   "clearances": {
     "akita_black_bowl|kitchen_table": 0.10094,
@@ -54,6 +72,7 @@
     "butter|wooden_cabinet": 0.32697,
     "chefmate_8_frypan|kitchen_table": 0.10039,
     "chefmate_8_frypan|table": 0.10039,
+    "chocolate_pudding|flat_stove": 0.15795,
     "chocolate_pudding|kitchen_table": 0.10023,
     "chocolate_pudding|microwave": 0.31106,
     "chocolate_pudding|table": 0.10023,
@@ -62,6 +81,7 @@
     "cookies|flat_stove": 0.17594,
     "cookies|microwave": 0.32848,
     "cookies|wooden_cabinet": 0.34915,
+    "cream_cheese|flat_stove": 0.15474,
     "cream_cheese|kitchen_table": 0.08672,
     "cream_cheese|microwave": 0.30909,
     "cream_cheese|table": 0.08672,
@@ -82,6 +102,7 @@
     "orange_juice|table": 0.14968,
     "plate|kitchen_table": 0.10063,
     "plate|table": 0.10063,
+    "popcorn|flat_stove": 0.15462,
     "popcorn|microwave": 0.309,
     "popcorn|wooden_cabinet": 0.32878,
     "porcelain_mug|kitchen_table": 0.10024,
