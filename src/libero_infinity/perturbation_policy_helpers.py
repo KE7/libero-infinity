@@ -14,6 +14,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Mapping
 
+from libero_infinity import semantic_registries as _semantic_registries
 from libero_infinity.bddl_preprocessor import _extract_block, _find_closing_paren
 from libero_infinity.task_config import (
     _IMMOBILE_WORKSPACE_FIXTURES,
@@ -27,13 +28,20 @@ _YAW_ROTATION_RE = re.compile(
     r"\(:yaw_rotation\s*\(\s*\(\s*([-+eE0-9.]+)\s+([-+eE0-9.]+)\s*\)\s*\)\s*\)"
 )
 
-_SUPPORT_SCALE_BY_TYPE: dict[str, tuple[float, float]] = {
+# Per-support-type local-perturbation scale factors. Resolved from
+# ``data/support_scale_factors.json`` (WS-4 hardcoding audit); the dict below is
+# the byte-identical fallback used when the data file is absent/malformed.
+_SUPPORT_SCALE_BY_TYPE_FALLBACK: dict[str, tuple[float, float]] = {
     "contained": (0.45, 0.45),
     "cook_surface": (0.75, 0.75),
     "shelf_surface": (0.60, 0.60),
     "workspace": (0.60, 0.60),
     "object_surface": (0.60, 0.60),
 }
+
+_SUPPORT_SCALE_BY_TYPE: dict[str, tuple[float, float]] = (
+    _semantic_registries.load_support_scale_factors() or dict(_SUPPORT_SCALE_BY_TYPE_FALLBACK)
+)
 
 _CONTAINER_SUPPORT_CLASSES = frozenset(
     {
