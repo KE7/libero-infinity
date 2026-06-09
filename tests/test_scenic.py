@@ -1419,3 +1419,112 @@ class TestPerVariantSurfaceSpawnZ:
         zs = [float(z) for z in re.findall(r'"[^"]+", ([0-9.]+)\)', chooser)]
         assert len(zs) >= 2
         assert max(zs) - min(zs) > 1e-3, f"per-variant z not distinguished: {zs}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WS-3 — Task/mode-adaptive Scenic iteration budget.
+#
+# The global ``maxIterations=5000`` under-provisioned hard perturbation modes
+# (combined/full), silently corrupting the valid-scene distribution. These tests
+# pin the resolver semantics (defaults preserved, explicit override wins,
+# per-mode budgets monotone) and that the budget is actually threaded into
+# ``LIBEROScenicEnv`` and the eval generate paths.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestScenicIterationBudget:
+    def test_default_and_explicit_override(self):
+        from libero_infinity.scenic_budget import (
+            DEFAULT_MAX_ITERATIONS,
+            resolve_iteration_budget,
+        )
+
+        assert DEFAULT_MAX_ITERATIONS == 5000
+        # No mode → historical default (back-compat).
+        assert resolve_iteration_budget(None) == 5000
+        assert resolve_iteration_budget("") == 5000
+        # Explicit override always wins, regardless of mode.
+        assert resolve_iteration_budget(None, 12345) == 12345
+        assert resolve_iteration_budget("combined", 7) == 7
+        assert resolve_iteration_budget("position", 99999) == 99999
+
+    def test_simple_modes_floor_at_default(self):
+        from libero_infinity.scenic_budget import resolve_iteration_budget
+
+        # Cheap single axes (measured mean ~1-20 iters) must stay at the 5000
+        # floor — never below — so existing simple-mode behaviour is preserved.
+        for mode in ("position", "object", "camera", "lighting"):
+            assert resolve_iteration_budget(mode) == 5000
+
+    def test_hard_modes_are_monotone_and_at_least_default(self):
+        from libero_infinity.scenic_budget import resolve_iteration_budget
+
+        combined = resolve_iteration_budget("combined")
+        full = resolve_iteration_budget("full")
+        # Never below back-compat default.
+        assert combined >= 5000
+        assert full >= 5000
+        # ``full``'s axis-set is a superset of ``combined``'s, so its budget
+        # must dominate (the resolver folds in every contained preset).
+        assert full >= combined
+
+    def test_composite_request_inherits_contained_preset(self):
+        from libero_infinity.planner.composition import AXIS_PRESETS
+        from libero_infinity.scenic_budget import resolve_iteration_budget
+
+        # A custom comma-list equal to the ``combined`` preset's axis set must
+        # resolve to the same budget as the named preset.
+        combined_axes = ",".join(sorted(AXIS_PRESETS["combined"]))
+        assert resolve_iteration_budget(combined_axes) == resolve_iteration_budget("combined")
+
+    def test_warn_emitted_only_near_budget(self, caplog):
+        import logging
+
+        from libero_infinity.scenic_budget import warn_if_near_budget
+
+        with caplog.at_level(logging.WARNING):
+            # 50% of budget → no warning.
+            assert warn_if_near_budget(2500, 5000) is False
+        assert not caplog.records
+
+        with caplog.at_level(logging.WARNING):
+            # 95% of budget → warning.
+            assert warn_if_near_budget(4800, 5000, mode="combined") is True
+        assert any("under-provisioned" in r.message for r in caplog.records)
+
+    def test_gym_env_threads_budget(self, monkeypatch):
+        # Avoid Scenic compilation / LIBERO: stub the compile step.
+        from libero_infinity import gym_env as _gym_env
+        from libero_infinity.gym_env import LIBEROScenicEnv
+        from libero_infinity.scenic_budget import resolve_iteration_budget
+
+        monkeypatch.setattr(LIBEROScenicEnv, "_compile_scenario", lambda self, scenic_path: None)
+
+        # Default (None) → per-mode resolved budget.
+        env_default = LIBEROScenicEnv(bddl_path=str(BOWL_BDDL), perturbation="combined")
+        assert env_default._max_scenic_iterations == resolve_iteration_budget("combined")
+
+        # Simple mode still floors at 5000.
+        env_simple = LIBEROScenicEnv(bddl_path=str(BOWL_BDDL), perturbation="position")
+        assert env_simple._max_scenic_iterations == 5000
+
+        # Explicit override threads verbatim.
+        env_override = LIBEROScenicEnv(
+            bddl_path=str(BOWL_BDDL),
+            perturbation="combined",
+            max_scenic_iterations=42_000,
+        )
+        assert env_override._max_scenic_iterations == 42_000
+        del _gym_env  # silence unused-import lints
+
+    def test_eval_signatures_accept_budget_params(self):
+        import inspect
+
+        from libero_infinity.eval import evaluate, evaluate_adversarial
+
+        for fn in (evaluate, evaluate_adversarial):
+            params = inspect.signature(fn).parameters
+            assert "max_scenic_iterations" in params
+            assert "perturbation" in params
+            # Back-compat: both default to None (→ resolves to 5000 when no mode).
+            assert params["max_scenic_iterations"].default is None

@@ -174,6 +174,8 @@ def evaluate(
     seed: int | None = None,
     render_live: str | None = None,
     camera: str = "agentview",
+    perturbation: str | None = None,
+    max_scenic_iterations: int | None = None,
 ) -> EvalResults:
     """Sample N scenes from the Scenic program and evaluate `policy` on each.
 
@@ -194,15 +196,26 @@ def evaluate(
                      "cv2" keeps one window open across all episodes.
                      "viewer" opens a fresh viewer per episode.
         camera:      Camera name used for "cv2" mode (default "agentview").
+        perturbation: Optional perturbation-mode hint used to resolve the
+                     per-mode Scenic iteration budget when
+                     ``max_scenic_iterations`` is not given.
+        max_scenic_iterations: Cap on Scenic rejection-sampling iterations per
+                     scene. ``None`` (default) → resolved from ``perturbation``
+                     via the measured calibration artifact (back-compat 5000).
 
     Returns:
         EvalResults with per-episode data and aggregate statistics.
     """
     import scenic
     from libero_infinity.bddl_preprocessor import parse_object_classes
+    from libero_infinity.scenic_budget import (
+        resolve_iteration_budget,
+        warn_if_near_budget,
+    )
 
     scenic_path = str(pathlib.Path(scenic_path).resolve())
     bddl_path = str(pathlib.Path(bddl_path).resolve())
+    _max_iters = resolve_iteration_budget(perturbation, max_scenic_iterations)
 
     if seed is not None:
         import random
@@ -256,7 +269,8 @@ def evaluate(
         for i in range(n_scenes):
             t0 = time.monotonic()
 
-            scene, n_iters = scenario.generate(maxIterations=5000, verbosity=0)
+            scene, n_iters = scenario.generate(maxIterations=_max_iters, verbosity=0)
+            warn_if_near_budget(n_iters, _max_iters, mode=perturbation or "", logger=log)
 
             with _bddl_for_scene(scene, bddl_path, _orig_obj_classes) as effective_bddl:
                 simulator = LIBEROSimulator(
@@ -395,6 +409,8 @@ def evaluate_adversarial(
     scenic_params: dict | None = None,
     env_kwargs: dict | None = None,
     verbose: bool = False,
+    perturbation: str | None = None,
+    max_scenic_iterations: int | None = None,
 ) -> EvalResults:
     """Find the worst-case scene using cross-entropy adversarial search.
 
@@ -415,12 +431,22 @@ def evaluate_adversarial(
         scenic_params: Override globalParameters.
         env_kwargs:  Extra kwargs for OffScreenRenderEnv.
         verbose:     Print per-episode summaries.
+        perturbation: Optional perturbation-mode hint for budget resolution.
+        max_scenic_iterations: Cap on Scenic iterations per scene. ``None``
+                     (default) → resolved from ``perturbation`` (back-compat
+                     5000).
 
     Returns:
         EvalResults sorted by failure (worst-case first).
     """
     import scenic
     from libero_infinity.bddl_preprocessor import parse_object_classes
+    from libero_infinity.scenic_budget import (
+        resolve_iteration_budget,
+        warn_if_near_budget,
+    )
+
+    _max_iters = resolve_iteration_budget(perturbation, max_scenic_iterations)
 
     scenic_path = str(pathlib.Path(scenic_path).resolve())
     bddl_path = str(pathlib.Path(bddl_path).resolve())
@@ -442,10 +468,11 @@ def evaluate_adversarial(
     for i in range(n_samples):
         t0 = time.monotonic()
 
-        gen_kwargs = dict(maxIterations=5000, verbosity=0)
+        gen_kwargs = dict(maxIterations=_max_iters, verbosity=0)
         if last_feedback is not None:
             gen_kwargs["feedback"] = last_feedback
         scene, n_iters = scenario.generate(**gen_kwargs)
+        warn_if_near_budget(n_iters, _max_iters, mode=perturbation or "", logger=log)
 
         with _bddl_for_scene(scene, bddl_path, _orig_obj_classes) as effective_bddl:
             simulator = LIBEROSimulator(
