@@ -98,6 +98,14 @@ class LIBEROScenicEnv(gym.Env):
     scenic_generate_kwargs :
         Extra kwargs for ``generate_scenic()`` (e.g. ``min_clearance``,
         ``max_distractors``).
+    max_scenic_iterations :
+        Cap on Scenic rejection-sampling iterations per scene
+        (``Scenario.generate(maxIterations=...)``). If ``None`` (default), the
+        budget is resolved per perturbation mode from the measured calibration
+        artifact (``data/scenic_iteration_budgets.json``) via
+        :func:`libero_infinity.scenic_budget.resolve_iteration_budget` — harder
+        modes (``combined``/``full``) get larger budgets while simple modes keep
+        the historical 5000. Pass an int to override.
     """
 
     metadata = {"render.modes": ["rgb_array"]}
@@ -115,6 +123,7 @@ class LIBEROScenicEnv(gym.Env):
         env_kwargs: dict[str, Any] | None = None,
         scenic_generate_kwargs: dict[str, Any] | None = None,
         scene: Any = None,
+        max_scenic_iterations: int | None = None,
     ):
         super().__init__()
 
@@ -134,12 +143,22 @@ class LIBEROScenicEnv(gym.Env):
         self._env_kwargs = env_kwargs or {}
         self._scenic_generate_kwargs = scenic_generate_kwargs or {}
 
-        # Managed resources
+        # Managed resources (init before any code that could raise, so __del__
+        # cleanup never hits a missing attribute).
         self._exit_stack = contextlib.ExitStack()  # for long-lived resources (reversed BDDL)
         self._scenario = None
         self._sim: Any = None  # LIBEROSimulation
         self._generated_scenic_path: str | None = None
         self._per_reset_stack: contextlib.ExitStack | None = None  # per-episode resources
+
+        # Resolve the per-mode Scenic iteration budget once. An explicit value
+        # wins; otherwise the budget is derived from the perturbation mode using
+        # the measured calibration artifact (back-compat default 5000).
+        from libero_infinity.scenic_budget import resolve_iteration_budget
+
+        self._max_scenic_iterations = resolve_iteration_budget(
+            perturbation, max_scenic_iterations
+        )
 
         # Action space: 7D continuous [-1, 1]
         self.action_space = spaces.Box(
@@ -215,9 +234,10 @@ class LIBEROScenicEnv(gym.Env):
         # a fresh Scenic scene rather than propagating the error.
         for attempt in range(self._MAX_SETTLE_RETRIES + 1):
             # Generate a new scene from the Scenic program.
-            # Use 5000 iterations: radial footprint-clearance constraints
-            # (task objects vs fixtures) are tighter than the old AABB form
-            # and may need more rejection-sampling attempts.
+            # The iteration budget is task/mode-adaptive (WS-3): radial
+            # footprint-clearance constraints (task objects vs fixtures) are
+            # tight, and harder modes (combined/full) need far more rejection-
+            # sampling attempts than the historical global 5000.
             #
             # If a preset scene was injected (sweep harness contract via
             # ``make_env``), consume it on the first attempt of the first
@@ -227,8 +247,17 @@ class LIBEROScenicEnv(gym.Env):
                 self._preset_scene = None  # consume once
             else:
                 scene, _n_iters = self._scenario.generate(
-                    maxIterations=5000,
+                    maxIterations=self._max_scenic_iterations,
                     verbosity=0,
+                )
+                # Early signal that the budget is too tight for this mode/task.
+                from libero_infinity.scenic_budget import warn_if_near_budget
+
+                warn_if_near_budget(
+                    _n_iters,
+                    self._max_scenic_iterations,
+                    mode=self._perturbation,
+                    logger=log,
                 )
 
             # Resolve BDDL substitutions (asset swaps) via proper context manager.
@@ -537,6 +566,7 @@ def make_vec_env(
     scenic_params: dict[str, Any] | None = None,
     env_kwargs: dict[str, Any] | None = None,
     scenic_generate_kwargs: dict[str, Any] | None = None,
+    max_scenic_iterations: int | None = None,
     use_subprocess: bool = True,
 ) -> gym.vector.VectorEnv:
     """Create a vectorized environment for parallel rollouts.
@@ -565,6 +595,9 @@ def make_vec_env(
         Extra kwargs for ``OffScreenRenderEnv``.
     scenic_generate_kwargs :
         Extra kwargs for ``generate_scenic()``.
+    max_scenic_iterations :
+        Per-env Scenic iteration budget (see ``LIBEROScenicEnv``). ``None``
+        (default) → resolved per perturbation mode from calibration.
     use_subprocess :
         If ``True`` (default), use ``AsyncVectorEnv`` for true parallelism.
         If ``False``, use ``SyncVectorEnv`` (sequential, useful for debugging).
@@ -598,6 +631,7 @@ def make_vec_env(
                 scenic_params=scenic_params,
                 env_kwargs=env_kwargs,
                 scenic_generate_kwargs=scenic_generate_kwargs,
+                max_scenic_iterations=max_scenic_iterations,
             )
 
         return _thunk
