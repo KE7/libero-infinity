@@ -95,7 +95,13 @@ def main() -> int:
                         )
                         continue
                     robot_axis = "robot" in subset
-                    for o in _iter_scene_objects(scene):
+                    # Score against the scene the env ACTUALLY realized: reset()
+                    # may have resampled a fresh scene on a settle rejection, in
+                    # which case the externally generated ``scene`` is stale and
+                    # scoring against it reports spurious pose mismatches
+                    # (RCA task_robot_shove.md). Falls back to ``scene``.
+                    eval_scene = getattr(env, "realized_scene", None) or scene
+                    for o in _iter_scene_objects(eval_scene):
                         if is_scene_fixture(o):
                             continue
                         nm = resolve_object_name(o) or "?"

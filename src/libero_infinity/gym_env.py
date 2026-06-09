@@ -428,6 +428,23 @@ class LIBEROScenicEnv(gym.Env):
             return None
         return self._sim.last_obs.get("agentview_image")
 
+    @property
+    def realized_scene(self) -> Any:
+        """The Scenic scene the env ACTUALLY realized on the last ``reset()``.
+
+        This differs from the scene handed to ``make_env``/``reset`` whenever the
+        settle-validation retry loop resampled a fresh scene (a preset is consumed
+        only on attempt 0; settle rejections on later attempts call
+        ``self._scenario.generate()`` again — see ``reset``). Consumers that score
+        the realized state against Scenic intent (e.g. ``pose_tolerance`` / the G4
+        consistency family) MUST compare against THIS scene, not the externally
+        held preset, otherwise a retried sample is scored against the rejected
+        sample's poses and reports spurious mismatches.
+
+        Returns ``None`` before the first successful ``reset()``.
+        """
+        return getattr(self._sim, "scene", None) if self._sim is not None else None
+
     def close(self):
         """Release all resources."""
         self._cleanup_sim()

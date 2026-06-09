@@ -320,6 +320,16 @@ def run_condition(
         env = make_env(scene, bddl_path=str(bddl_path))
         env.reset()
         row["g5"] = "pass"
+        # The settle-validation retry loop inside reset() may have RESAMPLED a
+        # fresh scene (a preset is consumed only on attempt 0; settle rejections
+        # resample). The realized scene — not the externally generated ``scene``
+        # — is what MuJoCo loaded and what the policy/eval observes, so the
+        # post-env G4 families (domain / consistency / affordance) must score
+        # against it. Comparing Scenic intent of the rejected sample against the
+        # accepted sample's settled poses reports spurious pose_tolerance
+        # mismatches (RCA task_robot_shove.md). Falls back to ``scene`` if the
+        # env did not expose a realized scene.
+        realized_scene = getattr(env, "realized_scene", None) or scene
     except Exception as exc:  # noqa: BLE001
         _record_failure(row, "g5", exc)
         row["duration_s"] = time.monotonic() - t0
@@ -336,7 +346,7 @@ def run_condition(
             from libero_infinity.asset_registry import ASSET_VARIANTS as _registry
         except Exception:  # noqa: BLE001
             _registry = None
-        _flat = g4_domain_consistency_hook(scene, env, cfg, registry=_registry)
+        _flat = g4_domain_consistency_hook(realized_scene, env, cfg, registry=_registry)
         # Bucket by family for compact JSONL rows: family -> {name: passed}
         dom: dict[str, Any] = {}
         con: dict[str, Any] = {}
