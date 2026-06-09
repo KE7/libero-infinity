@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING
 
 from libero_infinity.asset_metadata import (
     _FIXTURE_DIMS_FALLBACK,
-    TABLE_SURFACE_Z,
+    PER_ARENA_TABLE_CLASSES,
+    arena_surface_z,
     distractor_fit_half,
     distractor_footprint,
     distractor_half_height,
@@ -34,10 +35,17 @@ from libero_infinity.ir.nodes import (
     FixtureNode,
     MovableSupportNode,
     ObjectNode,
+    WorkspaceNode,
 )
 from libero_infinity.ir.scene_graph import SemanticSceneGraph
+from libero_infinity.planner.position import workspace_half_extents
 from libero_infinity.planner.types import PerturbationPlan
-from libero_infinity.robot_metadata import RobotFootprint, RobotLink, get_robot_footprint
+from libero_infinity.robot_metadata import (
+    RobotFootprint,
+    RobotLink,
+    arena_base_offset,
+    get_robot_footprint,
+)
 
 if TYPE_CHECKING:
     pass
@@ -466,6 +474,18 @@ def _resolve_surface_class(
             if support_name is not None:
                 break
     if support_name is None:
+        # Object rests directly on the workspace table. For reference arenas
+        # (kitchen / default table / study) the canonical per-class clearance +
+        # ``arena_surface_z`` reproduces the settled z, so we keep ``None`` (the
+        # legacy class-only path, byte-identical). For the lower living-room /
+        # coffee tables LIBERO seats objects materially differently (and some
+        # tall objects at an elevated metastable rest), so we thread the arena
+        # table class as the surface to pick up the MEASURED per-(class, table)
+        # clearance — see asset_metadata.PER_ARENA_TABLE_CLASSES / measure_arena_tables.
+        for wsnode in graph.nodes.values():
+            if isinstance(wsnode, WorkspaceNode):
+                wclass = wsnode.object_class
+                return wclass if wclass in PER_ARENA_TABLE_CLASSES else None
         return None
     support_node = graph.get_node(support_name)
     if support_node is None:
@@ -473,11 +493,49 @@ def _resolve_surface_class(
     return support_node.object_class or None
 
 
+def _workspace_class(graph: SemanticSceneGraph) -> str | None:
+    """Object class of this scene's workspace fixture (the arena table), or None."""
+    for node in graph.nodes.values():
+        if isinstance(node, WorkspaceNode):
+            return node.object_class
+    return None
+
+
+def _table_half_extents(graph: SemanticSceneGraph) -> tuple[float, float]:
+    """Per-arena workspace-table placement half-extents (x, y) in metres (WS-2).
+
+    The LIBERO arena table half-extents (``planner.workspace_half_extents``) inset
+    by ``_WORKSPACE_MARGIN`` so a table-resting distractor's sampled centre stays
+    clear of the visible table edge. Replaces the constant ``main_table``-baked
+    half-extents that mis-bounded every non-default arena.
+    """
+    hx, hy = workspace_half_extents(_workspace_class(graph))
+    return max(hx - _WORKSPACE_MARGIN, 0.0), max(hy - _WORKSPACE_MARGIN, 0.0)
+
+
+def _arena_surface_z(graph: SemanticSceneGraph) -> float:
+    """Per-arena Scenic table-surface constant for this scene's workspace.
+
+    The renderer emits an object's spawn z as
+    ``surface_spawn_z(<surface_z>, class, surface_class)``. ``<surface_z>`` must
+    be the *arena's* table-surface constant, not the kitchen reference
+    ``TABLE_SURFACE_Z``: the living-room / coffee tables sit ~0.49 m lower and
+    the study table ~0.03 m lower, so emitting the kitchen z placed every
+    non-kitchen object hundreds of mm too high and failed pose_tolerance on z
+    (RCA task_robot_shove.md §4). :func:`asset_metadata.arena_surface_z` shifts
+    the kitchen constant by the arena's table-top delta (LIBERO geometry), and
+    the arena-invariant per-class clearance then reproduces the arena's settled
+    z. Falls back to ``TABLE_SURFACE_Z`` when the scene has no WorkspaceNode.
+    """
+    return arena_surface_z(_workspace_class(graph))
+
+
 def _spawn_z_expr(
     obj_class: str,
     surface_class: str | None,
     scenic_class: str | None,
     variants: list[str] | None,
+    surface_z: float,
 ) -> str:
     """Return a Scenic expression string for an object's resolved spawn z.
 
@@ -495,11 +553,12 @@ def _spawn_z_expr(
         # value (allowed by Scenic), unlike an `if`/`==` branch (forbidden).
         del obj_class, surface_class  # folded into the pair at chooser build time
         return f"{scenic_class}[1]"
-    return f"{surface_spawn_z(TABLE_SURFACE_Z, obj_class, surface_class):.4f}"
+    return f"{surface_spawn_z(surface_z, obj_class, surface_class):.4f}"
 
 
 def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     lines = ["# Object declarations"]
+    arena_z = _arena_surface_z(graph)
 
     # Asset variant sampling (object axis)
     seen_instances: set[str] = set()
@@ -533,8 +592,7 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
             var_name = f"_chosen_{_sanitize(inst)}"
             surface_class = _resolve_surface_class(node, plan, graph)
             pairs = ", ".join(
-                f'("{v}", {surface_spawn_z(TABLE_SURFACE_Z, v, surface_class):.4f})'
-                for v in variants
+                f'("{v}", {surface_spawn_z(arena_z, v, surface_class):.4f})' for v in variants
             )
             lines.append(f"{var_name} = Uniform({pairs})")
             asset_var_map[inst] = var_name
@@ -614,7 +672,9 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         object_axis_variants = (
             plan.object_substitutions.get(obj_name) if "object" in plan.active_axes else None
         )
-        spawn_z_expr = _spawn_z_expr(obj_class, surface_class, scenic_class, object_axis_variants)
+        spawn_z_expr = _spawn_z_expr(
+            obj_class, surface_class, scenic_class, object_axis_variants, arena_z
+        )
 
         if pos_plan is not None and not pos_plan.use_relative_positioning:
             x_lo = pos_plan.x_envelope.lo
@@ -875,12 +935,14 @@ _SUPPORT_EDGE_MARGIN: float = 0.01
 # (e.g. a wine rack's frame extends well above its shelf — the central region
 # lands on the shelf, the edge would catch a post at a different height).
 _SUPPORT_CENTRAL_FRAC: float = 0.6
-# Workspace-table half-extents (m) from ``scenic/libero_model.scenic`` (TABLE
-# is 0.40×0.30 about the workspace origin). A table-assigned distractor's centre
-# range is the table half inset by an edge margin and the (per-pool worst-case)
-# footprint radius so even the largest distractor stays on the table.
-_TABLE_HALF_X: float = 0.40
-_TABLE_HALF_Y: float = 0.30
+# Inset (m) applied to the LIBERO arena table half-extents before placing a
+# table-resting distractor, so its sampled centre stays clear of the visible
+# table edge (WS-2). The per-arena half-extents come from
+# ``planner.position.workspace_half_extents`` (the LIBERO ``*_table_full_size``
+# halved) — NOT a constant baked for ``main_table``, which silently sampled
+# living-room distractors off the (narrower) living-room table in x and starved
+# them of the (wider) table in y.
+_WORKSPACE_MARGIN: float = 0.05
 
 
 def _distractor_fits_fixture(asset_class: str, fixture_class: str | None) -> bool:
@@ -1031,6 +1093,7 @@ def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list
     n = plan.distractor_budget
     if n <= 0:
         return []
+    arena_z = _arena_surface_z(graph)
     pool = plan.distractor_classes or []
     fixtures = _assignable_fixtures(plan, graph, pool)
     # supports[0] is the table (surface_class=None); the rest are fixtures.
@@ -1052,8 +1115,9 @@ def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list
             # largest outlier (desk_caddy) for EVERY sample, starving the common
             # small distractors of placement room.
             r_min = _pool_fit_half_min(slot_pool) if slot_pool else _DEFAULT_DISTRACTOR_FIT
-            hx = max(_TABLE_HALF_X - _SUPPORT_EDGE_MARGIN - r_min, 0.0)
-            hy = max(_TABLE_HALF_Y - _SUPPORT_EDGE_MARGIN - r_min, 0.0)
+            table_half_x, table_half_y = _table_half_extents(graph)
+            hx = max(table_half_x - _SUPPORT_EDGE_MARGIN - r_min, 0.0)
+            hy = max(table_half_y - _SUPPORT_EDGE_MARGIN - r_min, 0.0)
             x_lo, x_hi = -hx, hx
             y_lo, y_hi = -hy, hy
         else:
@@ -1068,8 +1132,8 @@ def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list
             hx, hy = _fixture_placement_half(support.object_class, slot_pool)
             x_lo, x_hi = float(support.init_x) - hx, float(support.init_x) + hx
             y_lo, y_hi = float(support.init_y) - hy, float(support.init_y) + hy
-        zs = [surface_spawn_z(TABLE_SURFACE_Z, c, surface_class) for c in slot_pool] or [
-            surface_spawn_z(TABLE_SURFACE_Z, "distractor", surface_class)
+        zs = [surface_spawn_z(arena_z, c, surface_class) for c in slot_pool] or [
+            surface_spawn_z(arena_z, "distractor", surface_class)
         ]
         slots.append(
             _DistractorSlot(
@@ -1094,6 +1158,7 @@ def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         return ""
     classes = plan.distractor_classes or []
     n = plan.distractor_budget
+    arena_z = _arena_surface_z(graph)
     slots = _distractor_slots(plan, graph)
     lines = [
         "# Distractor objects (Fix 2: each slot assigned to a measured support —",
@@ -1117,7 +1182,7 @@ def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             # on a random value), so every clearance/declaration sees the real
             # per-class footprint instead of a uniform 8 cm proxy.
             pairs = ", ".join(
-                f'("{c}", {surface_spawn_z(TABLE_SURFACE_Z, c, slot.surface_class):.4f}, '
+                f'("{c}", {surface_spawn_z(arena_z, c, slot.surface_class):.4f}, '
                 f"{distractor_planar_half(c):.4f}, {distractor_footprint(c)[2]:.4f})"
                 for c in slot_classes
             )
@@ -1133,7 +1198,7 @@ def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             l_expr = f"(2 * _distractor_{i}_r)"
             h_expr = f"_distractor_{i}_h"
         else:
-            z_expr = f"{surface_spawn_z(TABLE_SURFACE_Z, 'distractor', slot.surface_class):.4f}"
+            z_expr = f"{surface_spawn_z(arena_z, 'distractor', slot.surface_class):.4f}"
             w_expr = f"{2 * _DEFAULT_DISTRACTOR_R:.4f}"
             l_expr = f"{2 * _DEFAULT_DISTRACTOR_R:.4f}"
             h_expr = f"{_DEFAULT_DISTRACTOR_H:.4f}"
@@ -1258,7 +1323,9 @@ def _clearance_relationship(
     return "independent"
 
 
-def _link_pos_exprs(link: RobotLink, n_dof: int) -> tuple[str, str, str]:
+def _link_pos_exprs(
+    link: RobotLink, n_dof: int, base_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+) -> tuple[str, str, str]:
     """Scenic expressions for a link's *perturbed* world position.
 
     Each coordinate is the canonical origin plus the linearized FK contribution
@@ -1266,7 +1333,13 @@ def _link_pos_exprs(link: RobotLink, n_dof: int) -> tuple[str, str, str]:
     Jacobian terms are dropped for compactness). The same ``_robot_dq_k`` locals
     drive the applied ``robot_init_qpos_k`` params, so the constraint graph and
     the simulator's applied pose are derived from one sample.
+
+    ``base_offset`` (Fix 2) shifts the canonical origin into the active arena's
+    robot base frame: the footprints are measured in the kitchen base frame, so
+    on a non-kitchen arena the link world position is the measured origin plus
+    the per-arena base shift (``robot_metadata.arena_base_offset``).
     """
+    ox, oy, oz = base_offset
 
     def _build(c0: float, jrow: tuple[float, ...]) -> str:
         terms = [f"{c0:.6f}"]
@@ -1277,7 +1350,11 @@ def _link_pos_exprs(link: RobotLink, n_dof: int) -> tuple[str, str, str]:
             terms.append(f"({coef:.6f} * _robot_dq_{k})")
         return " + ".join(terms)
 
-    return _build(link.x0, link.jx), _build(link.y0, link.jy), _build(link.z0, link.jz)
+    return (
+        _build(link.x0 + ox, link.jx),
+        _build(link.y0 + oy, link.jy),
+        _build(link.z0 + oz, link.jz),
+    )
 
 
 def _render_robot_clearance(
@@ -1298,6 +1375,13 @@ def _render_robot_clearance(
     active_links = footprint.active_links()
     if not active_links:
         return []
+    arena_z = _arena_surface_z(graph)
+    # Fix 2: the link footprints are measured in the kitchen base frame; shift
+    # every link world position (and the fixture world-z slabs derived from the
+    # robot base z) into the active arena's base frame so the clearance graph is
+    # correct on non-kitchen arenas (RCA Finding B).
+    base_off = arena_base_offset(_workspace_class(graph))
+    base_dz = base_off[2]
     n_dof = footprint.n_dof or len(rp.canonical_qpos)
 
     # target = (guard_prefix, cx_expr, cy_expr, cz_expr, thx, thy, thz, z_lo, z_hi)
@@ -1332,9 +1416,9 @@ def _render_robot_clearance(
             # dynamic z term still guards correctly.
             z_lo = z_hi = None
         else:
-            zs = [surface_spawn_z(TABLE_SURFACE_Z, obj_class, surface_class)]
+            zs = [surface_spawn_z(arena_z, obj_class, surface_class)]
             if variants:
-                zs.extend(surface_spawn_z(TABLE_SURFACE_Z, v, surface_class) for v in variants)
+                zs.extend(surface_spawn_z(arena_z, v, surface_class) for v in variants)
             z_lo = min(zs) - thz
             z_hi = max(zs) + thz
         targets.append(
@@ -1395,7 +1479,11 @@ def _render_robot_clearance(
             continue
         fdims = _fixture_dims(fnode.object_class)
         fh = fdims[2]
-        fz_center = footprint.table_world_z + fh / 2.0
+        # The fixture rests on the arena table, whose top tracks the robot base
+        # z; shift the measured (kitchen-frame) table z into the active arena
+        # frame so the fixture slab sits at the arena's table height (Fix 2).
+        fixture_base_z = footprint.table_world_z + base_dz
+        fz_center = fixture_base_z + fh / 2.0
         # Offset-aware center (real geom-AABB center vs body origin) — see
         # RCA robot_distractor_settle.md; (0,0) for centered fixtures.
         fox, foy = fixture_offset(fnode.object_class)
@@ -1408,8 +1496,8 @@ def _render_robot_clearance(
                 fdims[0] / 2.0,
                 fdims[1] / 2.0,
                 fh / 2.0,
-                footprint.table_world_z,
-                footprint.table_world_z + fh,
+                fixture_base_z,
+                fixture_base_z + fh,
             )
         )
 
@@ -1426,13 +1514,16 @@ def _render_robot_clearance(
         "# scripts/measure_robot_link_footprints.py.",
     ]
     for link in active_links:
-        lx, ly, lz = _link_pos_exprs(link, n_dof)
+        lx, ly, lz = _link_pos_exprs(link, n_dof, base_off)
         sv = _sanitize(link.name)
+        # Swept-z range shifted into the arena base frame for the static z-prune.
+        link_z_min = link.z_min + base_dz
+        link_z_max = link.z_max + base_dz
         lines.append(f"_rc_{sv}_x = {lx}")
         lines.append(f"_rc_{sv}_y = {ly}")
         lines.append(f"_rc_{sv}_z = {lz}")
         for guard, cx, cy, cz, thx, thy, thz, z_lo, z_hi in targets:
-            if z_lo is not None and (link.z_min > z_hi or link.z_max < z_lo):
+            if z_lo is not None and (link_z_min > z_hi or link_z_max < z_lo):
                 continue
             dx = link.hx + thx
             dy = link.hy + thy
@@ -1628,8 +1719,9 @@ def _render_constraints(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             # its real footprint instead of shrinking the table for everyone.
             slot_i = slot_by_index.get(i)
             if slot_i is not None and slot_i.fixture_name is None:
-                cx_b = _TABLE_HALF_X - _SUPPORT_EDGE_MARGIN
-                cy_b = _TABLE_HALF_Y - _SUPPORT_EDGE_MARGIN
+                table_half_x, table_half_y = _table_half_extents(graph)
+                cx_b = table_half_x - _SUPPORT_EDGE_MARGIN
+                cy_b = table_half_y - _SUPPORT_EDGE_MARGIN
                 lines.append(
                     f"require (_n_distractors <= {i}) "
                     f"or ((abs({d_var}.position.x) < ({cx_b:.4f} - {r_i})) "

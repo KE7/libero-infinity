@@ -115,3 +115,58 @@ ROBOT_FOOTPRINTS: dict[str, RobotFootprint] = _load()
 def get_robot_footprint(robot_model: str) -> RobotFootprint | None:
     """Return the measured footprint model for ``robot_model`` (or None)."""
     return ROBOT_FOOTPRINTS.get(robot_model)
+
+
+# ---------------------------------------------------------------------------
+# Per-arena robot base frame (arena-aware clearance graph)
+# ---------------------------------------------------------------------------
+#
+# The link footprints above are measured ONCE, on the KITCHEN arena, so every
+# link origin / swept-z is in the world frame with the robot base at
+# ``robot0_base = [-0.66, 0, 0.912]`` (the reference). The renderer's robot↔
+# object/distractor/fixture clearance graph compares those link world positions
+# against scene-frame object positions — correct only while the robot base is at
+# the reference. On NON-kitchen arenas LIBERO mounts the robot at a different
+# base (the living-room base is ~0.51 m forward and ~0.49 m LOWER), so the
+# unshifted link positions sit hundreds of mm off and the clearance ``require``
+# graph is silently inert there (RCA task_robot_shove.md Finding B / §4).
+#
+# The per-arena base world position is LIBERO geometry: ``bddl_base_domain``
+# sets ``robot0_base`` to ``base_xpos_offset[arena](table_length)`` from the
+# mounted_panda / on_the_ground_panda models —
+#     x = (-0.16 or -0.25) - table_length/2     (panda base_xpos_offset)
+# with z the mount-determined standing height (0.912 on the mounted-panda
+# kitchen/table/study arenas; 0.42 / 0.41 on the on-the-ground living-room /
+# coffee arenas). ``table_length`` is 1.0 for kitchen/table/study and 0.70 for
+# living-room/coffee. The values below were verified against the measured
+# ``robot0_base`` after ``env.reset()`` for kitchen / living-room / study.
+_LIBERO_ROBOT_BASE_XPOS: dict[str, tuple[float, float, float]] = {
+    "table": (-0.66, 0.0, 0.912),  # -0.16 - 1.0/2 ; mounted_panda
+    "main_table": (-0.66, 0.0, 0.912),
+    "kitchen_table": (-0.66, 0.0, 0.912),  # reference (footprints measured here)
+    "study_table": (-0.75, 0.0, 0.912),  # -0.25 - 1.0/2 ; mounted_panda
+    "living_room_table": (-0.51, 0.0, 0.42),  # -0.16 - 0.70/2 ; on_the_ground_panda
+    "coffee_table": (-0.51, 0.0, 0.41),  # -0.16 - 0.70/2 ; on_the_ground_panda
+}
+
+# The arena the footprints were measured on; ``arena_base_offset`` returns the
+# zero vector for it so the kitchen clearance graph is byte-identical.
+_REFERENCE_ROBOT_BASE_XPOS: tuple[float, float, float] = _LIBERO_ROBOT_BASE_XPOS["kitchen_table"]
+
+
+def arena_base_offset(workspace_class: str | None) -> tuple[float, float, float]:
+    """World-frame robot base shift (dx, dy, dz) for ``workspace_class``.
+
+    The link footprints are in the reference (kitchen) base frame; adding this
+    offset to a link's measured world origin / swept-z places it in the arena's
+    actual base frame so the robot↔object clearance graph is geometrically
+    correct on non-kitchen arenas. Returns the zero vector for the reference
+    arena and for any unknown / absent workspace class (legacy behaviour).
+    """
+    if not workspace_class:
+        return (0.0, 0.0, 0.0)
+    base = _LIBERO_ROBOT_BASE_XPOS.get(workspace_class)
+    if base is None:
+        return (0.0, 0.0, 0.0)
+    ref = _REFERENCE_ROBOT_BASE_XPOS
+    return (base[0] - ref[0], base[1] - ref[1], base[2] - ref[2])

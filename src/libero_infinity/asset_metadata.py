@@ -158,6 +158,90 @@ def _is_fixture_surface(surface_class: str | None) -> bool:
     return surface_class in FIXTURE_GEOMETRY or surface_class in _FIXTURE_DIMS_FALLBACK
 
 
+# ---------------------------------------------------------------------------
+# Per-arena table-surface height (arena-aware spawn z)
+# ---------------------------------------------------------------------------
+#
+# ``TABLE_SURFACE_Z`` (0.82) is the Scenic table-surface constant the *kitchen /
+# default tabletop* arena is calibrated against: the measured per-class spawn
+# clearances in ``spawn_clearances.json`` are ``settled_body_z − TABLE_SURFACE_Z``
+# on that arena, so ``surface_spawn_z(TABLE_SURFACE_Z, …)`` reproduces the
+# kitchen settled z exactly (pose_tolerance ≈ 0 mm). But the kitchen table top
+# is not the only arena: LIBERO's living-room / coffee tables sit ~0.49 m LOWER
+# and the study table ~0.03 m lower. Emitting the kitchen spawn z for ALL arenas
+# placed every living-room / study object hundreds of mm too high, so every
+# object failed pose_tolerance on the z axis (RCA task_robot_shove.md §4).
+#
+# The fix is arena-aware WITHOUT remeasuring per-arena clearances: a movable's
+# settled body-origin height ABOVE its (flat) table top is a property of the
+# object's geometry, not the arena, so it is arena-invariant. Shifting only the
+# Scenic surface constant by the table-top delta therefore reproduces the
+# arena's settled z while reusing the SAME measured clearance:
+#
+#     arena_surface_z(A) = TABLE_SURFACE_Z + (table_top_z[A] − table_top_z[ref])
+#     surface_spawn_z(arena_surface_z(A), c) = arena_surface_z(A) + clearance(c)
+#                                            = table_top_z[A] + (body-origin offset)
+#
+# ``table_top_z`` is the per-arena ``workspace_offset[2]`` hard-coded in LIBERO's
+# arena problem classes (vendored at
+# ``site-packages/libero/libero/envs/problems/libero_*_manipulation.py``). These
+# are LIBERO geometry constants, sourced (not hand-tuned), mirroring the
+# provenance of ``planner.position._LIBERO_TABLE_HALF_EXTENTS``.
+#
+#   kitchen_table / table  : workspace_offset (0, 0, 0.90)   (libero_kitchen_*, libero_tabletop_*)
+#   study_table            : workspace_offset (-0.2, 0, 0.867) (libero_study_*)
+#   living_room_table      : workspace_offset (0, 0, 0.41)   (libero_living_room_*)
+#   coffee_table           : workspace_offset (0, 0, 0.41)   (libero_coffee_*)
+#   floor                  : floor_offset     (0, 0, -0.035) (libero_floor_*)
+_LIBERO_ARENA_TABLE_TOP_Z: dict[str, float] = {
+    "table": 0.90,
+    "main_table": 0.90,
+    "kitchen_table": 0.90,
+    "study_table": 0.867,
+    "living_room_table": 0.41,
+    "coffee_table": 0.41,
+    "floor": -0.035,
+}
+
+# The reference arena ``TABLE_SURFACE_Z`` is calibrated against (kitchen/default
+# tabletop). The measured clearances are expressed relative to TABLE_SURFACE_Z
+# on this arena, so its delta is 0 and kitchen behaviour is byte-identical.
+_REFERENCE_ARENA_TABLE_TOP_Z: float = _LIBERO_ARENA_TABLE_TOP_Z["kitchen_table"]
+
+# Workspace-table classes whose per-(class, table) settled clearances are
+# MEASURED (in spawn_clearances_variants.json, by measure_arena_tables) and
+# threaded as the ``surface_class`` for table-resting objects. These are the
+# arenas LIBERO seats objects materially differently from the kitchen reference
+# — the ~0.49 m-lower living-room / coffee tables, where LIBERO additionally
+# places several tall objects at an elevated metastable rest no rigid arena
+# shift can predict. Reference arenas (kitchen / default ``table``) and the study
+# table reproduce their settled z via ``arena_surface_z`` + the canonical
+# per-class clearance, so they are NOT threaded and stay byte-identical.
+PER_ARENA_TABLE_CLASSES: frozenset[str] = frozenset({"living_room_table", "coffee_table"})
+
+
+def arena_surface_z(workspace_class: str | None) -> float:
+    """Scenic table-surface constant for the arena whose workspace is ``workspace_class``.
+
+    Returns the per-arena equivalent of :data:`TABLE_SURFACE_Z`: the kitchen
+    constant shifted by the arena's table-top height delta (see the
+    ``_LIBERO_ARENA_TABLE_TOP_Z`` block). Feeding this to
+    :func:`surface_spawn_z` reproduces the arena's LIBERO settled z while reusing
+    the arena-invariant per-class measured clearance, so the renderer's emitted
+    spawn z matches the simulator's per-arena settled pose (pose_tolerance).
+
+    An unknown / absent workspace class falls back to the reference
+    ``TABLE_SURFACE_Z`` (the legacy single-constant behaviour), so kitchen and
+    any not-yet-registered arena are unchanged.
+    """
+    if not workspace_class:
+        return TABLE_SURFACE_Z
+    top_z = _LIBERO_ARENA_TABLE_TOP_Z.get(workspace_class)
+    if top_z is None:
+        return TABLE_SURFACE_Z
+    return TABLE_SURFACE_Z + (top_z - _REFERENCE_ARENA_TABLE_TOP_Z)
+
+
 def spawn_clearance(asset_class: str, surface_class: str | None = None) -> float:
     """Return the resting body-origin height (m) above ``TABLE_SURFACE_Z``.
 
