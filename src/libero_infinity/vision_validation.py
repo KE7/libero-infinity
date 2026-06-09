@@ -10,13 +10,36 @@ import pathlib
 import re
 import subprocess
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from libero_infinity.perturbation_audit import VisibleChangeScore
+if TYPE_CHECKING:
+    # Imported for type-checking only. `VisibleChangeScore` is consumed purely
+    # via duck-typed attribute access at runtime, so guarding the import keeps
+    # this module importable even when the scoring helper is refactored away.
+    from libero_infinity.perturbation_audit import VisibleChangeScore
 
-DEFAULT_VERTEX_VISION_MODEL = "vertex_ai/gemini-3-flash-preview"
+# --- Reproducibility pins (WS-6) -------------------------------------------
+# Canonical default VLM. This MUST match the model that produced the recorded
+# baseline audit results documented in docs/vlm_validation.md. Historically the
+# code drifted to a `gemini-3-flash-preview` *preview* model, which is unstable
+# and non-reproducible (preview models can change or be withdrawn without
+# notice), silently diverging new runs from recorded results and breaking
+# regression detection. The canonical baseline is the GA Gemini 2.0 Flash model.
+# Override per-run via the LIBERO_VLM_MODEL env var.
+DEFAULT_VERTEX_VISION_MODEL = "vertex_ai/gemini-2.0-flash"
+VLM_MODEL_ENV_VAR = "LIBERO_VLM_MODEL"
+
+# Request timeout (seconds). Multimodal Gemini Flash calls with two images have
+# an observed p95 latency of ~30-40s; 60s = p95 + comfortable headroom. Made a
+# named, env-overridable constant (LIBERO_VLM_TIMEOUT) so the basis is explicit
+# and tunable instead of a bare magic literal. A timeout now yields a distinct
+# `timeout` decision (not `request_error`) so it is never mistaken for a model
+# verdict.
+DEFAULT_VLM_TIMEOUT_SECONDS = 60
+VLM_TIMEOUT_ENV_VAR = "LIBERO_VLM_TIMEOUT"
+
 DEFAULT_VERTEX_LOCATION = "global"
 
 _SYSTEM_PROMPT = """You are validating whether a perturbation remains visually interpretable.
@@ -36,9 +59,47 @@ class VisionValidationResult:
     model: str
     project: str
     location: str
+    timeout_seconds: int | None = None
+    timed_out: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def resolve_vision_model(model: str | None = None) -> str:
+    """Resolve the VLM model: explicit arg > LIBERO_VLM_MODEL env > canonical default.
+
+    Recording/returning the resolved value lets every result be self-describing
+    and reproducible regardless of how the model was selected.
+    """
+    if model:
+        return model
+    env_value = os.environ.get(VLM_MODEL_ENV_VAR)
+    if env_value and env_value.strip():
+        return env_value.strip()
+    return DEFAULT_VERTEX_VISION_MODEL
+
+
+def resolve_vision_timeout(timeout: int | None = None) -> int:
+    """Resolve request timeout: explicit arg > LIBERO_VLM_TIMEOUT env > named default."""
+    if timeout is not None:
+        return timeout
+    env_value = os.environ.get(VLM_TIMEOUT_ENV_VAR)
+    if env_value and env_value.strip():
+        try:
+            return int(float(env_value.strip()))
+        except ValueError:
+            pass
+    return DEFAULT_VLM_TIMEOUT_SECONDS
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """Best-effort detection of a request timeout across litellm/openai/std errors."""
+    if isinstance(exc, TimeoutError):
+        return True
+    # litellm.Timeout / openai.APITimeoutError / httpx.*Timeout etc. — match by
+    # class name to avoid importing optional provider SDKs just for isinstance.
+    return "timeout" in type(exc).__name__.lower()
 
 
 def run_curated_ambiguity_check(
@@ -47,14 +108,21 @@ def run_curated_ambiguity_check(
     visible_change: VisibleChangeScore,
     canonical_image: np.ndarray | bytes | pathlib.Path | str,
     perturbed_image: np.ndarray | bytes | pathlib.Path | str,
-    model: str = DEFAULT_VERTEX_VISION_MODEL,
+    model: str | None = None,
     project: str | None = None,
     location: str | None = None,
-    timeout: int = 60,
+    timeout: int | None = None,
     temperature: float = 0.0,
     litellm_module: Any | None = None,
 ) -> VisionValidationResult:
-    """Run a small VLM ambiguity check after deterministic scoring."""
+    """Run a small VLM ambiguity check after deterministic scoring.
+
+    `model` and `timeout` resolve through env vars (LIBERO_VLM_MODEL,
+    LIBERO_VLM_TIMEOUT) when not passed explicitly; the resolved model and
+    timeout are recorded on the returned result so each run is reproducible.
+    """
+    model = resolve_vision_model(model)
+    timeout = resolve_vision_timeout(timeout)
     resolved_project = resolve_vertex_project(project)
     resolved_location = resolve_vertex_location(location, model=model)
     litellm_module = litellm_module or _import_litellm()
@@ -77,14 +145,17 @@ def run_curated_ambiguity_check(
             response_mime_type="application/json",
         )
     except Exception as exc:
+        timed_out = _is_timeout_error(exc)
         return VisionValidationResult(
-            decision="request_error",
+            decision="timeout" if timed_out else "request_error",
             confidence=None,
             reasoning=str(exc),
             raw_response=str(exc),
             model=model,
             project=resolved_project,
             location=resolved_location,
+            timeout_seconds=timeout,
+            timed_out=timed_out,
         )
 
     content = _extract_response_text(response)
@@ -93,6 +164,7 @@ def run_curated_ambiguity_check(
         model=model,
         project=resolved_project,
         location=resolved_location,
+        timeout_seconds=timeout,
     )
     return parsed
 
@@ -141,6 +213,7 @@ def parse_vision_validation_response(
     model: str,
     project: str,
     location: str,
+    timeout_seconds: int | None = None,
 ) -> VisionValidationResult:
     """Parse JSON-ish VLM output into a stable result shape."""
     normalized = re.sub(r"```(?:json)?", "", response).replace("```", "").strip()
@@ -154,6 +227,7 @@ def parse_vision_validation_response(
             model=model,
             project=project,
             location=location,
+            timeout_seconds=timeout_seconds,
         )
 
     try:
@@ -167,6 +241,7 @@ def parse_vision_validation_response(
             model=model,
             project=project,
             location=location,
+            timeout_seconds=timeout_seconds,
         )
 
     decision = _normalize_decision(
@@ -181,6 +256,7 @@ def parse_vision_validation_response(
             model=model,
             project=project,
             location=location,
+            timeout_seconds=timeout_seconds,
         )
 
     return VisionValidationResult(
@@ -191,6 +267,7 @@ def parse_vision_validation_response(
         model=model,
         project=project,
         location=location,
+        timeout_seconds=timeout_seconds,
     )
 
 
