@@ -76,7 +76,6 @@ docs/convention_audit.md
 docs/gap_extension_plan.md
 docs/pipeline_readiness_review.md
 docs/user_review.md
-docs/vlm_validation.md
 docs/scenic_docs_review.md
 docs/blog_post.md
 
@@ -95,7 +94,6 @@ scripts/audit_position_perturbations.py
 # Internal VLM research scaffolding (not for publication)
 src/libero_infinity/_vision_audit.py
 tests/test_viewer.py
-tests/test_vision_validation.py
 scripts/render_and_validate.py
 
 # Audit report artifacts (re-runnable; only the asset-parity manifest is tracked)
