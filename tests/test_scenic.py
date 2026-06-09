@@ -1475,9 +1475,7 @@ class TestScenicIterationBudget:
         # A custom comma-list equal to the ``combined`` preset's axis set must
         # resolve to the same budget as the named preset.
         combined_axes = ",".join(sorted(AXIS_PRESETS["combined"]))
-        assert resolve_iteration_budget(combined_axes) == resolve_iteration_budget(
-            "combined"
-        )
+        assert resolve_iteration_budget(combined_axes) == resolve_iteration_budget("combined")
 
     def test_warn_emitted_only_near_budget(self, caplog):
         import logging
@@ -1500,15 +1498,11 @@ class TestScenicIterationBudget:
         from libero_infinity.gym_env import LIBEROScenicEnv
         from libero_infinity.scenic_budget import resolve_iteration_budget
 
-        monkeypatch.setattr(
-            LIBEROScenicEnv, "_compile_scenario", lambda self, scenic_path: None
-        )
+        monkeypatch.setattr(LIBEROScenicEnv, "_compile_scenario", lambda self, scenic_path: None)
 
         # Default (None) → per-mode resolved budget.
         env_default = LIBEROScenicEnv(bddl_path=str(BOWL_BDDL), perturbation="combined")
-        assert env_default._max_scenic_iterations == resolve_iteration_budget(
-            "combined"
-        )
+        assert env_default._max_scenic_iterations == resolve_iteration_budget("combined")
 
         # Simple mode still floors at 5000.
         env_simple = LIBEROScenicEnv(bddl_path=str(BOWL_BDDL), perturbation="position")

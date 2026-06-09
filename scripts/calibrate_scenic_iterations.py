@@ -67,8 +67,8 @@ MODE_PLAN = [
     ("full", 4, 16),
 ]
 
-CAP = 300_000          # high enough to observe the real tail
-SAFETY = 1.30          # margin over the tail estimate
+CAP = 300_000  # high enough to observe the real tail
+SAFETY = 1.30  # margin over the tail estimate
 TARGET_COVERAGE = 0.999
 
 
@@ -107,9 +107,7 @@ def main() -> None:
         for bddl_rel in CORPUS[:n_tasks]:
             bddl = BDDL_ROOT / bddl_rel
             cfg = TaskConfig.from_bddl(str(bddl))
-            scenario = compile_task_to_scenario(
-                cfg, mode, params={"bddl_path": str(bddl)}
-            )
+            scenario = compile_task_to_scenario(cfg, mode, params={"bddl_path": str(bddl)})
             iters: list[int] = []
             t0 = time.monotonic()
             for _ in range(n_samples):
@@ -150,8 +148,7 @@ def main() -> None:
             "per_task": per_task,
         }
         print(
-            f"==> {mode}: mean={mean:.0f} p99={p99:.0f} geom999={geom_999:.0f} "
-            f"=> BUDGET={budget}",
+            f"==> {mode}: mean={mean:.0f} p99={p99:.0f} geom999={geom_999:.0f} => BUDGET={budget}",
             flush=True,
         )
 

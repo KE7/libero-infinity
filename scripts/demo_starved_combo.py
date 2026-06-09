@@ -48,8 +48,9 @@ def main() -> None:
 
     new_ok, new_iters = run(budget)
     mx = max(new_iters) if new_iters else 0
-    print(f"NEW adaptive cap={budget:<7} -> {new_ok}/{TRIALS} scenes generated "
-          f"(max iters used={mx})")
+    print(
+        f"NEW adaptive cap={budget:<7} -> {new_ok}/{TRIALS} scenes generated (max iters used={mx})"
+    )
 
 
 if __name__ == "__main__":

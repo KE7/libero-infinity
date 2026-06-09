@@ -156,9 +156,7 @@ class LIBEROScenicEnv(gym.Env):
         # the measured calibration artifact (back-compat default 5000).
         from libero_infinity.scenic_budget import resolve_iteration_budget
 
-        self._max_scenic_iterations = resolve_iteration_budget(
-            perturbation, max_scenic_iterations
-        )
+        self._max_scenic_iterations = resolve_iteration_budget(perturbation, max_scenic_iterations)
 
         # Action space: 7D continuous [-1, 1]
         self.action_space = spaces.Box(
