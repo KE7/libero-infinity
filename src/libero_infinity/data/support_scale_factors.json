@@ -1,0 +1,16 @@
+{
+  "_meta": {
+    "description": "Per-support-type xy scale factors for local position perturbation envelopes. Externalized from perturbation_policy_helpers._SUPPORT_SCALE_BY_TYPE (WS-4 hardcoding audit). Loaded at runtime; the in-code dict is the byte-identical fallback when this file is absent.",
+    "schema": "support_scale_by_type[support_type] = [scale_x, scale_y] in (0, 1]; fraction of the clearance-reduced usable support extent over which a child object may be perturbed.",
+    "support_types": "Keys must cover every value returned by perturbation_policy_helpers.infer_support_type: contained, cook_surface, shelf_surface, workspace, object_surface.",
+    "behavior": "Values are identical to the historical in-code dict; this file changes no behavior. Edit here to retune placement spread per support class.",
+    "curator_process": "When infer_support_type() gains a new return value, add a matching key here (and to the in-code fallback) or support_local_envelope will KeyError."
+  },
+  "support_scale_by_type": {
+    "contained": [0.45, 0.45],
+    "cook_surface": [0.75, 0.75],
+    "shelf_surface": [0.60, 0.60],
+    "workspace": [0.60, 0.60],
+    "object_surface": [0.60, 0.60]
+  }
+}

@@ -17,6 +17,102 @@ import pathlib
 import re
 import tempfile
 
+from libero_infinity import semantic_registries as _semreg
+
+# ---------------------------------------------------------------------------
+# Externalized semantic registries (WS-4 hardcoding audit).
+#
+# These three registries drive counterfactual (CF) variant generation. They are
+# now served from ``data/*.json`` (single source of truth, shared with
+# ``scripts/rate_cf_bddls.py``). The in-code dicts below are byte-identical
+# FALLBACKS: if the data file is absent/malformed, behavior is unchanged.
+# ---------------------------------------------------------------------------
+
+# Physical-type taxonomy used to classify destination surfaces and CF objects
+# for placement-plausibility checks (was the function-local ``_VISUAL_CATEGORY``).
+# NOTE: this PHYSICAL axis is intentionally distinct from the visual-grounding
+# ``_CF_CATEGORY`` axis below — e.g. wine_bottle and ketchup share physical
+# category "bottle" but differ in cf_category.
+_VISUAL_CATEGORY_FALLBACK: dict[str, str] = {
+    "akita_black_bowl": "bowl",
+    "white_bowl": "bowl",
+    "glazed_rim_porcelain_ramekin": "bowl",
+    "plate": "bowl",
+    "chefmate_8_frypan": "cookware",
+    "red_coffee_mug": "mug",
+    "white_yellow_mug": "mug",
+    "porcelain_mug": "mug",
+    "moka_pot": "mug",
+    "black_book": "book",
+    "yellow_book": "book",
+    "wine_bottle": "bottle",
+    "ketchup": "bottle",
+    "milk": "bottle",
+    "orange_juice": "bottle",
+    "tomato_sauce": "bottle",
+    "bbq_sauce": "bottle",
+    "salad_dressing": "bottle",
+    "new_salad_dressing": "bottle",
+    "cream_cheese": "carton",
+    "butter": "carton",
+    "chocolate_pudding": "carton",
+    "alphabet_soup": "carton",
+    "cookies": "carton",
+    "basket": "container",
+    "wooden_tray": "container",
+    "desk_caddy": "container",
+}
+
+# Forbidden (cf_category, dest_surface) pairs that produce implausible
+# placements (was the function-local ``_INCOMPATIBLE``).
+_INCOMPATIBLE_FALLBACK: set[tuple[str, str]] = {
+    ("container", "bowl"),  # large tray/caddy balanced on small bowl
+    ("bowl", "bowl"),  # plate/bowl stacked on another small bowl
+    ("bowl", "stove"),  # bowl on cooking surface — wrong object type
+    ("carton", "stove"),  # food carton on stove — semantically odd
+    ("book", "stove"),  # book on stove — fire hazard / nonsensical
+    ("mug", "stove"),  # mug on stove — odd for robot task
+    ("book", "rack"),  # book on wine rack — nonsensical
+}
+
+# Cross-category preference groups for CF object selection (was the
+# function-local ``_CF_CATEGORY``). Objects sharing a group are visually
+# similar → weaker grounding test; CF generation prefers cross-group swaps.
+_CF_CATEGORY_FALLBACK: dict[str, str] = {
+    "alphabet_soup": "food_can",
+    "tomato_sauce": "food_can",
+    "bbq_sauce": "food_can",
+    "ketchup": "food_can",
+    "salad_dressing": "food_can",
+    "new_salad_dressing": "food_can",
+    "cream_cheese": "food_box",
+    "butter": "food_box",
+    "chocolate_pudding": "food_box",
+    "red_coffee_mug": "mug",
+    "white_yellow_mug": "mug",
+    "black_book": "book",
+    "akita_black_bowl": "bowl_plate",
+    "white_bowl": "bowl_plate",
+    "plate": "bowl_plate",
+    "wine_bottle": "bottle",
+}
+
+
+def _resolve_registries() -> tuple[dict[str, str], set[tuple[str, str]], dict[str, str]]:
+    """Return (physical_category, incompatible, cf_category) from data files,
+    falling back to the in-code dicts when a file is absent/malformed."""
+    surface = _semreg.load_surface_compatibility()
+    if surface is not None:
+        physical_category, incompatible = surface
+    else:
+        physical_category = dict(_VISUAL_CATEGORY_FALLBACK)
+        incompatible = set(_INCOMPATIBLE_FALLBACK)
+    cf_category = _semreg.load_cf_category_groups() or dict(_CF_CATEGORY_FALLBACK)
+    return physical_category, incompatible, cf_category
+
+
+_VISUAL_CATEGORY, _INCOMPATIBLE, _CF_CATEGORY = _resolve_registries()
+
 
 def _find_closing_paren(text: str, open_pos: int) -> int:
     """Find the index of the closing paren matching the one at ``open_pos``.
@@ -554,49 +650,10 @@ def generate_cf_bddls(bddl_content: str) -> list[tuple[str, str]]:
         "new_salad_dressing": "salad dressing",
     }
 
-    # Visual category groupings — swapping within a category is a weak
-    # grounding test since the objects look similar.
-    _VISUAL_CATEGORY: dict[str, str] = {
-        "akita_black_bowl": "bowl",
-        "white_bowl": "bowl",
-        "glazed_rim_porcelain_ramekin": "bowl",
-        "plate": "bowl",
-        "chefmate_8_frypan": "cookware",
-        "red_coffee_mug": "mug",
-        "white_yellow_mug": "mug",
-        "porcelain_mug": "mug",
-        "moka_pot": "mug",
-        "black_book": "book",
-        "yellow_book": "book",
-        "wine_bottle": "bottle",
-        "ketchup": "bottle",
-        "milk": "bottle",
-        "orange_juice": "bottle",
-        "tomato_sauce": "bottle",
-        "bbq_sauce": "bottle",
-        "salad_dressing": "bottle",
-        "new_salad_dressing": "bottle",
-        "cream_cheese": "carton",
-        "butter": "carton",
-        "chocolate_pudding": "carton",
-        "alphabet_soup": "carton",
-        "cookies": "carton",
-        "basket": "container",
-        "wooden_tray": "container",
-        "desk_caddy": "container",
-    }
-
-    # Physical incompatibility: (cf_category, dest_surface) pairs that produce
-    # implausible placements. dest_surface is derived from the destination name.
-    _INCOMPATIBLE: set[tuple[str, str]] = {
-        ("container", "bowl"),  # large tray/caddy balanced on small bowl
-        ("bowl", "bowl"),  # plate/bowl stacked on another small bowl
-        ("bowl", "stove"),  # bowl on cooking surface — wrong object type
-        ("carton", "stove"),  # food carton on stove — semantically odd
-        ("book", "stove"),  # book on stove — fire hazard / nonsensical
-        ("mug", "stove"),  # mug on stove — odd for robot task
-        ("book", "rack"),  # book on wine rack — nonsensical
-    }
+    # ``_VISUAL_CATEGORY`` (physical-type taxonomy) and ``_INCOMPATIBLE``
+    # (forbidden category->surface pairs) are now module-level registries
+    # resolved from ``data/surface_compatibility.json`` (WS-4). They are read
+    # here as module globals; see the top of this file for the fallback dicts.
 
     # Tall/unstable objects that should be placed "in" a curved/concave
     # surface (bowl, plate) rather than "on" it — avoids physically misleading
@@ -609,27 +666,11 @@ def generate_cf_bddls(bddl_content: str) -> list[tuple[str, str]]:
         "moka_pot",
     }
 
-    # Cross-category preference groups for CF object selection.
-    # Objects sharing a group are visually similar → weaker grounding test.
-    # Prefer cross-group swaps; only fall back to same-group if necessary.
-    _CF_CATEGORY: dict[str, str] = {
-        "alphabet_soup": "food_can",
-        "tomato_sauce": "food_can",
-        "bbq_sauce": "food_can",
-        "ketchup": "food_can",
-        "salad_dressing": "food_can",
-        "new_salad_dressing": "food_can",
-        "cream_cheese": "food_box",
-        "butter": "food_box",
-        "chocolate_pudding": "food_box",
-        "red_coffee_mug": "mug",
-        "white_yellow_mug": "mug",
-        "black_book": "book",
-        "akita_black_bowl": "bowl_plate",
-        "white_bowl": "bowl_plate",
-        "plate": "bowl_plate",
-        "wine_bottle": "bottle",
-    }
+    # ``_CF_CATEGORY`` (cross-category preference groups for CF object
+    # selection) is now a module-level registry resolved from
+    # ``data/cf_category_groups.json`` (WS-4), harmonized with
+    # ``scripts/rate_cf_bddls.py``. It is read here as a module global; see the
+    # top of this file for the fallback dict.
 
     def _class_to_phrase(cls: str) -> str:
         name = _DISPLAY_NAMES.get(cls, cls)

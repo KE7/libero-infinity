@@ -51,7 +51,20 @@ from libero_infinity.runtime import get_bddl_dir
 
 # Objects in the same visual category look similar; swapping within category
 # gives a weaker grounding test.
-_CATEGORY: dict[str, str] = {
+# Visual-similarity grouping for the cf_value score. Resolved from
+# data/cf_category_groups.json (WS-4 hardcoding audit) so this script shares a
+# single source of truth with the live eval pipeline
+# (bddl_preprocessor._CF_CATEGORY). The dict below is the legacy fallback used
+# only when the data file is absent.
+#
+# NOTE: when the data file loads (the normal case), the harmonized partition
+# splits condiments/cans (food_can) from tall bottles (bottle) and soup-cans
+# (food_can) from rectangular cartons (food_box), matching the production
+# partition. This changes cf_value scoring for some pairs vs. the legacy
+# fallback below; see data/cf_category_groups.json:_meta.harmonization.
+from libero_infinity.semantic_registries import load_cf_category_groups
+
+_CATEGORY_FALLBACK: dict[str, str] = {
     # Shallow bowls / plates
     "akita_black_bowl": "bowl", "white_bowl": "bowl",
     "glazed_rim_porcelain_ramekin": "bowl", "plate": "bowl",
@@ -72,6 +85,8 @@ _CATEGORY: dict[str, str] = {
     # Condiments (squeeze bottles / small jars — similar silhouette to bottles)
     "salad_dressing": "bottle", "new_salad_dressing": "bottle",
 }
+
+_CATEGORY: dict[str, str] = load_cf_category_groups() or dict(_CATEGORY_FALLBACK)
 
 # ── graspability ──────────────────────────────────────────────────────────────
 

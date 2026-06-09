@@ -1,0 +1,69 @@
+{
+  "_meta": {
+    "description": "Placement plausibility registry for counterfactual (CF) generation. Externalized from bddl_preprocessor._VISUAL_CATEGORY (physical type) and _INCOMPATIBLE (forbidden category->surface pairs) (WS-4 hardcoding audit). Loaded at runtime; the in-code dicts are byte-identical fallbacks for the historical entries.",
+    "physical_category_semantics": "Maps each asset to a coarse PHYSICAL type used to (a) classify a destination object's surface and (b) decide whether a CF object may plausibly be placed on a given surface. Labels: {bowl, cookware, mug, book, bottle, carton, container}.",
+    "incompatible_semantics": "Each [category, surface] pair forbids generating a CF that places an object of that physical_category onto that surface. 'surface' is the destination's type: either a physical_category (when the destination is an object) or a fixture keyword {stove, shelf, rack, table} derived from the destination region name.",
+    "axis_note": "physical_category (placement) is INTENTIONALLY distinct from cf_category (visual-grounding similarity) in cf_category_groups.json. wine_bottle and ketchup share physical_category=bottle here but differ in cf_category there. Do not merge the two axes.",
+    "coverage": "All 34 registry assets have a physical_category, so every asset participates in the compatibility check. Historical _VISUAL_CATEGORY covered 27; the 7 additions are justified below.",
+    "physical_category_additions": {
+      "yellow_book": "book: parallels black_book (was already implicitly book-like; explicit now).",
+      "popcorn": "carton: boxed/bagged snack food.",
+      "macaroni_and_cheese": "carton: boxed food.",
+      "corn": "carton: packaged food good (unloadable asset; best-effort).",
+      "cherries": "carton: packaged food good (unloadable asset; best-effort).",
+      "mayo": "bottle: condiment bottle/jar (unloadable asset; best-effort).",
+      "white_storage_box": "container: lidded storage holder.",
+      "bowl_drainer": "container: dish rack/drainer that holds items."
+    },
+    "incompatible_additions": {
+      "[bottle, stove]": "Fills a coverage gap: bowl/carton/book/mug are already barred from a cooking surface, but bottles were not. A wine_bottle/ketchup/mayo balanced on a stove is as implausible as the others. This newly bars existing bottle CFs onto stoves and covers the new asset mayo. Intentional behavior change (file-present path only), justified by consistency with the existing stove rules."
+    },
+    "curator_process": "When a new asset enters asset_variants.json, add a physical_category here (and, if it introduces a genuinely new placement constraint, an incompatible pair). cookware (frypan) is deliberately NOT barred from stove — a pan on a stove is correct."
+  },
+  "physical_category": {
+    "akita_black_bowl": "bowl",
+    "white_bowl": "bowl",
+    "glazed_rim_porcelain_ramekin": "bowl",
+    "plate": "bowl",
+    "chefmate_8_frypan": "cookware",
+    "red_coffee_mug": "mug",
+    "white_yellow_mug": "mug",
+    "porcelain_mug": "mug",
+    "moka_pot": "mug",
+    "black_book": "book",
+    "yellow_book": "book",
+    "wine_bottle": "bottle",
+    "ketchup": "bottle",
+    "milk": "bottle",
+    "orange_juice": "bottle",
+    "tomato_sauce": "bottle",
+    "bbq_sauce": "bottle",
+    "salad_dressing": "bottle",
+    "new_salad_dressing": "bottle",
+    "mayo": "bottle",
+    "cream_cheese": "carton",
+    "butter": "carton",
+    "chocolate_pudding": "carton",
+    "alphabet_soup": "carton",
+    "cookies": "carton",
+    "macaroni_and_cheese": "carton",
+    "popcorn": "carton",
+    "corn": "carton",
+    "cherries": "carton",
+    "basket": "container",
+    "wooden_tray": "container",
+    "desk_caddy": "container",
+    "white_storage_box": "container",
+    "bowl_drainer": "container"
+  },
+  "incompatible": [
+    ["container", "bowl"],
+    ["bowl", "bowl"],
+    ["bowl", "stove"],
+    ["carton", "stove"],
+    ["book", "stove"],
+    ["mug", "stove"],
+    ["book", "rack"],
+    ["bottle", "stove"]
+  ]
+}
