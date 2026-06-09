@@ -88,6 +88,20 @@ _MOVABLE_CONTAINER_INTERIOR: dict[str, tuple[float, float]] = {
 }
 
 
+def workspace_half_extents(workspace_class: str | None) -> tuple[float, float]:
+    """Per-arena workspace-table half-extents ``(x_half, y_half)`` in metres.
+
+    Single source of truth (the LIBERO arena ``*_table_full_size`` halved; see
+    ``_LIBERO_TABLE_HALF_EXTENTS``) so both the position planner and the renderer
+    derive on-table placement bounds for the SAME arena instead of a constant
+    baked for ``main_table``. Falls back to the default ``main_table`` extent for
+    an unknown / absent workspace class (legacy renderer behaviour).
+    """
+    if workspace_class and workspace_class in _LIBERO_TABLE_HALF_EXTENTS:
+        return _LIBERO_TABLE_HALF_EXTENTS[workspace_class]
+    return _LIBERO_TABLE_HALF_EXTENTS["main_table"]
+
+
 def container_interior_xy_by_class(container_class: str) -> tuple[float, float] | None:
     """Return the (x_extent, y_extent) interior dims for a container class.
 

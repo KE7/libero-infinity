@@ -775,6 +775,169 @@ def _run_distractor_footprints_only() -> None:
     print(f"\nWrote {dest} with {len(out['distractors'])} distractor classes.")
 
 
+# ---------------------------------------------------------------------------
+# Per-arena workspace-table clearances (non-reference arenas)
+# ---------------------------------------------------------------------------
+#
+# The canonical ``spawn_clearances.json`` is measured on the KITCHEN / default
+# tabletop arena (table top ≈ 0.90 m), and ``surface_spawn_z`` resolves the
+# kitchen settled z exactly. But LIBERO's NON-reference arenas place objects at a
+# materially different settled z that is NOT a rigid translation of the kitchen
+# pose: the living-room table sits ~0.49 m lower AND LIBERO seats several tall
+# objects at an elevated (metastable) reset pose (e.g. ketchup ~0.20 m above the
+# living-room table top vs ~0.07 m above the kitchen table top). The
+# ``arena_surface_z`` shift alone (reusing the kitchen clearance) therefore leaves
+# a per-object residual of up to ~130 mm, which still fails pose_tolerance
+# (RCA task_robot_shove.md §4). The fix is the SAME methodology that made kitchen
+# exact: measure the per-(class, arena-table) settled clearance from the real
+# LIBERO reset (the pose pose_tolerance compares against), keyed by the arena's
+# workspace-table class and expressed relative to that arena's
+# ``arena_surface_z`` so the renderer's emitted z == the simulator's realized z.
+#
+# Only NON-reference arenas need this: kitchen / default ``table`` are the
+# reference (canonical clearance), and the study table is high enough that
+# ``arena_surface_z`` + canonical already lands within tolerance. The reference
+# arenas are intentionally NOT remeasured here so their validated rows stay
+# byte-identical.
+_ARENA_TABLE_MEASURE_TASKS: dict[str, list[str]] = {
+    "living_room_table": [
+        "libero_10/LIVING_ROOM_SCENE1_put_both_the_alphabet_soup_and_the_cream_cheese_box_in_the_basket.bddl",
+        "libero_90/LIVING_ROOM_SCENE2_pick_up_the_milk_and_put_it_in_the_basket.bddl",
+        "libero_90/LIVING_ROOM_SCENE2_pick_up_the_orange_juice_and_put_it_in_the_basket.bddl",
+        "libero_90/LIVING_ROOM_SCENE2_pick_up_the_butter_and_put_it_in_the_basket.bddl",
+        "libero_90/LIVING_ROOM_SCENE3_pick_up_the_alphabet_soup_and_put_it_in_the_tray.bddl",
+        "libero_90/LIVING_ROOM_SCENE3_pick_up_the_ketchup_and_put_it_in_the_tray.bddl",
+        "libero_90/LIVING_ROOM_SCENE4_pick_up_the_chocolate_pudding_and_put_it_in_the_tray.bddl",
+        "libero_90/LIVING_ROOM_SCENE4_pick_up_the_salad_dressing_and_put_it_in_the_tray.bddl",
+        "libero_90/LIVING_ROOM_SCENE4_pick_up_the_black_bowl_on_the_left_and_put_it_in_the_tray.bddl",
+        "libero_90/LIVING_ROOM_SCENE5_put_the_red_mug_on_the_right_plate.bddl",
+        "libero_90/LIVING_ROOM_SCENE5_put_the_yellow_and_white_mug_on_the_right_plate.bddl",
+        "libero_90/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate.bddl",
+    ],
+}
+
+# Settled-clearance plausibility band for an arena table (m, relative to the
+# arena's ``arena_surface_z``). Wider than the kitchen band because LIBERO seats
+# some tall objects elevated/metastable on the lower tables (ketchup ≈ 0.28).
+_ARENA_CLEARANCE_BAND = (0.0, 0.45)
+_ARENA_TABLE_SEEDS = (0, 1, 2)
+
+
+def measure_arena_tables() -> dict[str, float]:
+    """Measure per-(class, arena-table) settled clearance for NON-reference arenas.
+
+    For each arena task, generate a ``position`` scene, reset the real LIBERO env
+    (the same path the validation pipeline / pose_tolerance use), and record each
+    table-resting movable's ``settled_z − arena_surface_z(arena_table_class)``,
+    bucketed by ``"<asset_class>|<arena_table_class>"``. Aggregated by the
+    dominant settle mode (robust to a stray fixture-perched sample), over a few
+    deterministic seeds. The result is merged into
+    ``spawn_clearances_variants.json`` so ``surface_spawn_z`` resolves the arena's
+    settled z when the renderer threads the arena-table class as the surface.
+
+    No table-contact guard is applied: an arena's own ``:init`` regions target
+    the workspace table, so an object's LIBERO reset pose IS the ground-truth
+    table-resting pose pose_tolerance scores — even when LIBERO seats it at an
+    elevated metastable rest. Dominant-mode aggregation + multi-seed handle any
+    xy sample that lands over a fixture.
+    """
+    from libero_infinity.asset_metadata import arena_surface_z
+    from libero_infinity.compiler import compile_task_to_scenario
+    from libero_infinity.gym_env import make_env
+    from libero_infinity.task_config import TaskConfig
+    from libero_infinity.validation.invariants._scene_view import (
+        is_scene_fixture,
+        resolve_object_name,
+    )
+    from libero_infinity.validation.invariants.domain import _iter_scene_objects
+    from libero_infinity.validation.sweep import discover_all_tasks, resolve_task_path
+
+    avail = set(discover_all_tasks())
+    samples: dict[str, list[float]] = {}
+    lo, hi = _ARENA_CLEARANCE_BAND
+    for arena_table, tasks in _ARENA_TABLE_MEASURE_TASKS.items():
+        surf_z = arena_surface_z(arena_table)
+        for task_rel in tasks:
+            if task_rel not in avail:
+                print(f"# SKIP (not found): {task_rel}")
+                continue
+            bddl = str(resolve_task_path(task_rel))
+            for seed in _ARENA_TABLE_SEEDS:
+                try:
+                    cfg = TaskConfig.from_bddl(bddl)
+                    random.seed(seed)
+                    scenario = compile_task_to_scenario(cfg, "position")
+                    scene, _ = scenario.generate(maxIterations=20000)
+                    env = make_env(scene, bddl_path=bddl)
+                    env.reset()
+                except Exception as exc:  # noqa: BLE001 — measurement noise, recorded
+                    print(f"# build failed {task_rel} [seed {seed}]: {exc}")
+                    continue
+                for o in _iter_scene_objects(scene):
+                    if is_scene_fixture(o) or not getattr(o, "graspable", True):
+                        continue
+                    # Skip contained / fixture-supported children — their z
+                    # derives from a support relation, not the arena table.
+                    sp = getattr(o, "support_parent_name", "")
+                    if sp and "table" not in sp.lower():
+                        continue
+                    nm = resolve_object_name(o) or "?"
+                    cls = getattr(o, "asset_class", None)
+                    if not cls:
+                        continue
+                    st = env.get_object_state(nm)
+                    if st is None:
+                        continue
+                    clearance = float(st["position"][2]) - surf_z
+                    if not (lo <= clearance <= hi):
+                        continue
+                    samples.setdefault(f"{cls}|{arena_table}", []).append(round(clearance, 5))
+                env.close()
+
+    rows = {k: round(_dominant_mode(v), 5) for k, v in sorted(samples.items())}
+    print(f"\n# arena-table clearance rows ({len(rows)}):")
+    for k, v in rows.items():
+        print(f"  {k:44} {v:.4f}  (n={len(samples[k])})")
+    return rows
+
+
+def _merge_arena_table_rows(variants_path: pathlib.Path, rows: dict[str, float]) -> dict:
+    """Corrective-merge arena-table clearance rows into the variants file.
+
+    Rewrites a row only when it diverges from the stored value by more than the
+    smoke pose_tolerance (so already-correct rows stay byte-identical), and adds
+    new rows. Never touches non-arena-table keys.
+    """
+    data = json.loads(variants_path.read_text())
+    clearances: dict[str, float] = data.get("clearances", {})
+    changed: dict[str, tuple[float | None, float]] = {}
+    for key, z in rows.items():
+        old = clearances.get(key)
+        if old is None or abs(float(old) - z) > _POSE_TOLERANCE:
+            changed[key] = (None if old is None else float(old), z)
+            clearances[key] = z
+    data["clearances"] = {k: clearances[k] for k in sorted(clearances)}
+    data.setdefault("_meta", {})["n_arena_table_rows"] = len(rows)
+    variants_path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+    print(
+        f"\nMerged {len(changed)} arena-table row(s) into {variants_path} "
+        f"(>{_POSE_TOLERANCE * 1000:.0f}mm divergence; rest byte-identical):"
+    )
+    for k, (old, z) in sorted(changed.items()):
+        delta = "NEW" if old is None else f"{(z - old) * 1000:+.1f}mm"
+        print(f"  {k:44} {('—' if old is None else f'{old:.5f}'):>9} -> {z:.5f}  (Δ={delta})")
+    return changed
+
+
+def _run_arena_tables_only() -> None:
+    """Measure ONLY per-(class, arena-table) clearances for non-reference arenas
+    and corrective-merge them into ``spawn_clearances_variants.json``. Touches no
+    other data file and no reference-arena rows."""
+    rows = measure_arena_tables()
+    vdest = pathlib.Path("src/libero_infinity/data/spawn_clearances_variants.json")
+    _merge_arena_table_rows(vdest, rows)
+
+
 def measure() -> dict:
     from libero_infinity.compiler import compile_task_to_scenario
     from libero_infinity.gym_env import make_env
@@ -1089,7 +1252,9 @@ def _merge_distractor_table_corrective(
     )
     for c, (old, z, n) in sorted(changed.items()):
         delta = "NEW" if old is None else f"{(z - float(old)) * 1000:+.1f}mm"
-        print(f"  {c:24} {('—' if old is None else f'{float(old):.5f}'):>9} -> {z:.5f}  (n={n}, Δ={delta})")
+        print(
+            f"  {c:24} {('—' if old is None else f'{float(old):.5f}'):>9} -> {z:.5f}  (n={n}, Δ={delta})"
+        )
     return changed
 
 
@@ -1100,12 +1265,18 @@ def _run_distractor_table_only(seeds: int = _DISTRACTOR_FIXTURE_SEEDS) -> None:
     table_path = pathlib.Path("src/libero_infinity/data/spawn_clearances.json")
     existing = json.loads(table_path.read_text()).get("clearances", {})
     samples = measure_distractor_table(existing, seeds=seeds)
-    print(f"\n# distractor-table samples per class (n): "
-          f"{ {c: len(v) for c, v in sorted(samples.items())} }")
+    print(
+        f"\n# distractor-table samples per class (n): "
+        f"{ {c: len(v) for c, v in sorted(samples.items())} }"
+    )
     for c, v in sorted(samples.items()):
         mode = _dominant_mode(v)
         old = existing.get(c)
-        chk = f"stored={float(old):.5f} Δ={abs(mode - float(old)) * 1000:.1f}mm" if old is not None else "(NEW)"
+        chk = (
+            f"stored={float(old):.5f} Δ={abs(mode - float(old)) * 1000:.1f}mm"
+            if old is not None
+            else "(NEW)"
+        )
         print(f"  {c:24} mode={mode:.5f} med={statistics.median(v):.5f} n={len(v)}  {chk}")
     _merge_distractor_table_corrective(table_path, samples)
 
@@ -1129,6 +1300,10 @@ if __name__ == "__main__":
             if _a.startswith("--seeds="):
                 _seeds = int(_a.split("=", 1)[1])
         _run_distractor_table_only(seeds=_seeds)
+        raise SystemExit(0)
+
+    if "--arena-tables-only" in sys.argv:
+        _run_arena_tables_only()
         raise SystemExit(0)
 
     out = measure()
