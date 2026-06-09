@@ -13,8 +13,6 @@ from __future__ import annotations
 import pathlib
 import types
 
-import pytest
-
 from libero_infinity import vision_validation as vv
 
 CANONICAL_MODEL = "vertex_ai/gemini-2.0-flash"
