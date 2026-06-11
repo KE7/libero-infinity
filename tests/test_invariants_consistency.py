@@ -232,3 +232,96 @@ def test_assert_consistency_uses_libero_env_accessor_real_results():
     assert cls.passed is True, cls.detail
     # Critical: not the uniform-False env_missing path.
     assert pose.payload.get("reason") != "env_missing"
+
+
+# ---------------------------------------------------------------------------
+# WS-1: measured fixture geometry — no silent hand-coded fallback for the real
+# support fixtures objects/distractors rest on across the scenario corpus.
+# ---------------------------------------------------------------------------
+
+
+def _corpus_support_fixture_classes() -> set[str]:
+    """Every non-table fixture class present as a ``FixtureNode`` in the corpus.
+
+    These are the surfaces the renderer can seat objects/distractors on; the
+    workspace tables/floor are arena surfaces (served by the arena-table rows,
+    not ``fixture_geometry.json``) and are excluded.
+    """
+    from libero_infinity.ir.graph_builder import build_semantic_scene_graph
+    from libero_infinity.ir.nodes import ArticulationModel, FixtureNode
+    from libero_infinity.task_config import TaskConfig
+    from libero_infinity.validation.sweep import discover_all_tasks, resolve_task_path
+
+    tables = set(ArticulationModel.canonical().root_workspace_fixtures)
+    classes: set[str] = set()
+    for task_rel in discover_all_tasks():
+        try:
+            cfg = TaskConfig.from_bddl(str(resolve_task_path(task_rel)))
+            graph = build_semantic_scene_graph(cfg)
+        except Exception:  # noqa: BLE001 — unbuildable task is not this test's concern
+            continue
+        for node in graph.nodes.values():
+            cls = getattr(node, "object_class", None)
+            if isinstance(node, FixtureNode) and cls and cls not in tables:
+                classes.add(cls)
+    return classes
+
+
+def test_all_corpus_support_fixtures_have_measured_geometry():
+    """Every real (non-table) support fixture used anywhere in the scenario
+    corpus MUST carry MEASURED geometry in ``fixture_geometry.json`` — never the
+    hand-coded ``_FIXTURE_DIMS_FALLBACK``. A fixture missing here silently
+    degrades its spawn z / footprint to a guessed value (audit WS-1)."""
+    from libero_infinity import asset_metadata
+
+    support_fixtures = _corpus_support_fixture_classes()
+    assert support_fixtures, "corpus scan found no support fixtures — scan is broken"
+    unmeasured = sorted(f for f in support_fixtures if not asset_metadata.is_fixture_measured(f))
+    assert not unmeasured, (
+        f"corpus support fixtures missing MEASURED geometry (fell back to "
+        f"_FIXTURE_DIMS_FALLBACK): {unmeasured}. Measure them with "
+        f"`scripts/measure_spawn_clearances.py --support-fixtures-only`."
+    )
+
+
+def test_measured_fixture_geometry_rows_are_well_formed():
+    """Each measured fixture row exposes a sane footprint, height and top_z."""
+    from libero_infinity import asset_metadata
+
+    assert asset_metadata.FIXTURE_GEOMETRY, "no measured fixtures loaded"
+    for fclass, geom in asset_metadata.FIXTURE_GEOMETRY.items():
+        fw, fl = asset_metadata.fixture_footprint(fclass)
+        assert 0.0 < fw < 1.0 and 0.0 < fl < 1.0, (fclass, fw, fl)
+        assert 0.0 < asset_metadata.fixture_height(fclass) < 1.0, fclass
+        assert 0.0 <= asset_metadata.fixture_top_z_above_table(fclass) < 1.0, fclass
+
+
+def test_fixture_fallback_warns_only_for_unmeasured_real_fixtures(caplog):
+    """A real fixture without measured geometry WARNS (once); a measured fixture
+    and a workspace table (an arena surface) do NOT warn."""
+    import logging
+
+    from libero_infinity import asset_metadata
+
+    # Measured fixture: no warning.
+    asset_metadata._warned_fixture_fallback.discard("flat_stove")
+    with caplog.at_level(logging.WARNING, logger="libero_infinity.asset_metadata"):
+        asset_metadata.fixture_footprint("flat_stove")
+    assert not any("fixture_geometry" in r.message for r in caplog.records)
+
+    # Workspace table (arena surface, fallback is the accepted source): no warning.
+    caplog.clear()
+    asset_metadata._warned_fixture_fallback.discard("kitchen_table")
+    with caplog.at_level(logging.WARNING, logger="libero_infinity.asset_metadata"):
+        asset_metadata.fixture_footprint("kitchen_table")
+    assert not any("no MEASURED" in r.message for r in caplog.records)
+
+    # Genuinely-unmeasured real fixture: warns exactly once, then deduplicates.
+    caplog.clear()
+    fake = "totally_unmeasured_fixture_xyz"
+    asset_metadata._warned_fixture_fallback.discard(fake)
+    with caplog.at_level(logging.WARNING, logger="libero_infinity.asset_metadata"):
+        asset_metadata.fixture_footprint(fake)
+        asset_metadata.fixture_height(fake)
+    warns = [r for r in caplog.records if "no MEASURED" in r.message and fake in r.message]
+    assert len(warns) == 1, f"expected one deduped warning, got {len(warns)}"

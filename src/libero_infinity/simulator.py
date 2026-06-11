@@ -272,6 +272,22 @@ def _body_world_aabb(sim, object_name: str) -> tuple[np.ndarray, np.ndarray] | N
     return np.min(mins, axis=0), np.max(maxs, axis=0)
 
 
+def _body_origin_z(sim, object_name: str) -> float | None:
+    """World-frame z of a movable's body origin (``body_xpos``), or ``None``.
+
+    The body origin is the frame ``spawn_clearance`` / ``surface_spawn_z`` are
+    expressed in (``body_xpos_z − surface_z``), so the restack compares and lifts
+    in this frame to stay in lockstep with the renderer's emitted spawn z.
+    """
+    for cand in (object_name, f"{object_name}_main"):
+        try:
+            body_id = sim.model.body_name2id(cand)
+        except Exception:
+            continue
+        return float(sim.data.body_xpos[body_id][2])
+    return None
+
+
 def _visibility_anchor_points_for_body(
     *,
     sim,
@@ -1368,9 +1384,36 @@ class LIBEROSimulation(Simulation):
         support_parent_names: dict[str, str],
         contained_object_names: set[str],
     ) -> None:
-        """Lift supported children that settled into their parent support."""
+        """Lift supported children that settled into their parent support.
+
+        A stacked child (movable→movable, e.g. a bowl stacked on a plate) is
+        rendered ``at <support> offset by (.., .., 0.0)`` and dropped onto its
+        parent, then physics settles it. If it sinks INTO the parent, it is
+        lifted so its body origin sits at the MEASURED seating height above the
+        parent's top: ``parent_top + spawn_clearance(child_class, parent_class)``.
+
+        ``spawn_clearance`` is the measured body-origin height above a flat
+        contact surface (``body_xpos_z − TABLE_SURFACE_Z`` for a table-rester),
+        so adding it to the parent's AABB top places the child's base exactly on
+        the parent — the SAME measured quantity the renderer/injector use for an
+        object's spawn z (``surface_spawn_z``), keeping injected z == settled z.
+        This replaces the prior heuristic gap ``max(0.003, min(0.010,
+        child_height*0.05))`` (3–10 mm), which ignored the asset's real
+        body-origin offset and under-seated tall children by 50–250 % (audit
+        WS-1), inducing a renderer/simulator z-frame mismatch. The guard is
+        unchanged: a child already resting at/above the measured height is left
+        untouched (only sunk children are lifted, never pulled down).
+        """
         if self.libero_env is None:
             return
+
+        # Resolve each movable's asset class so the per-(child, parent) measured
+        # clearance can be looked up — the SAME class the renderer emits.
+        class_by_name: dict[str, str] = {}
+        for o in getattr(self.scene, "objects", []) or []:
+            nm = getattr(o, "libero_name", "")
+            if nm:
+                class_by_name[nm] = getattr(o, "asset_class", "") or "_default"
 
         sim = self.libero_env.env.sim
         for child_name, parent_name in support_parent_names.items():
@@ -1382,19 +1425,25 @@ class LIBEROSimulation(Simulation):
             if child_aabb is None or parent_aabb is None:
                 continue
 
-            child_min, child_max = child_aabb
+            child_min, _child_max = child_aabb
             _parent_min, parent_max = parent_aabb
             if not np.all(np.isfinite(child_min)) or not np.all(np.isfinite(parent_max)):
                 continue
 
-            child_height = max(float(child_max[2] - child_min[2]), 0.0)
-            clearance = max(0.003, min(0.010, child_height * 0.05))
-            min_child_bottom_z = float(parent_max[2]) + clearance
-            current_child_bottom_z = float(child_min[2])
-            if current_child_bottom_z >= min_child_bottom_z:
+            child_origin_z = _body_origin_z(sim, child_name)
+            if child_origin_z is None or not np.isfinite(child_origin_z):
                 continue
 
-            dz = min_child_bottom_z - current_child_bottom_z
+            # Measured body-origin seating height above the parent's top face.
+            clearance = _spawn_clearance(
+                class_by_name.get(child_name, "_default"),
+                class_by_name.get(parent_name) or None,
+            )
+            min_child_origin_z = float(parent_max[2]) + clearance
+            if child_origin_z >= min_child_origin_z:
+                continue
+
+            dz = min_child_origin_z - child_origin_z
             joint_name = f"{child_name}_joint0"
             try:
                 qpos = sim.data.get_joint_qpos(joint_name).copy()

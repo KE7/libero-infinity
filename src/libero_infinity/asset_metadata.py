@@ -34,9 +34,12 @@ half-bounding-box approximation so the function is always total.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import pkgutil
 import warnings
+
+log = logging.getLogger(__name__)
 
 # Canonical workspace table-surface height in the Scenic / MuJoCo world frame
 # (floor → 0). This is the surface objects are sampled to rest on. It MUST stay
@@ -365,17 +368,44 @@ def _load_fixture_geometry() -> dict[str, dict]:
 FIXTURE_GEOMETRY: dict[str, dict] = _load_fixture_geometry()
 
 
+# Classes for which the hand-coded fallback is a documented, accepted source —
+# the workspace tables/floor are ARENA surfaces (their per-arena geometry is
+# served by #29's arena-table rows, NOT fixture_geometry.json), so resolving them
+# through the fallback dict is correct and must not warn. Every OTHER non-empty
+# fixture class hitting the fallback is an UNMEASURED real support surface and is
+# warned about (once per class) so it cannot silently degrade spawn z / footprint.
+_FALLBACK_OK_CLASSES: frozenset[str] = _WORKSPACE_TABLE_CLASSES
+_warned_fixture_fallback: set[str] = set()
+
+
+def _warn_fixture_fallback(fixture_class: str | None, quantity: str) -> None:
+    """Emit a one-shot WARNING when a real (non-table) fixture resolves ``quantity``
+    from the hand-coded fallback instead of measured ``fixture_geometry.json``."""
+    fc = fixture_class or ""
+    if not fc or fc in _FALLBACK_OK_CLASSES or fc in _warned_fixture_fallback:
+        return
+    _warned_fixture_fallback.add(fc)
+    log.warning(
+        "fixture %r has no MEASURED %s in fixture_geometry.json — using the "
+        "hand-coded _FIXTURE_DIMS_FALLBACK (inaccurate). Run "
+        "`scripts/measure_spawn_clearances.py --support-fixtures-only` to measure it.",
+        fc,
+        quantity,
+    )
+
+
 def fixture_footprint(fixture_class: str | None) -> tuple[float, float]:
     """Return the measured (width, length) xy footprint of a fixture class (m).
 
     Falls back to the conservative legacy dimensions when the fixture is not in
-    the measured ``fixture_geometry.json`` table.
+    the measured ``fixture_geometry.json`` table (warns for real fixtures).
     """
     geom = FIXTURE_GEOMETRY.get(fixture_class or "")
     if geom is not None:
         fp = geom.get("footprint")
         if isinstance(fp, (list, tuple)) and len(fp) >= 2:
             return float(fp[0]), float(fp[1])
+    _warn_fixture_fallback(fixture_class, "footprint")
     dims = _FIXTURE_DIMS_FALLBACK.get(fixture_class or "", _FIXTURE_DIM_DEFAULT)
     return dims[0], dims[1]
 
@@ -404,6 +434,7 @@ def fixture_height(fixture_class: str | None) -> float:
     geom = FIXTURE_GEOMETRY.get(fixture_class or "")
     if geom is not None and geom.get("height") is not None:
         return float(geom["height"])
+    _warn_fixture_fallback(fixture_class, "height")
     dims = _FIXTURE_DIMS_FALLBACK.get(fixture_class or "", _FIXTURE_DIM_DEFAULT)
     return dims[2]
 
@@ -419,6 +450,7 @@ def fixture_top_z_above_table(fixture_class: str | None) -> float:
     geom = FIXTURE_GEOMETRY.get(fixture_class or "")
     if geom is not None and geom.get("top_z") is not None:
         return float(geom["top_z"])
+    _warn_fixture_fallback(fixture_class, "top_z")
     return fixture_height(fixture_class)
 
 
