@@ -835,9 +835,21 @@ def _isolated_fixture_world_aabb(fixture_class: str):
     vs stored offset 0.0947).
 
     Returns ``{"footprint": [w, l], "height": h, "offset": [dx, dy]}`` (all
-    rounded, m) over ALL geoms — matching the existing ``_fixture_world_aabb``
-    union (visual + collision) the stored rows used — or ``None`` if the class
-    will not load. No scene, no dynamics, no contacts → cannot overflow.
+    rounded, m) over the fixture's **collision** geoms only — or ``None`` if the
+    class will not load. No scene, no dynamics, no contacts → cannot overflow.
+
+    Collision-only is deliberate (audit WS-1 g3): the footprint is consumed as a
+    PLACEMENT/CLEARANCE keepout (renderer object↔fixture and robot↔fixture boxes,
+    and the goal-region distractor keepout). Only collision geometry physically
+    blocks placement — a visual-only overhang (a decorative shell, an open-frame
+    side panel) does NOT, so unioning visual geoms over-inflates the keepout and
+    spuriously fails Scenic generation in budget (g3). For the corpus's
+    non-articulated support fixtures the visual mesh overhangs the collision body
+    by up to ~0.19 m (desk_caddy width, wooden_two_layer_shelf length), which
+    drove a −7.4 pp g3 regression; the collision AABB is the true seating/keepout
+    extent. (The already-stored articulated fixtures — flat_stove, microwave,
+    {white,wooden}_cabinet — keep their in-scene door/drawer-OPEN envelopes and
+    are not re-measured through this path; the cross-check skips them.)
     """
     import math as _math
 
@@ -871,6 +883,11 @@ def _isolated_fixture_world_aabb(fixture_class: str):
     for gid in range(model.ngeom):
         gname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
         if gname is None or fixture_class not in gname:
+            continue
+        # Skip visual-only geoms (contype == conaffinity == 0): they never make a
+        # contact, so they cannot block a placed object — including them would
+        # over-inflate the keepout footprint (audit WS-1 g3 regression).
+        if int(model.geom_contype[gid]) == 0 and int(model.geom_conaffinity[gid]) == 0:
             continue
         aabb = model.geom_aabb[gid]
         c_local = np.asarray(aabb[:3], dtype=float)
@@ -1081,9 +1098,12 @@ def measure_support_fixtures(only_unmeasured: bool = True) -> dict[str, dict]:
 
 
 def _crosscheck_isolated_vs_stored() -> None:
-    """Sanity: confirm the isolated static-AABB reproduces the 4 already-measured
-    NON-articulated fixtures' stored footprint/height within tolerance (does NOT
-    write — pure validation that the isolated frame matches the stored frame).
+    """Sanity: confirm the isolated collision-AABB reproduces each NON-articulated
+    fixture's stored footprint/height within tolerance (does NOT write — pure
+    validation that the isolated frame matches the stored frame). The corpus's
+    articulated originals (flat_stove, microwave, {white,wooden}_cabinet) store
+    door/drawer-OPEN envelopes and are skipped; the non-articulated support
+    fixtures (desk_caddy, wine_rack, wooden_two_layer_shelf) are validated here.
     """
     from libero_infinity import asset_metadata
     from libero_infinity.ir.nodes import ArticulationModel
