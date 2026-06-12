@@ -34,9 +34,12 @@ half-bounding-box approximation so the function is always total.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import pkgutil
 import warnings
+
+log = logging.getLogger(__name__)
 
 # Canonical workspace table-surface height in the Scenic / MuJoCo world frame
 # (floor → 0). This is the surface objects are sampled to rest on. It MUST stay
@@ -242,7 +245,9 @@ def arena_surface_z(workspace_class: str | None) -> float:
     return TABLE_SURFACE_Z + (top_z - _REFERENCE_ARENA_TABLE_TOP_Z)
 
 
-def spawn_clearance(asset_class: str, surface_class: str | None = None) -> float:
+def spawn_clearance(
+    asset_class: str, surface_class: str | None = None, *, distractor: bool = False
+) -> float:
     """Return the resting body-origin height (m) above ``TABLE_SURFACE_Z``.
 
     Resolution order (most specific first), so an object-axis variant carries
@@ -253,35 +258,67 @@ def spawn_clearance(asset_class: str, surface_class: str | None = None) -> float
        (geometry-different variants and surface-dependent seating) AND the
        measured per-(distractor, fixture) entries produced by Fix 2.
     2. **On-fixture analytic** (Fix 2): when ``surface_class`` is an elevated
-       fixture not yet in the measured table, the distractor rests on the
-       fixture's top face, so its body origin sits
-       ``fixture_top_z_above_table(surface_class)`` higher than it would on the
-       table, plus its own table-resting body-origin offset
-       (``spawn_clearance(asset_class, None)``). Both terms are measured
-       geometry (or a conservative fallback), so the renderer and simulator
-       resolve the SAME on-fixture z even before the per-pair settle has been
-       recorded — no hardcoded fixture heights, no chicken-and-egg with the
-       measured table. The settle measurement validates this analytic value and,
-       once recorded, supersedes it via rule 1.
+       fixture not yet in the measured table, the object rests on the fixture's
+       top face, so its body origin sits ``<rest surface above table>`` higher
+       than it would on the table, plus its own table-resting body-origin offset
+       (``spawn_clearance(asset_class, None)``). The rest surface depends on the
+       resting object:
+
+         * a DISTRACTOR (``distractor=True``) is a FLAT object that settles at
+           the height a flat object actually comes to rest on the fixture top —
+           ``fixture_distractor_rest_z_above_table`` (the settle-measured
+           ``settle_top_z``). For a flat fixture (stove/cabinet/table top) this
+           equals ``top_z``; for an OPEN-FRAME fixture (wine_rack, shelf) it is
+           LOWER than ``top_z`` because the flat object sinks between the frame
+           rails rather than perching on the highest collision edge (WS-1 RCA:
+           wine_rack top_z≈0.396 collision edge vs ≈0.361 flat-settle rest).
+         * a TASK object (``distractor=False``, default) keeps the raw
+           ``fixture_top_z_above_table`` (``top_z``) — task seating already
+           no-regresses and must be left unchanged.
+
+       Both terms are measured geometry (or a conservative fallback), so the
+       renderer and simulator resolve the SAME on-fixture z even before the
+       per-pair settle has been recorded. The per-pair settle measurement
+       validates this analytic value and, once recorded, supersedes it via rule 1.
     3. The measured per-canonical-class clearance (legacy table-resting table).
     4. The median measured clearance (:data:`DEFAULT_CLEARANCE`) — a data-derived
        prior, NOT the discredited bounding-box approximation — so the function is
        total for every (class, surface).
     """
     if surface_class is not None:
+        # Cradle seating (angled open-frame fixture, e.g. wine_rack): a flat
+        # distractor seats in the slot at a MEASURED body-centre clearance
+        # ``dz`` above the table — NOT the additive top_z/settle_top_z model,
+        # which does not hold in the inclined cradle. Resolved identically on the
+        # renderer and the simulator so injected z == settled z.
+        if distractor:
+            cr = cradle_rest(surface_class, asset_class)
+            if cr is not None:
+                return max(cr[1], _MIN_CLEARANCE)
         measured = VARIANT_CLEARANCES.get(_variant_key(asset_class, surface_class))
         if measured is not None:
             return max(float(measured), _MIN_CLEARANCE)
         if _is_fixture_surface(surface_class):
             on_table = spawn_clearance(asset_class, None)
-            return max(fixture_top_z_above_table(surface_class) + on_table, _MIN_CLEARANCE)
+            rest_z = (
+                fixture_distractor_rest_z_above_table(surface_class)
+                if distractor
+                else fixture_top_z_above_table(surface_class)
+            )
+            return max(rest_z + on_table, _MIN_CLEARANCE)
     measured = SPAWN_CLEARANCES.get(asset_class)
     if measured is not None:
         return max(float(measured), _MIN_CLEARANCE)
     return max(DEFAULT_CLEARANCE, _MIN_CLEARANCE)
 
 
-def surface_spawn_z(surface_z: float, asset_class: str, surface_class: str | None = None) -> float:
+def surface_spawn_z(
+    surface_z: float,
+    asset_class: str,
+    surface_class: str | None = None,
+    *,
+    distractor: bool = False,
+) -> float:
     """Resolved spawn z for ``asset_class`` resting on ``surface_class``.
 
     Pure function: identical output for identical inputs, on both the renderer
@@ -292,8 +329,14 @@ def surface_spawn_z(surface_z: float, asset_class: str, surface_class: str | Non
     ``surface_class`` is the class of the support the object rests on (e.g.
     ``"flat_stove"``, ``"wooden_cabinet"``); pass ``None`` for the default
     workspace table to preserve the legacy class-only behaviour.
+
+    ``distractor`` selects the on-fixture rest surface for the un-measured
+    analytic fallback (rule 2 of :func:`spawn_clearance`): a flat distractor
+    rests at the settle-measured ``settle_top_z`` (which is below ``top_z`` for
+    open-frame fixtures), while a task object keeps ``top_z``. It has no effect
+    when a per-(class, surface) row is measured (rule 1) or for the table.
     """
-    return float(surface_z) + spawn_clearance(asset_class, surface_class)
+    return float(surface_z) + spawn_clearance(asset_class, surface_class, distractor=distractor)
 
 
 def is_measured(asset_class: str, surface_class: str | None = None) -> bool:
@@ -365,17 +408,44 @@ def _load_fixture_geometry() -> dict[str, dict]:
 FIXTURE_GEOMETRY: dict[str, dict] = _load_fixture_geometry()
 
 
+# Classes for which the hand-coded fallback is a documented, accepted source —
+# the workspace tables/floor are ARENA surfaces (their per-arena geometry is
+# served by #29's arena-table rows, NOT fixture_geometry.json), so resolving them
+# through the fallback dict is correct and must not warn. Every OTHER non-empty
+# fixture class hitting the fallback is an UNMEASURED real support surface and is
+# warned about (once per class) so it cannot silently degrade spawn z / footprint.
+_FALLBACK_OK_CLASSES: frozenset[str] = _WORKSPACE_TABLE_CLASSES
+_warned_fixture_fallback: set[str] = set()
+
+
+def _warn_fixture_fallback(fixture_class: str | None, quantity: str) -> None:
+    """Emit a one-shot WARNING when a real (non-table) fixture resolves ``quantity``
+    from the hand-coded fallback instead of measured ``fixture_geometry.json``."""
+    fc = fixture_class or ""
+    if not fc or fc in _FALLBACK_OK_CLASSES or fc in _warned_fixture_fallback:
+        return
+    _warned_fixture_fallback.add(fc)
+    log.warning(
+        "fixture %r has no MEASURED %s in fixture_geometry.json — using the "
+        "hand-coded _FIXTURE_DIMS_FALLBACK (inaccurate). Run "
+        "`scripts/measure_spawn_clearances.py --support-fixtures-only` to measure it.",
+        fc,
+        quantity,
+    )
+
+
 def fixture_footprint(fixture_class: str | None) -> tuple[float, float]:
     """Return the measured (width, length) xy footprint of a fixture class (m).
 
     Falls back to the conservative legacy dimensions when the fixture is not in
-    the measured ``fixture_geometry.json`` table.
+    the measured ``fixture_geometry.json`` table (warns for real fixtures).
     """
     geom = FIXTURE_GEOMETRY.get(fixture_class or "")
     if geom is not None:
         fp = geom.get("footprint")
         if isinstance(fp, (list, tuple)) and len(fp) >= 2:
             return float(fp[0]), float(fp[1])
+    _warn_fixture_fallback(fixture_class, "footprint")
     dims = _FIXTURE_DIMS_FALLBACK.get(fixture_class or "", _FIXTURE_DIM_DEFAULT)
     return dims[0], dims[1]
 
@@ -404,6 +474,7 @@ def fixture_height(fixture_class: str | None) -> float:
     geom = FIXTURE_GEOMETRY.get(fixture_class or "")
     if geom is not None and geom.get("height") is not None:
         return float(geom["height"])
+    _warn_fixture_fallback(fixture_class, "height")
     dims = _FIXTURE_DIMS_FALLBACK.get(fixture_class or "", _FIXTURE_DIM_DEFAULT)
     return dims[2]
 
@@ -419,7 +490,162 @@ def fixture_top_z_above_table(fixture_class: str | None) -> float:
     geom = FIXTURE_GEOMETRY.get(fixture_class or "")
     if geom is not None and geom.get("top_z") is not None:
         return float(geom["top_z"])
+    _warn_fixture_fallback(fixture_class, "top_z")
     return fixture_height(fixture_class)
+
+
+def fixture_distractor_rest_z_above_table(fixture_class: str | None) -> float:
+    """Height above ``TABLE_SURFACE_Z`` (m) at which a FLAT distractor actually
+    settles on the fixture top — the contact surface a flat object comes to rest
+    on, NOT the highest collision edge.
+
+    For a flat-topped fixture (stove burner, cabinet/microwave/table top) this is
+    the same as :func:`fixture_top_z_above_table` (``top_z``): a flat object rests
+    right on the flat surface. For an OPEN-FRAME fixture (wine_rack, two-layer
+    shelf, desk_caddy) the flat object sinks between the top rails until it
+    catches lower, so it settles BELOW the highest-collision-edge ``top_z`` (WS-1
+    RCA ``robot_distractor_settle.md``: wine_rack ``top_z``≈0.396 vs flat-settle
+    rest ≈0.361). The settle-measured value is stored per fixture as
+    ``settle_top_z`` by ``scripts/measure_spawn_clearances.py
+    --distractor-settle-z``; when absent it falls back to ``top_z`` so behaviour
+    is unchanged for any not-yet-measured fixture (and exactly equal for flat
+    fixtures, whose ``settle_top_z`` == ``top_z``).
+    """
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is not None and geom.get("settle_top_z") is not None:
+        return float(geom["settle_top_z"])
+    return fixture_top_z_above_table(fixture_class)
+
+
+# Minimum ``top_z − settle_top_z`` divergence (m) that marks an OPEN-FRAME
+# fixture — a slatted/lattice top with no flat platform. Equal to the
+# pose-tolerance: a smaller divergence means the top is effectively flat
+# (``settle_top_z`` ≈ ``top_z``) and a flat object rests on it.
+_OPEN_FRAME_SETTLE_DROP: float = 0.005
+
+
+def is_open_frame_fixture(fixture_class: str | None) -> bool:
+    """True iff ``fixture_class`` is an OPEN-FRAME fixture that cannot hold a flat
+    distractor on its top.
+
+    An open-frame fixture (``wine_rack``, ``wooden_two_layer_shelf``) has a
+    lattice / slatted top with **no flat platform**: a flat clutter object placed
+    on it sinks between the rails and keeps falling rather than perching on the
+    highest collision edge — for the wine_rack it falls THROUGH the frame to the
+    table entirely (WS-1 RCA ``robot_distractor_settle.md``; verified: collision
+    geometry is thin vertical panels, and a box injected on top drops ~35 mm in
+    the 50-step settle window and continues to the table over a full settle).
+
+    The original WS-1 fix tried to seat such a distractor at the settle-measured
+    ``settle_top_z`` (below ``top_z``), but that 50-step value is a *mid-fall*
+    artifact, not a stable rest: injecting there merely starts the object lower
+    and it keeps sinking, so the injected target never matches the settled pose.
+    Because no stable on-top rest exists, an open-frame fixture is **not a valid
+    flat-distractor support**; :func:`_assignable_fixtures` excludes it and the
+    distractor is routed to the table or a flat fixture (cabinet/stove/caddy),
+    where it settles within pose-tolerance — matching the pre-fixture (main)
+    table-resting behaviour.
+
+    Detection is data-driven and general: the settle-measurement records a
+    ``settle_top_z`` that diverges from ``top_z`` by more than the pose tolerance
+    **only** for these open-frame tops (a flat top measures ``settle_top_z`` ≈
+    ``top_z`` and carries no field), so any future open-frame fixture is excluded
+    automatically without a hard-coded name.
+    """
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is None:
+        return False
+    top_z = geom.get("top_z")
+    settle = geom.get("settle_top_z")
+    if top_z is None or settle is None:
+        return False
+    return (float(top_z) - float(settle)) > _OPEN_FRAME_SETTLE_DROP
+
+
+# ---------------------------------------------------------------------------
+# Cradle seating — angled open-frame fixtures (wine_rack)
+# ---------------------------------------------------------------------------
+#
+# An open-frame fixture whose top is an ANGLED slotted surface (the wine_rack: a
+# 62°-inclined V-cradle, MJCF ``top_region`` site) cannot hold a flat distractor
+# laid on its bounding top (it falls through — see ``is_open_frame_fixture``),
+# but a FLAT-enough distractor placed IN the cradle slides to the bottom of the
+# slant and comes to a STABLE rest, wedged against the lower rail / stopper (user
+# directive C). That rest is measured per distractor class — drop the class into
+# the cradle and long-settle to a fixed point (injected-vs-settled error 0 mm) —
+# and stored in the fixture's ``cradle`` block:
+#
+#   cradle = {
+#     "tilt_quat_wxyz": [...],   # class-independent rest orientation (the incline)
+#     "x_half": <m>,             # half-range along the cradle's free (x) axis
+#     "rests": { <class>: {"dy": <m>, "dz": <m>} },  # per eligible (flat) class
+#   }
+#
+# ``dy`` is the +y offset (toward the downslope) of the rest from the fixture
+# BODY position; ``dz`` is the resting body-centre clearance above
+# ``TABLE_SURFACE_Z``. Only classes that seat WITHOUT tumbling appear in
+# ``rests`` — tall/cube classes (e.g. alphabet_soup) tip and fall through, so
+# they are absent and fall back to the table. Both the renderer (placement) and
+# the simulator (injection) read this block so the injected pose == the settled
+# pose, keeping the distractor seated ON the rack within pose-tolerance.
+
+
+def cradle_geometry(fixture_class: str | None) -> dict | None:
+    """Return the fixture's measured ``cradle`` block, or ``None`` if it is not an
+    angled-slot (cradle) fixture."""
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is None:
+        return None
+    c = geom.get("cradle")
+    return c if isinstance(c, dict) and c.get("rests") else None
+
+
+def is_cradle_fixture(fixture_class: str | None) -> bool:
+    """True iff ``fixture_class`` is an angled-slot fixture with measured per-class
+    cradle rests (so flat distractors can be SEATED in it rather than excluded)."""
+    return cradle_geometry(fixture_class) is not None
+
+
+def cradle_rest(fixture_class: str | None, asset_class: str | None) -> tuple[float, float] | None:
+    """Return ``(dy, dz)`` cradle rest for ``asset_class`` on ``fixture_class``.
+
+    ``dy`` is the +y offset from the fixture body toward the downslope; ``dz`` is
+    the resting body-centre clearance above ``TABLE_SURFACE_Z``. Returns ``None``
+    when the fixture is not a cradle fixture or the class is not cradle-seatable
+    (too tall/round to seat without tumbling) — the caller then routes the
+    distractor to the table."""
+    c = cradle_geometry(fixture_class)
+    if c is None:
+        return None
+    r = (c.get("rests") or {}).get(asset_class or "")
+    if not isinstance(r, dict) or r.get("dy") is None or r.get("dz") is None:
+        return None
+    return float(r["dy"]), float(r["dz"])
+
+
+def cradle_tilt_quat(fixture_class: str | None) -> tuple[float, float, float, float] | None:
+    """Return the (class-independent) cradle rest orientation as a MuJoCo wxyz
+    quaternion, or ``None`` for a non-cradle fixture."""
+    c = cradle_geometry(fixture_class)
+    if c is None:
+        return None
+    q = c.get("tilt_quat_wxyz")
+    if isinstance(q, (list, tuple)) and len(q) == 4:
+        return tuple(float(x) for x in q)  # type: ignore[return-value]
+    return None
+
+
+def cradle_x_half(fixture_class: str | None) -> float:
+    """Half-range along the cradle's free (x) axis for distractor placement (m)."""
+    c = cradle_geometry(fixture_class)
+    if c is None:
+        return 0.0
+    return max(float(c.get("x_half", 0.0)), 0.0)
+
+
+def is_cradle_seatable(fixture_class: str | None, asset_class: str | None) -> bool:
+    """True iff ``asset_class`` has a measured stable cradle rest on ``fixture_class``."""
+    return cradle_rest(fixture_class, asset_class) is not None
 
 
 def is_fixture_measured(fixture_class: str | None) -> bool:

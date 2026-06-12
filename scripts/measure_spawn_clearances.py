@@ -776,6 +776,632 @@ def _run_distractor_footprints_only() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Unmeasured SUPPORT-fixture geometry — isolated static-AABB + in-scene rest top
+# ---------------------------------------------------------------------------
+#
+# WS-1 (hardcoding audit): only 4 of the corpus's support fixtures carried
+# MEASURED geometry (flat_stove, microwave, white_cabinet, wooden_cabinet); the
+# rest (wine_rack, wooden_two_layer_shelf, desk_caddy) fell back to the
+# hand-coded ``asset_metadata._FIXTURE_DIMS_FALLBACK`` (microwave shows ~131 %
+# width error vs measured; wine_rack's fallback 0.18×0.12 vs measured 0.27×0.33
+# is so small that NO distractor pool class "fits" it, so distractors are never
+# seated on the rack at all). This path measures the missing fixtures WITHOUT
+# the contact-arena overflow that killed prior agents:
+#
+#   * ``footprint`` [w, l], ``height``, ``offset`` [dx, dy] — STATIC asset
+#     geometry, read by loading the fixture IN ISOLATION (EmptyArena + the single
+#     welded fixture, ``mj_forward``, geom world-AABB; ``_isolated_fixture_world_aabb``).
+#     Deterministic, runs in seconds, and STRUCTURALLY cannot overflow the contact
+#     arena (no scene, no dynamics, no contacts). Cross-validated against the 4
+#     already-measured fixtures: the isolated AABB reproduces their stored
+#     footprint/height/offset for the NON-articulated fixtures (the missing 3 are
+#     all non-articulated, so isolated == in-scene; articulated microwave/
+#     white_cabinet differ only because their stored rows captured the OPEN
+#     door/drawer envelope, which is irrelevant here).
+#
+#   * ``top_z`` — the REST surface a centrally-placed object/distractor settles
+#     onto, expressed above the ``TABLE_Z`` constant. This is the one quantity
+#     that needs the IN-SCENE vertical placement (the fixture's authored seat on
+#     the table), so it is read from a real scene built with the ``position``
+#     perturbation (NO distractors — so NO irregular-distractor settling, the
+#     overflow trigger) and SUBPROCESS-ISOLATED per (fixture, task) so any crash
+#     loses only that sample. The rest surface is the highest *substantial*
+#     collision geom (``_FIXTURE_REST_MIN_GEOM_EXTENT``) — a thin post/divider
+#     cannot support a resting object, it straddles to the broad surface below.
+#     VALIDATED: this rule reproduces the stored flat_stove top_z (0.13502)
+#     EXACTLY — the distractor-contact method's value was the central raised
+#     grate, which is precisely the highest substantial collision geom.
+
+# Minimum horizontal half? NO — minimum FULL horizontal extent (m) a collision
+# geom must have in BOTH x and y to count as a rest surface. The smallest
+# distractor/object footprints span ~50–80 mm, so a collision geom narrower than
+# 40 mm in either axis cannot seat a resting object (it straddles/tips and the
+# object comes to rest on the broad surface below). 40 mm is comfortably below
+# the smallest real footprint yet above every thin divider/post/rim wall in the
+# corpus fixtures. Validated: reproduces the stored flat_stove top_z exactly.
+_FIXTURE_REST_MIN_GEOM_EXTENT = 0.04
+
+
+def _isolated_fixture_world_aabb(fixture_class: str):
+    """Static geom-AABB of one FIXTURE class loaded IN ISOLATION.
+
+    Like :func:`_isolated_object_world_aabb`, but fixtures are immovable bodies
+    with no inertial mass, so their free joint is stripped (the fixture is welded
+    to the worldbody) before ``mj_forward`` — otherwise MuJoCo rejects the
+    massless moving body. The fixture body is appended at the origin, so the
+    geom-AABB *center* xy IS the fixture's body-origin → geom offset (the same
+    quantity ``measure_fixture_offsets.py`` reads in-scene as
+    ``aabb_center - init_xy``; cross-checked: flat_stove isolated center x=0.0945
+    vs stored offset 0.0947).
+
+    Returns ``{"footprint": [w, l], "height": h, "offset": [dx, dy]}`` (all
+    rounded, m) over the fixture's **collision** geoms only — or ``None`` if the
+    class will not load. No scene, no dynamics, no contacts → cannot overflow.
+
+    Collision-only is deliberate (audit WS-1 g3): the footprint is consumed as a
+    PLACEMENT/CLEARANCE keepout (renderer object↔fixture and robot↔fixture boxes,
+    and the goal-region distractor keepout). Only collision geometry physically
+    blocks placement — a visual-only overhang (a decorative shell, an open-frame
+    side panel) does NOT, so unioning visual geoms over-inflates the keepout and
+    spuriously fails Scenic generation in budget (g3). For the corpus's
+    non-articulated support fixtures the visual mesh overhangs the collision body
+    by up to ~0.19 m (desk_caddy width, wooden_two_layer_shelf length), which
+    drove a −7.4 pp g3 regression; the collision AABB is the true seating/keepout
+    extent. (The already-stored articulated fixtures — flat_stove, microwave,
+    {white,wooden}_cabinet — keep their in-scene door/drawer-OPEN envelopes and
+    are not re-measured through this path; the cross-check skips them.)
+    """
+    import math as _math
+
+    import mujoco
+    import numpy as np
+    from libero.libero.envs.objects import get_object_fn
+    from robosuite.models.arenas import EmptyArena
+    from robosuite.models.world import MujocoWorldBase
+
+    try:
+        obj = get_object_fn(fixture_class)(name=f"{fixture_class}_probe")
+    except Exception as exc:  # noqa: BLE001 — unloadable class, recorded by caller
+        print(f"# isolate build failed {fixture_class}: {exc}")
+        return None
+
+    world = MujocoWorldBase()
+    world.merge(EmptyArena())
+    world.merge_assets(obj)
+    body = obj.get_obj()
+    # Strip free/articulation joints → a welded static body (no mass required).
+    for j in list(body.findall("joint")) + list(body.findall("freejoint")):
+        body.remove(j)
+    world.worldbody.append(body)
+    model = world.get_model(mode="mujoco")
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+
+    mins = np.full(3, _math.inf)
+    maxs = np.full(3, -_math.inf)
+    found = 0
+    for gid in range(model.ngeom):
+        gname = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+        if gname is None or fixture_class not in gname:
+            continue
+        # Skip visual-only geoms (contype == conaffinity == 0): they never make a
+        # contact, so they cannot block a placed object — including them would
+        # over-inflate the keepout footprint (audit WS-1 g3 regression).
+        if int(model.geom_contype[gid]) == 0 and int(model.geom_conaffinity[gid]) == 0:
+            continue
+        aabb = model.geom_aabb[gid]
+        c_local = np.asarray(aabb[:3], dtype=float)
+        half = np.asarray(aabb[3:], dtype=float)
+        xpos = np.asarray(data.geom_xpos[gid], dtype=float)
+        rot = np.asarray(data.geom_xmat[gid], dtype=float).reshape(3, 3)
+        center = xpos + rot @ c_local
+        ext = np.array([sum(abs(rot[ax, k]) * half[k] for k in range(3)) for ax in range(3)])
+        mins = np.minimum(mins, center - ext)
+        maxs = np.maximum(maxs, center + ext)
+        found += 1
+
+    if found == 0:
+        return None
+    wx, wy, hz = (maxs - mins).tolist()
+    cx = (mins[0] + maxs[0]) / 2.0
+    cy = (mins[1] + maxs[1]) / 2.0
+    return {
+        "footprint": [round(wx, 5), round(wy, 5)],
+        "height": round(hz, 5),
+        "offset": [round(float(cx), 5), round(float(cy), 5)],
+    }
+
+
+def _fixture_rest_top_inscene(task_rel: str, fixture_class: str, *, seed: int = 0):
+    """In-scene REST-surface top_z above ``TABLE_Z`` for ``fixture_class``.
+
+    Builds the task with the ``position`` perturbation (NO distractors → NO
+    irregular-distractor settling, the contact-arena overflow trigger), resets,
+    and returns the highest *substantial* collision-geom top of the fixture
+    minus ``TABLE_Z`` (the surface a centrally-placed object rests on). Returns
+    ``None`` when the fixture instance / a substantial surface is absent. Meant
+    to be run in a SUBPROCESS (``--fixture-topz-worker``) so a crash is isolated.
+    """
+    import numpy as np
+
+    from libero_infinity.compiler import compile_task_to_scenario
+    from libero_infinity.gym_env import make_env
+    from libero_infinity.ir.graph_builder import build_semantic_scene_graph
+    from libero_infinity.ir.nodes import FixtureNode
+    from libero_infinity.simulator import TABLE_Z
+    from libero_infinity.task_config import TaskConfig
+    from libero_infinity.validation.sweep import resolve_task_path
+
+    bddl = str(resolve_task_path(task_rel))
+    cfg = TaskConfig.from_bddl(bddl)
+    graph = build_semantic_scene_graph(cfg)
+    insts = [
+        getattr(n, "instance_name", None)
+        for n in graph.nodes.values()
+        if isinstance(n, FixtureNode) and getattr(n, "object_class", None) == fixture_class
+    ]
+    insts = [i for i in insts if i]
+    if not insts:
+        return None
+    random.seed(seed)
+    scene, _ = compile_task_to_scenario(cfg, "position").generate(maxIterations=8000)
+    env = make_env(scene, bddl_path=bddl)
+    env.reset()
+    sim = env._sim.libero_env.env.sim  # noqa: SLF001
+    model = sim.model
+    raw = model._model  # noqa: SLF001 — MjModel for geom_aabb
+    best = None
+    for inst in insts:
+        for gid in range(model.ngeom):
+            try:
+                gname = model.geom_id2name(gid)
+            except Exception:
+                gname = None
+            if gname is None:
+                continue
+            bid = model.geom_bodyid[gid]
+            bname = model.body_id2name(bid)
+            if bname is None or not (bname == inst or bname.startswith(inst + "_")):
+                continue
+            if int(model.geom_contype[gid]) == 0:
+                continue  # visual-only geom — not a contact/rest surface
+            aabb = raw.geom_aabb[gid]
+            c_local = np.asarray(aabb[:3], dtype=float)
+            half = np.asarray(aabb[3:], dtype=float)
+            xpos = np.asarray(sim.data.geom_xpos[gid], dtype=float)
+            rot = np.asarray(sim.data.geom_xmat[gid], dtype=float).reshape(3, 3)
+            center = xpos + rot @ c_local
+            ext = np.array([sum(abs(rot[ax, k]) * half[k] for k in range(3)) for ax in range(3)])
+            wx, wy = float(2 * ext[0]), float(2 * ext[1])
+            if min(wx, wy) < _FIXTURE_REST_MIN_GEOM_EXTENT:
+                continue  # thin post/divider — cannot seat a resting object
+            ztop = float(center[2] + ext[2])
+            best = ztop if best is None else max(best, ztop)
+    env.close()
+    if best is None:
+        return None
+    return round(best - TABLE_Z, 5)
+
+
+def _fixture_topz_subprocess(task_rel: str, fixture_class: str):
+    """Run :func:`_fixture_rest_top_inscene` in an ISOLATED subprocess.
+
+    The in-scene read does not live-step irregular distractors (it uses the
+    distractor-free ``position`` perturbation), but per the WS-1 mandate any
+    in-scene measurement is subprocess-isolated so a MuJoCo segfault on one
+    (fixture, task) cannot abort the whole run. Returns the measured top_z float
+    or ``None``.
+    """
+    import os
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, __file__, "--fixture-topz-worker", task_rel, fixture_class],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "MUJOCO_GL": "egl", "PYTHONPATH": "src"},
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        print(f"# topz subprocess crashed {fixture_class} @ {task_rel} (rc={proc.returncode})")
+        return None
+    for line in proc.stdout.splitlines():
+        if line.startswith("TOPZ_RESULT "):
+            val = line.split(" ", 1)[1].strip()
+            return None if val == "None" else float(val)
+    return None
+
+
+def _corpus_support_fixtures() -> dict[str, list[str]]:
+    """Discover the support fixtures (non-table FixtureNode classes) used across
+    the whole task corpus, mapped to up to 3 representative task ids each.
+
+    The authoritative "real on-fixture support surface" set the renderer can seat
+    objects/distractors on — every non-table fixture class present as a graph
+    ``FixtureNode``. The workspace tables/floor (arena surfaces, handled by #29)
+    are excluded.
+    """
+    from libero_infinity.ir.graph_builder import build_semantic_scene_graph
+    from libero_infinity.ir.nodes import ArticulationModel, FixtureNode
+    from libero_infinity.task_config import TaskConfig
+    from libero_infinity.validation.sweep import discover_all_tasks, resolve_task_path
+
+    tables = set(ArticulationModel.canonical().root_workspace_fixtures)
+    out: dict[str, list[str]] = {}
+    for task_rel in discover_all_tasks():
+        try:
+            cfg = TaskConfig.from_bddl(str(resolve_task_path(task_rel)))
+            graph = build_semantic_scene_graph(cfg)
+        except Exception:  # noqa: BLE001 — unbuildable task, skipped
+            continue
+        classes = {
+            getattr(n, "object_class", None)
+            for n in graph.nodes.values()
+            if isinstance(n, FixtureNode)
+        }
+        for cls in classes:
+            if not cls or cls in tables:
+                continue
+            tasks = out.setdefault(cls, [])
+            if len(tasks) < 3:
+                tasks.append(task_rel)
+    return out
+
+
+def measure_support_fixtures(only_unmeasured: bool = True) -> dict[str, dict]:
+    """Measure the corpus support fixtures' static geometry + rest top_z.
+
+    For each non-table fixture class in the corpus (optionally only those not yet
+    in the stored ``fixture_geometry.json``): footprint/height/offset from the
+    ISOLATED static-AABB and top_z from the SUBPROCESS-ISOLATED in-scene rest
+    surface, dominant-MODE aggregated over the representative tasks. Returns
+    ``{fixture_class: {"footprint": [w,l], "offset": [dx,dy], "height": h,
+    "top_z": z}}``.
+    """
+    from libero_infinity import asset_metadata
+
+    corpus = _corpus_support_fixtures()
+    measured_keys = set(asset_metadata.FIXTURE_GEOMETRY)
+    targets = {
+        c: ts for c, ts in sorted(corpus.items()) if not (only_unmeasured and c in measured_keys)
+    }
+    print(
+        f"# corpus support fixtures: {sorted(corpus)}\n"
+        f"# already measured: {sorted(measured_keys & set(corpus))}\n"
+        f"# measuring: {sorted(targets)}"
+    )
+    result: dict[str, dict] = {}
+    for fclass, tasks in targets.items():
+        static = _isolated_fixture_world_aabb(fclass)
+        if static is None:
+            print(f"# WARNING: no isolated AABB for fixture {fclass!r} — skipped")
+            continue
+        tops: list[float] = []
+        for task_rel in tasks:
+            tz = _fixture_topz_subprocess(task_rel, fclass)
+            if tz is not None:
+                tops.append(tz)
+                print(f"  {fclass:24} top_z={tz:+.5f} @ {task_rel.split('/')[-1][:46]}")
+        if not tops:
+            print(f"# WARNING: no in-scene top_z for fixture {fclass!r} — skipped")
+            continue
+        entry = {
+            "footprint": static["footprint"],
+            "offset": static["offset"],
+            "height": static["height"],
+            "top_z": round(_dominant_mode(tops), 5),
+        }
+        result[fclass] = entry
+        print(f"# {fclass}: {entry}  (top_z n={len(tops)})")
+    return result
+
+
+def _crosscheck_isolated_vs_stored() -> None:
+    """Sanity: confirm the isolated collision-AABB reproduces each NON-articulated
+    fixture's stored footprint/height within tolerance (does NOT write — pure
+    validation that the isolated frame matches the stored frame). The corpus's
+    articulated originals (flat_stove, microwave, {white,wooden}_cabinet) store
+    door/drawer-OPEN envelopes and are skipped; the non-articulated support
+    fixtures (desk_caddy, wine_rack, wooden_two_layer_shelf) are validated here.
+    """
+    from libero_infinity import asset_metadata
+    from libero_infinity.ir.nodes import ArticulationModel
+
+    articulated = set(ArticulationModel.canonical().fixture_families)
+    print("\n# cross-check isolated AABB vs stored (non-articulated only):")
+    for fclass, stored in sorted(asset_metadata.FIXTURE_GEOMETRY.items()):
+        iso = _isolated_fixture_world_aabb(fclass)
+        if iso is None:
+            continue
+        note = " [ARTICULATED: stored row = open envelope, skip]" if fclass in articulated else ""
+        sf = stored.get("footprint")
+        if sf and not note:
+            dw = abs(sf[0] - iso["footprint"][0]) * 1000
+            dl = abs(sf[1] - iso["footprint"][1]) * 1000
+            flag = "  <-- DIVERGES" if max(dw, dl) > 5 else ""
+            print(
+                f"  {fclass:24} stored_fp={sf} iso_fp={iso['footprint']} "
+                f"Δ=({dw:.1f},{dl:.1f})mm{flag}"
+            )
+        else:
+            print(f"  {fclass:24} stored_fp={sf} iso_fp={iso['footprint']}{note}")
+
+
+# ---------------------------------------------------------------------------
+# Distractor settle-z: the height a FLAT distractor actually rests at on a
+# fixture top (WS-1 open-frame seating fix).
+# ---------------------------------------------------------------------------
+#
+# ``top_z`` is the highest substantial COLLISION-geom edge of the fixture top.
+# For a FLAT-topped fixture a flat object rests right on it, but for an OPEN-FRAME
+# fixture (wine_rack, two-layer shelf, desk_caddy) a flat object sinks between the
+# top rails until it catches lower, so it settles BELOW ``top_z`` (WS-1 RCA:
+# wine_rack top_z≈0.396 collision edge vs ≈0.361 flat-settle rest → 35 mm drift →
+# the on-rack distractor fails pose_tolerance). The renderer's rule-2 ANALYTIC
+# on-fixture distractor z (``top_z + on_table``) is therefore too high for those
+# fixtures.
+#
+# settle_top_z is the analytic-consistent rest surface measured directly from a
+# real settle: drop the scene's flat distractors onto the fixture, read each
+# settled body z, and subtract its own flat-table body-origin clearance and the
+# table z. That delta is the contact-surface height the renderer must use so that
+#   inject_z = TABLE_Z + settle_top_z + on_table(class) == settled body z.
+# It is measured ONLY for the analytic-path fixtures (those with NO measured
+# per-(class|fixture) variant row); the rule-1 fixtures (flat_stove, microwave,
+# {white,wooden}_cabinet) already inject at their measured per-pair settle, never
+# consult the analytic, and are left byte-identical. The merge only writes
+# settle_top_z when it diverges from top_z by > pose_tolerance, so a fixture that
+# happens to settle ≈ top_z stays byte-identical too (no spurious field).
+
+_SETTLE_Z_SEEDS = 8
+
+# Candidate corpus tasks per analytic-path open-frame fixture where the fixture
+# is present as a NON-goal FixtureNode (goal fixtures are excluded from distractor
+# assignment, so a distractor only seats on a non-goal one). Discovered with
+# scripts/_diag_find_fixture_tasks.py.
+_SETTLE_Z_TASKS: dict[str, list[str]] = {
+    "wine_rack": [
+        "libero_goal/put_the_bowl_on_the_stove.bddl",
+        "libero_goal/push_the_plate_to_the_front_of_the_stove.bddl",
+        "libero_goal/put_the_bowl_on_top_of_the_cabinet.bddl",
+    ],
+    "desk_caddy": [
+        "libero_90/STUDY_SCENE1_pick_up_the_yellow_and_white_mug_and_place_it_to_the_right_of_the_caddy.bddl",
+        "libero_90/STUDY_SCENE2_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+        "libero_10/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+    ],
+    "wooden_two_layer_shelf": [
+        "libero_90/KITCHEN_SCENE9_turn_on_the_stove.bddl",
+        "libero_90/KITCHEN_SCENE9_put_the_white_bowl_on_top_of_the_cabinet.bddl",
+        "libero_90/KITCHEN_SCENE9_put_the_frying_pan_on_the_stove.bddl",
+    ],
+}
+
+
+def _settle_z_inscene(task_rel: str, fixture_class: str, *, seeds: int = _SETTLE_Z_SEEDS):
+    """Per-sample distractor settle deltas on ``fixture_class`` for ``task_rel``.
+
+    Builds the ``distractor`` perturbation, resets (inject + settle), and for each
+    active distractor whose ``support_surface_class`` is ``fixture_class`` returns
+    ``settled_body_z - on_table_clearance(class) - TABLE_Z`` — the analytic-
+    consistent contact-surface height above the table (distractor-independent for
+    a given fixture). Meant to run in a SUBPROCESS so the irregular-distractor
+    contact-arena (ncon) overflow stays isolated.
+    """
+    from libero_infinity.asset_metadata import spawn_clearance
+    from libero_infinity.compiler import compile_task_to_scenario
+    from libero_infinity.gym_env import make_env
+    from libero_infinity.simulator import TABLE_Z
+    from libero_infinity.task_config import TaskConfig
+    from libero_infinity.validation.sweep import resolve_task_path
+
+    bddl = str(resolve_task_path(task_rel))
+    deltas: list[float] = []
+    for seed in range(seeds):
+        try:
+            cfg = TaskConfig.from_bddl(bddl)
+            random.seed(seed)
+            scene, _ = compile_task_to_scenario(cfg, "distractor").generate(maxIterations=8000)
+            env = make_env(scene, bddl_path=bddl)
+            env.reset()
+        except Exception as exc:  # noqa: BLE001 — measurement noise, recorded
+            print(f"# settle-z build failed {task_rel} [seed {seed}]: {exc}")
+            continue
+        sim = env._sim.libero_env.env.sim  # noqa: SLF001
+        active = getattr(env._sim, "_active_distractor_names", set())  # noqa: SLF001
+        for o in scene.objects:
+            nm = getattr(o, "libero_name", "")
+            if not nm.startswith("distractor_") or nm not in active:
+                continue
+            if (getattr(o, "support_surface_class", "") or "") != fixture_class:
+                continue
+            cls = getattr(o, "asset_class", "") or ""
+            if not cls:
+                continue
+            bid = None
+            for cand in (nm, nm + "_main"):
+                try:
+                    bid = sim.model.body_name2id(cand)
+                    break
+                except Exception:
+                    continue
+            if bid is None:
+                continue
+            body_z = float(sim.data.body_xpos[bid][2])
+            delta = body_z - spawn_clearance(cls, None) - TABLE_Z
+            if 0.0 <= delta <= _FIXTURE_CLEARANCE_MAX:
+                deltas.append(round(delta, 5))
+        env.close()
+    return deltas
+
+
+def _settle_z_subprocess(task_rel: str, fixture_class: str) -> list[float]:
+    """Run :func:`_settle_z_inscene` in an ISOLATED subprocess (ncon-overflow
+    containment). Returns the list of per-sample settle deltas (possibly empty)."""
+    import os
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, __file__, "--settle-z-worker", task_rel, fixture_class],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "MUJOCO_GL": "egl", "PYTHONPATH": "src"},
+        timeout=900,
+    )
+    if proc.returncode != 0:
+        print(f"# settle-z subprocess crashed {fixture_class} @ {task_rel} (rc={proc.returncode})")
+        return []
+    out: list[float] = []
+    for line in proc.stdout.splitlines():
+        if line.startswith("SETTLEZ "):
+            try:
+                out.append(float(line.split(" ", 2)[2]))
+            except (ValueError, IndexError):
+                continue
+    return out
+
+
+def measure_distractor_settle_z() -> dict[str, float]:
+    """Settle-measured ``settle_top_z`` for every analytic-path open-frame fixture.
+
+    For each fixture in ``fixture_geometry.json`` that has NO measured
+    per-(class|fixture) variant row (so the renderer resolves its on-fixture
+    distractor z analytically), drop the scene's distractors onto it across a few
+    representative non-goal tasks (subprocess-isolated) and take the dominant
+    settle MODE of the contact-surface deltas. Returns ``{fixture: settle_top_z}``;
+    fixtures with too few samples are skipped (and warned).
+    """
+    from libero_infinity import asset_metadata
+
+    measured_pairs = {k.split("|", 1)[1] for k in asset_metadata.VARIANT_CLEARANCES if "|" in k}
+    analytic = sorted(f for f in asset_metadata.FIXTURE_GEOMETRY if f not in measured_pairs)
+    print(f"# analytic-path fixtures (settle_top_z candidates): {analytic}")
+    out: dict[str, float] = {}
+    for fclass in analytic:
+        tasks = _SETTLE_Z_TASKS.get(fclass, [])
+        if not tasks:
+            print(f"# WARNING: no candidate tasks for {fclass!r} — skipped (stays on top_z)")
+            continue
+        samples: list[float] = []
+        for task_rel in tasks:
+            ds = _settle_z_subprocess(task_rel, fclass)
+            if ds:
+                print(f"  {fclass:24} n={len(ds):3} mode={_dominant_mode(ds):.5f} @ "
+                      f"{task_rel.split('/')[-1][:46]}")
+                samples.extend(ds)
+        if len(samples) < 3:
+            print(f"# WARNING: only {len(samples)} settle samples for {fclass!r} — "
+                  f"skipped (stays on top_z)")
+            continue
+        out[fclass] = round(_dominant_mode(samples), 5)
+        top_z = asset_metadata.FIXTURE_GEOMETRY[fclass].get("top_z")
+        drop = (top_z - out[fclass]) * 1000 if top_z is not None else float("nan")
+        print(f"# {fclass}: settle_top_z={out[fclass]:.5f} (top_z={top_z}, "
+              f"{drop:+.1f}mm below edge, n={len(samples)})")
+    return out
+
+
+def _run_distractor_settle_z() -> None:
+    """Measure ``settle_top_z`` for the analytic-path open-frame fixtures and
+    ADDITIVELY merge it into ``data/fixture_geometry.json``.
+
+    Merge discipline (WS-1): a fixture gets a ``settle_top_z`` field ONLY when it
+    diverges from the fixture's ``top_z`` by > ``_POSE_TOLERANCE`` (an open frame).
+    A fixture that settles ≈ ``top_z`` is left byte-identical (no field). The
+    rule-1 fixtures are never scanned, so flat_stove/{white,wooden}_cabinet/
+    microwave rows stay byte-identical. No other field, fixture, or data file is
+    touched. The file is re-dumped in its existing insertion order so untouched
+    rows are byte-for-byte preserved.
+    """
+    settle = measure_distractor_settle_z()
+    fg_path = pathlib.Path("src/libero_infinity/data/fixture_geometry.json")
+    canon = json.loads(fg_path.read_text())
+    fixtures = canon.get("fixtures", {})
+    changed: list[str] = []
+    for fclass, sz in settle.items():
+        row = fixtures.get(fclass)
+        if row is None:
+            continue
+        top_z = row.get("top_z")
+        if top_z is not None and abs(top_z - sz) <= _POSE_TOLERANCE:
+            print(f"# {fclass}: settle_top_z {sz:.5f} ≈ top_z {top_z:.5f} — left byte-identical")
+            continue
+        if row.get("settle_top_z") == sz:
+            continue
+        row["settle_top_z"] = sz
+        changed.append(fclass)
+    if not changed:
+        print("\nNo fixture settle_top_z diverged — fixture_geometry.json untouched.")
+        return
+    meta = canon.get("_meta", {})
+    if "settle_top_z" not in meta.get("description", ""):
+        meta["description"] = (
+            meta.get("description", "").rstrip()
+            + " settle_top_z (open-frame fixtures only) is the settle-measured "
+            "height a FLAT distractor actually rests at on the fixture top — below "
+            "top_z for open frames (rails) — used for the rule-2 analytic on-fixture "
+            "DISTRACTOR z; absent ⇒ falls back to top_z. Generated by "
+            "scripts/measure_spawn_clearances.py --distractor-settle-z."
+        )
+        canon["_meta"] = meta
+    fg_path.write_text(json.dumps(canon, indent=2) + "\n")
+    print(f"\nWrote {fg_path}: added settle_top_z to {changed} "
+          f"(all other rows byte-identical).")
+    for fclass in changed:
+        print(f"  {fclass:24} {fixtures[fclass]}")
+
+
+def _run_support_fixtures_only() -> None:
+    """Measure the UNMEASURED corpus support fixtures and ADDITIVELY merge them
+    into ``data/fixture_geometry.json``.
+
+    Corrective-merge discipline (WS-1 task D): the already-measured rows (the 4
+    fixtures + #29's offset rows) are preserved BYTE-IDENTICAL — a fixture is
+    written only if it is ABSENT, or (when re-measuring all) its value diverges
+    from stored by > ``_POSE_TOLERANCE``. Touches NO other data file
+    (distractor_geometry.json, spawn_clearances*.json, arena-table rows are all
+    untouched).
+    """
+    _crosscheck_isolated_vs_stored()
+    new_geom = measure_support_fixtures(only_unmeasured=True)
+    fg_path = pathlib.Path("src/libero_infinity/data/fixture_geometry.json")
+    canon = json.loads(fg_path.read_text())
+    fixtures = canon.setdefault("fixtures", {})
+    added: list[str] = []
+    rewritten: list[str] = []
+    for fclass, entry in new_geom.items():
+        old = fixtures.get(fclass)
+        if old is None:
+            fixtures[fclass] = entry
+            added.append(fclass)
+            continue
+        # Re-measure guard (only triggers if not only_unmeasured): rewrite a
+        # stored row solely when it diverges > pose_tolerance on any scalar.
+        diverged = (
+            abs(old.get("top_z", 0.0) - entry["top_z"]) > _POSE_TOLERANCE
+            or abs(old.get("height", 0.0) - entry["height"]) > _POSE_TOLERANCE
+            or abs(old.get("footprint", [0, 0])[0] - entry["footprint"][0]) > _POSE_TOLERANCE
+            or abs(old.get("footprint", [0, 0])[1] - entry["footprint"][1]) > _POSE_TOLERANCE
+        )
+        if diverged:
+            fixtures[fclass] = entry
+            rewritten.append(fclass)
+    if not added and not rewritten:
+        print("\nNo fixtures added or diverged — fixture_geometry.json untouched.")
+        return
+    canon["fixtures"] = fixtures
+    fg_path.write_text(json.dumps(canon, indent=2) + "\n")
+    print(
+        f"\nWrote {fg_path}: added {added}, rewrote {rewritten} "
+        f"(existing rows preserved byte-identical)."
+    )
+    for fclass in added + rewritten:
+        print(f"  {fclass:24} {fixtures[fclass]}")
+
+
+# ---------------------------------------------------------------------------
 # Per-arena workspace-table clearances (non-reference arenas)
 # ---------------------------------------------------------------------------
 #
@@ -1285,6 +1911,42 @@ if __name__ == "__main__":
     import sys
 
     from libero_infinity.simulator import TABLE_Z
+
+    if "--fixture-topz-worker" in sys.argv:
+        # Subprocess worker: print exactly one ``TOPZ_RESULT <float|None>`` line
+        # for (task, fixture_class), isolated so a MuJoCo crash stays contained.
+        _i = sys.argv.index("--fixture-topz-worker")
+        _task, _fclass = sys.argv[_i + 1], sys.argv[_i + 2]
+        try:
+            _tz = _fixture_rest_top_inscene(_task, _fclass)
+        except Exception as _exc:  # noqa: BLE001 — worker failure reported as None
+            print(f"# topz-worker error {_fclass} @ {_task}: {_exc}")
+            _tz = None
+        print(f"TOPZ_RESULT {_tz}")
+        raise SystemExit(0)
+
+    if "--settle-z-worker" in sys.argv:
+        # Subprocess worker: print one ``SETTLEZ <fixture> <delta>`` line per valid
+        # on-fixture distractor settle sample, isolated so an ncon-overflow segfault
+        # on one (task, fixture) stays contained.
+        _i = sys.argv.index("--settle-z-worker")
+        _task, _fclass = sys.argv[_i + 1], sys.argv[_i + 2]
+        try:
+            _ds = _settle_z_inscene(_task, _fclass)
+        except Exception as _exc:  # noqa: BLE001 — worker failure reported as no lines
+            print(f"# settle-z-worker error {_fclass} @ {_task}: {_exc}")
+            _ds = []
+        for _d in _ds:
+            print(f"SETTLEZ {_fclass} {_d}")
+        raise SystemExit(0)
+
+    if "--distractor-settle-z" in sys.argv:
+        _run_distractor_settle_z()
+        raise SystemExit(0)
+
+    if "--support-fixtures-only" in sys.argv:
+        _run_support_fixtures_only()
+        raise SystemExit(0)
 
     if "--distractor-footprints-only" in sys.argv:
         _run_distractor_footprints_only()

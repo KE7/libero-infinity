@@ -764,14 +764,23 @@ class TestLiberoCorpusAudit:
         random.seed(0)
         np.random.seed(0)
 
+        from libero_infinity.scenic_budget import resolve_iteration_budget
+
         path = generate_scenic_file(bowl_config, perturbation="full")
         try:
             scenario = sc.scenarioFromFile(path)
-            # Radial footprint-clearance constraints (task objects vs fixtures) are
-            # tighter than the old AABB form, so more rejection-sampling iterations
-            # are needed to find a valid scene when multiple large objects (e.g.
-            # plate_1 at 0.20×0.20m) must avoid multiple fixtures.
-            scene, _ = scenario.generate(maxIterations=10000, verbosity=0)
+            # Generate at the SAME budget production uses (eval.py calls
+            # ``resolve_iteration_budget`` → 55000 for ``full``, #27). The radial
+            # footprint-clearance constraints (task objects vs fixtures) are tighter
+            # than the old AABB form, and the WS-1 MEASURED fixture footprints are
+            # larger than the discredited hand-coded under-estimates, so this packed
+            # kitchen scene (plate_1 0.20×0.20m + bowl + stove + cabinet + wine_rack
+            # + robot + distractors) legitimately needs the full-mode budget to find
+            # a valid sample — it generates at ~20k iters, well inside 55000. A stale
+            # 10000 cap (calibrated to the old under-measured footprints) flaked.
+            scene, _ = scenario.generate(
+                maxIterations=resolve_iteration_budget("full", None), verbosity=0
+            )
             assert "chosen_asset" in scene.params
             # New compiler uses cam_azimuth instead of camera_x_offset
             assert "cam_azimuth" in scene.params
@@ -868,13 +877,16 @@ class TestLiberoCorpusAudit:
             assert f'with support_parent_name "{s.fixture_name}"' in code
             # The correlated z for at least one fitting pool class equals
             # surface_spawn_z on the assigned fixture surface (NOT the bare table
-            # z). The correlated sample is a (class, z, planar_half, height)
-            # tuple, so match the (class, z, prefix.
+            # z). The renderer always emits the DISTRACTOR seating z
+            # (``distractor=True``) — identical to the plain z for a flat fixture,
+            # but the measured cradle clearance for an angled-slot fixture
+            # (wine_rack). The correlated sample is a (class, z, planar_half,
+            # height[, y]) tuple, so match the (class, z, prefix.
             cls0 = s.pool[0] if s.pool else plan.distractor_classes[0]
-            z = surface_spawn_z(TABLE_SURFACE_Z, cls0, s.surface_class)
+            z = surface_spawn_z(TABLE_SURFACE_Z, cls0, s.surface_class, distractor=True)
             assert f'("{cls0}", {z:.4f}, ' in code
             # And it differs from the table z for the same class (fixture seats higher).
-            z_table = surface_spawn_z(TABLE_SURFACE_Z, cls0, None)
+            z_table = surface_spawn_z(TABLE_SURFACE_Z, cls0, None, distractor=True)
             assert z > z_table
 
     def test_goal_feasibility_distractor_clears_goal_region(self):
@@ -1256,6 +1268,7 @@ class TestRobotClearanceInRequireGraph:
         from libero_infinity.asset_registry import get_dimensions
         from libero_infinity.compiler import compile_task_to_scenario
         from libero_infinity.robot_metadata import get_robot_footprint
+        from libero_infinity.scenic_budget import resolve_iteration_budget
         from libero_infinity.task_config import TaskConfig
 
         fp = get_robot_footprint("Panda")
@@ -1263,11 +1276,18 @@ class TestRobotClearanceInRequireGraph:
         canon = list(fp.canonical_qpos)
         cfg = TaskConfig.from_bddl(_kitchen_bowl_bddl())
 
+        # Generate at production's budget (eval.py → ``resolve_iteration_budget``,
+        # 5000 floor). The WS-1 MEASURED footprints are larger than the old
+        # under-estimates, so a couple of the 6 seeds need ~4.1–4.9k iters on this
+        # crowded kitchen scene — feasible, just above the stale 4000 cap that was
+        # tuned to the under-measured footprints. No tolerance is relaxed.
+        max_iters = resolve_iteration_budget(subset, None)
+
         n_checked = 0
         for seed in range(6):
             random.seed(seed)
             scenario = compile_task_to_scenario(cfg, subset)
-            scene, _ = scenario.generate(maxIterations=4000)
+            scene, _ = scenario.generate(maxIterations=max_iters)
             params = scene.params
             dq = [float(params[f"robot_init_qpos_{k}"]) - canon[k] for k in range(len(canon))]
             # Object world boxes (centre + half extents) from the sampled scene.

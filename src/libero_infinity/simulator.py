@@ -56,6 +56,8 @@ from scenic.core.simulators import Simulation, Simulator
 from scenic.core.vectors import Vector
 from scipy.spatial.transform import Rotation as _Rotation
 
+from libero_infinity.asset_metadata import cradle_tilt_quat as _cradle_tilt_quat
+from libero_infinity.asset_metadata import is_cradle_seatable as _is_cradle_seatable
 from libero_infinity.asset_metadata import spawn_clearance as _spawn_clearance
 from libero_infinity.asset_metadata import surface_spawn_z as _shared_surface_spawn_z
 from libero_infinity.asset_registry import get_dimensions
@@ -149,17 +151,26 @@ def _scenic_quat(scenic_orientation) -> np.ndarray:
         return DEFAULT_ORIENTATIONS["_default"].copy()
 
 
-def _surface_spawn_z(surface_z: float, asset_class: str, surface_class: str | None = None) -> float:
+def _surface_spawn_z(
+    surface_z: float,
+    asset_class: str,
+    surface_class: str | None = None,
+    *,
+    distractor: bool = False,
+) -> float:
     """Resolved object-centre z for spawning directly on a root surface.
 
     Thin delegate to the shared, pure :func:`asset_metadata.surface_spawn_z` so
     the simulator and the Scenic renderer resolve byte-identical spawn z for the
-    same ``(surface_z, asset_class, surface_class)`` — the G4 family-C
-    ``pose_tolerance`` invariant relies on both sides agreeing (see
+    same ``(surface_z, asset_class, surface_class, distractor)`` — the G4
+    family-C ``pose_tolerance`` invariant relies on both sides agreeing (see
     ``asset_metadata`` docstring and
-    ``rca/stage1_g4_consistency_pose_frame_mismatch.md``).
+    ``rca/stage1_g4_consistency_pose_frame_mismatch.md``). ``distractor`` routes
+    a flat distractor onto a fixture's settle-measured rest height instead of its
+    raw collision-edge ``top_z`` (WS-1 open-frame seating fix); it must mirror the
+    renderer's distractor branch exactly.
     """
-    return _shared_surface_spawn_z(surface_z, asset_class, surface_class)
+    return _shared_surface_spawn_z(surface_z, asset_class, surface_class, distractor=distractor)
 
 
 def _bddl_contained_object_names(bddl_path: str) -> set[str]:
@@ -270,6 +281,22 @@ def _body_world_aabb(sim, object_name: str) -> tuple[np.ndarray, np.ndarray] | N
     if not mins:
         return None
     return np.min(mins, axis=0), np.max(maxs, axis=0)
+
+
+def _body_origin_z(sim, object_name: str) -> float | None:
+    """World-frame z of a movable's body origin (``body_xpos``), or ``None``.
+
+    The body origin is the frame ``spawn_clearance`` / ``surface_spawn_z`` are
+    expressed in (``body_xpos_z − surface_z``), so the restack compares and lifts
+    in this frame to stay in lockstep with the renderer's emitted spawn z.
+    """
+    for cand in (object_name, f"{object_name}_main"):
+        try:
+            body_id = sim.model.body_name2id(cand)
+        except Exception:
+            continue
+        return float(sim.data.body_xpos[body_id][2])
+    return None
 
 
 def _visibility_anchor_points_for_body(
@@ -985,10 +1012,16 @@ class LIBEROSimulation(Simulation):
                 # surface) clearance identical to the renderer's emitted spawn z
                 # (Fix 3 / Finding A). Empty string → default workspace table.
                 _surface_class = getattr(obj, "support_surface_class", "") or None
+                # A distractor is a flat clutter object: on an open-frame fixture
+                # it settles BELOW the raw collision-edge top_z, so route it
+                # through the settle-measured rest-z (mirrors the renderer's
+                # distractor branch — lockstep). Task objects keep top_z.
+                _is_distractor = libero_name.startswith("distractor_")
                 pos[2] = _surface_spawn_z(
                     root_surface_z,
                     getattr(obj, "asset_class", "_default"),
                     _surface_class,
+                    distractor=_is_distractor,
                 )
                 table_spawned_names.add(libero_name)
             self._inject_object_pose(libero_name, pos, obj)
@@ -1331,6 +1364,19 @@ class LIBEROSimulation(Simulation):
             # (scalar-first), so convert: [qx,qy,qz,qw] → [qw,qx,qy,qz].
             quat = np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
 
+        # Angled-slot CRADLE seating (wine_rack): a flat distractor seated in the
+        # slot rests TILTED on the incline. Inject it at the measured cradle tilt
+        # (class-independent, MuJoCo wxyz) so it stays put at the slant-bottom
+        # rest (fixed-point: injected pose == settled pose) instead of toppling
+        # out from an upright start. Only for cradle-seatable distractors; the
+        # renderer placed the matching slant-bottom xy/z, so this completes the
+        # injected==settled pose. Rotation is not scored for distractors.
+        if libero_name.startswith("distractor_"):
+            _ssc = getattr(scenic_obj, "support_surface_class", "") or None
+            _tilt = _cradle_tilt_quat(_ssc) if _ssc else None
+            if _tilt is not None and _is_cradle_seatable(_ssc, asset_class):
+                quat = np.array(_tilt, dtype=float)
+
         pos = pos.copy()
 
         # 7-vector: [x, y, z, qw, qx, qy, qz]  (MuJoCo free-joint wxyz convention)
@@ -1368,9 +1414,36 @@ class LIBEROSimulation(Simulation):
         support_parent_names: dict[str, str],
         contained_object_names: set[str],
     ) -> None:
-        """Lift supported children that settled into their parent support."""
+        """Lift supported children that settled into their parent support.
+
+        A stacked child (movable→movable, e.g. a bowl stacked on a plate) is
+        rendered ``at <support> offset by (.., .., 0.0)`` and dropped onto its
+        parent, then physics settles it. If it sinks INTO the parent, it is
+        lifted so its body origin sits at the MEASURED seating height above the
+        parent's top: ``parent_top + spawn_clearance(child_class, parent_class)``.
+
+        ``spawn_clearance`` is the measured body-origin height above a flat
+        contact surface (``body_xpos_z − TABLE_SURFACE_Z`` for a table-rester),
+        so adding it to the parent's AABB top places the child's base exactly on
+        the parent — the SAME measured quantity the renderer/injector use for an
+        object's spawn z (``surface_spawn_z``), keeping injected z == settled z.
+        This replaces the prior heuristic gap ``max(0.003, min(0.010,
+        child_height*0.05))`` (3–10 mm), which ignored the asset's real
+        body-origin offset and under-seated tall children by 50–250 % (audit
+        WS-1), inducing a renderer/simulator z-frame mismatch. The guard is
+        unchanged: a child already resting at/above the measured height is left
+        untouched (only sunk children are lifted, never pulled down).
+        """
         if self.libero_env is None:
             return
+
+        # Resolve each movable's asset class so the per-(child, parent) measured
+        # clearance can be looked up — the SAME class the renderer emits.
+        class_by_name: dict[str, str] = {}
+        for o in getattr(self.scene, "objects", []) or []:
+            nm = getattr(o, "libero_name", "")
+            if nm:
+                class_by_name[nm] = getattr(o, "asset_class", "") or "_default"
 
         sim = self.libero_env.env.sim
         for child_name, parent_name in support_parent_names.items():
@@ -1382,19 +1455,25 @@ class LIBEROSimulation(Simulation):
             if child_aabb is None or parent_aabb is None:
                 continue
 
-            child_min, child_max = child_aabb
+            child_min, _child_max = child_aabb
             _parent_min, parent_max = parent_aabb
             if not np.all(np.isfinite(child_min)) or not np.all(np.isfinite(parent_max)):
                 continue
 
-            child_height = max(float(child_max[2] - child_min[2]), 0.0)
-            clearance = max(0.003, min(0.010, child_height * 0.05))
-            min_child_bottom_z = float(parent_max[2]) + clearance
-            current_child_bottom_z = float(child_min[2])
-            if current_child_bottom_z >= min_child_bottom_z:
+            child_origin_z = _body_origin_z(sim, child_name)
+            if child_origin_z is None or not np.isfinite(child_origin_z):
                 continue
 
-            dz = min_child_bottom_z - current_child_bottom_z
+            # Measured body-origin seating height above the parent's top face.
+            clearance = _spawn_clearance(
+                class_by_name.get(child_name, "_default"),
+                class_by_name.get(parent_name) or None,
+            )
+            min_child_origin_z = float(parent_max[2]) + clearance
+            if child_origin_z >= min_child_origin_z:
+                continue
+
+            dz = min_child_origin_z - child_origin_z
             joint_name = f"{child_name}_joint0"
             try:
                 qpos = sim.data.get_joint_qpos(joint_name).copy()
