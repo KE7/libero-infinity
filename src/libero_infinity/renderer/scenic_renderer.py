@@ -1132,8 +1132,8 @@ def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list
             hx, hy = _fixture_placement_half(support.object_class, slot_pool)
             x_lo, x_hi = float(support.init_x) - hx, float(support.init_x) + hx
             y_lo, y_hi = float(support.init_y) - hy, float(support.init_y) + hy
-        zs = [surface_spawn_z(arena_z, c, surface_class) for c in slot_pool] or [
-            surface_spawn_z(arena_z, "distractor", surface_class)
+        zs = [surface_spawn_z(arena_z, c, surface_class, distractor=True) for c in slot_pool] or [
+            surface_spawn_z(arena_z, "distractor", surface_class, distractor=True)
         ]
         slots.append(
             _DistractorSlot(
@@ -1182,7 +1182,7 @@ def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             # on a random value), so every clearance/declaration sees the real
             # per-class footprint instead of a uniform 8 cm proxy.
             pairs = ", ".join(
-                f'("{c}", {surface_spawn_z(arena_z, c, slot.surface_class):.4f}, '
+                f'("{c}", {surface_spawn_z(arena_z, c, slot.surface_class, distractor=True):.4f}, '
                 f"{distractor_planar_half(c):.4f}, {distractor_footprint(c)[2]:.4f})"
                 for c in slot_classes
             )
@@ -1198,7 +1198,8 @@ def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             l_expr = f"(2 * _distractor_{i}_r)"
             h_expr = f"_distractor_{i}_h"
         else:
-            z_expr = f"{surface_spawn_z(arena_z, 'distractor', slot.surface_class):.4f}"
+            _dz = surface_spawn_z(arena_z, "distractor", slot.surface_class, distractor=True)
+            z_expr = f"{_dz:.4f}"
             w_expr = f"{2 * _DEFAULT_DISTRACTOR_R:.4f}"
             l_expr = f"{2 * _DEFAULT_DISTRACTOR_R:.4f}"
             h_expr = f"{_DEFAULT_DISTRACTOR_H:.4f}"

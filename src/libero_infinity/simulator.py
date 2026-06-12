@@ -149,17 +149,26 @@ def _scenic_quat(scenic_orientation) -> np.ndarray:
         return DEFAULT_ORIENTATIONS["_default"].copy()
 
 
-def _surface_spawn_z(surface_z: float, asset_class: str, surface_class: str | None = None) -> float:
+def _surface_spawn_z(
+    surface_z: float,
+    asset_class: str,
+    surface_class: str | None = None,
+    *,
+    distractor: bool = False,
+) -> float:
     """Resolved object-centre z for spawning directly on a root surface.
 
     Thin delegate to the shared, pure :func:`asset_metadata.surface_spawn_z` so
     the simulator and the Scenic renderer resolve byte-identical spawn z for the
-    same ``(surface_z, asset_class, surface_class)`` — the G4 family-C
-    ``pose_tolerance`` invariant relies on both sides agreeing (see
+    same ``(surface_z, asset_class, surface_class, distractor)`` — the G4
+    family-C ``pose_tolerance`` invariant relies on both sides agreeing (see
     ``asset_metadata`` docstring and
-    ``rca/stage1_g4_consistency_pose_frame_mismatch.md``).
+    ``rca/stage1_g4_consistency_pose_frame_mismatch.md``). ``distractor`` routes
+    a flat distractor onto a fixture's settle-measured rest height instead of its
+    raw collision-edge ``top_z`` (WS-1 open-frame seating fix); it must mirror the
+    renderer's distractor branch exactly.
     """
-    return _shared_surface_spawn_z(surface_z, asset_class, surface_class)
+    return _shared_surface_spawn_z(surface_z, asset_class, surface_class, distractor=distractor)
 
 
 def _bddl_contained_object_names(bddl_path: str) -> set[str]:
@@ -1001,10 +1010,16 @@ class LIBEROSimulation(Simulation):
                 # surface) clearance identical to the renderer's emitted spawn z
                 # (Fix 3 / Finding A). Empty string → default workspace table.
                 _surface_class = getattr(obj, "support_surface_class", "") or None
+                # A distractor is a flat clutter object: on an open-frame fixture
+                # it settles BELOW the raw collision-edge top_z, so route it
+                # through the settle-measured rest-z (mirrors the renderer's
+                # distractor branch — lockstep). Task objects keep top_z.
+                _is_distractor = libero_name.startswith("distractor_")
                 pos[2] = _surface_spawn_z(
                     root_surface_z,
                     getattr(obj, "asset_class", "_default"),
                     _surface_class,
+                    distractor=_is_distractor,
                 )
                 table_spawned_names.add(libero_name)
             self._inject_object_pose(libero_name, pos, obj)

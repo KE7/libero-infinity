@@ -1128,6 +1128,231 @@ def _crosscheck_isolated_vs_stored() -> None:
             print(f"  {fclass:24} stored_fp={sf} iso_fp={iso['footprint']}{note}")
 
 
+# ---------------------------------------------------------------------------
+# Distractor settle-z: the height a FLAT distractor actually rests at on a
+# fixture top (WS-1 open-frame seating fix).
+# ---------------------------------------------------------------------------
+#
+# ``top_z`` is the highest substantial COLLISION-geom edge of the fixture top.
+# For a FLAT-topped fixture a flat object rests right on it, but for an OPEN-FRAME
+# fixture (wine_rack, two-layer shelf, desk_caddy) a flat object sinks between the
+# top rails until it catches lower, so it settles BELOW ``top_z`` (WS-1 RCA:
+# wine_rack top_z≈0.396 collision edge vs ≈0.361 flat-settle rest → 35 mm drift →
+# the on-rack distractor fails pose_tolerance). The renderer's rule-2 ANALYTIC
+# on-fixture distractor z (``top_z + on_table``) is therefore too high for those
+# fixtures.
+#
+# settle_top_z is the analytic-consistent rest surface measured directly from a
+# real settle: drop the scene's flat distractors onto the fixture, read each
+# settled body z, and subtract its own flat-table body-origin clearance and the
+# table z. That delta is the contact-surface height the renderer must use so that
+#   inject_z = TABLE_Z + settle_top_z + on_table(class) == settled body z.
+# It is measured ONLY for the analytic-path fixtures (those with NO measured
+# per-(class|fixture) variant row); the rule-1 fixtures (flat_stove, microwave,
+# {white,wooden}_cabinet) already inject at their measured per-pair settle, never
+# consult the analytic, and are left byte-identical. The merge only writes
+# settle_top_z when it diverges from top_z by > pose_tolerance, so a fixture that
+# happens to settle ≈ top_z stays byte-identical too (no spurious field).
+
+_SETTLE_Z_SEEDS = 8
+
+# Candidate corpus tasks per analytic-path open-frame fixture where the fixture
+# is present as a NON-goal FixtureNode (goal fixtures are excluded from distractor
+# assignment, so a distractor only seats on a non-goal one). Discovered with
+# scripts/_diag_find_fixture_tasks.py.
+_SETTLE_Z_TASKS: dict[str, list[str]] = {
+    "wine_rack": [
+        "libero_goal/put_the_bowl_on_the_stove.bddl",
+        "libero_goal/push_the_plate_to_the_front_of_the_stove.bddl",
+        "libero_goal/put_the_bowl_on_top_of_the_cabinet.bddl",
+    ],
+    "desk_caddy": [
+        "libero_90/STUDY_SCENE1_pick_up_the_yellow_and_white_mug_and_place_it_to_the_right_of_the_caddy.bddl",
+        "libero_90/STUDY_SCENE2_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+        "libero_10/STUDY_SCENE1_pick_up_the_book_and_place_it_in_the_back_compartment_of_the_caddy.bddl",
+    ],
+    "wooden_two_layer_shelf": [
+        "libero_90/KITCHEN_SCENE9_turn_on_the_stove.bddl",
+        "libero_90/KITCHEN_SCENE9_put_the_white_bowl_on_top_of_the_cabinet.bddl",
+        "libero_90/KITCHEN_SCENE9_put_the_frying_pan_on_the_stove.bddl",
+    ],
+}
+
+
+def _settle_z_inscene(task_rel: str, fixture_class: str, *, seeds: int = _SETTLE_Z_SEEDS):
+    """Per-sample distractor settle deltas on ``fixture_class`` for ``task_rel``.
+
+    Builds the ``distractor`` perturbation, resets (inject + settle), and for each
+    active distractor whose ``support_surface_class`` is ``fixture_class`` returns
+    ``settled_body_z - on_table_clearance(class) - TABLE_Z`` — the analytic-
+    consistent contact-surface height above the table (distractor-independent for
+    a given fixture). Meant to run in a SUBPROCESS so the irregular-distractor
+    contact-arena (ncon) overflow stays isolated.
+    """
+    from libero_infinity.asset_metadata import spawn_clearance
+    from libero_infinity.compiler import compile_task_to_scenario
+    from libero_infinity.gym_env import make_env
+    from libero_infinity.simulator import TABLE_Z
+    from libero_infinity.task_config import TaskConfig
+    from libero_infinity.validation.sweep import resolve_task_path
+
+    bddl = str(resolve_task_path(task_rel))
+    deltas: list[float] = []
+    for seed in range(seeds):
+        try:
+            cfg = TaskConfig.from_bddl(bddl)
+            random.seed(seed)
+            scene, _ = compile_task_to_scenario(cfg, "distractor").generate(maxIterations=8000)
+            env = make_env(scene, bddl_path=bddl)
+            env.reset()
+        except Exception as exc:  # noqa: BLE001 — measurement noise, recorded
+            print(f"# settle-z build failed {task_rel} [seed {seed}]: {exc}")
+            continue
+        sim = env._sim.libero_env.env.sim  # noqa: SLF001
+        active = getattr(env._sim, "_active_distractor_names", set())  # noqa: SLF001
+        for o in scene.objects:
+            nm = getattr(o, "libero_name", "")
+            if not nm.startswith("distractor_") or nm not in active:
+                continue
+            if (getattr(o, "support_surface_class", "") or "") != fixture_class:
+                continue
+            cls = getattr(o, "asset_class", "") or ""
+            if not cls:
+                continue
+            bid = None
+            for cand in (nm, nm + "_main"):
+                try:
+                    bid = sim.model.body_name2id(cand)
+                    break
+                except Exception:
+                    continue
+            if bid is None:
+                continue
+            body_z = float(sim.data.body_xpos[bid][2])
+            delta = body_z - spawn_clearance(cls, None) - TABLE_Z
+            if 0.0 <= delta <= _FIXTURE_CLEARANCE_MAX:
+                deltas.append(round(delta, 5))
+        env.close()
+    return deltas
+
+
+def _settle_z_subprocess(task_rel: str, fixture_class: str) -> list[float]:
+    """Run :func:`_settle_z_inscene` in an ISOLATED subprocess (ncon-overflow
+    containment). Returns the list of per-sample settle deltas (possibly empty)."""
+    import os
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, __file__, "--settle-z-worker", task_rel, fixture_class],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "MUJOCO_GL": "egl", "PYTHONPATH": "src"},
+        timeout=900,
+    )
+    if proc.returncode != 0:
+        print(f"# settle-z subprocess crashed {fixture_class} @ {task_rel} (rc={proc.returncode})")
+        return []
+    out: list[float] = []
+    for line in proc.stdout.splitlines():
+        if line.startswith("SETTLEZ "):
+            try:
+                out.append(float(line.split(" ", 2)[2]))
+            except (ValueError, IndexError):
+                continue
+    return out
+
+
+def measure_distractor_settle_z() -> dict[str, float]:
+    """Settle-measured ``settle_top_z`` for every analytic-path open-frame fixture.
+
+    For each fixture in ``fixture_geometry.json`` that has NO measured
+    per-(class|fixture) variant row (so the renderer resolves its on-fixture
+    distractor z analytically), drop the scene's distractors onto it across a few
+    representative non-goal tasks (subprocess-isolated) and take the dominant
+    settle MODE of the contact-surface deltas. Returns ``{fixture: settle_top_z}``;
+    fixtures with too few samples are skipped (and warned).
+    """
+    from libero_infinity import asset_metadata
+
+    measured_pairs = {k.split("|", 1)[1] for k in asset_metadata.VARIANT_CLEARANCES if "|" in k}
+    analytic = sorted(f for f in asset_metadata.FIXTURE_GEOMETRY if f not in measured_pairs)
+    print(f"# analytic-path fixtures (settle_top_z candidates): {analytic}")
+    out: dict[str, float] = {}
+    for fclass in analytic:
+        tasks = _SETTLE_Z_TASKS.get(fclass, [])
+        if not tasks:
+            print(f"# WARNING: no candidate tasks for {fclass!r} — skipped (stays on top_z)")
+            continue
+        samples: list[float] = []
+        for task_rel in tasks:
+            ds = _settle_z_subprocess(task_rel, fclass)
+            if ds:
+                print(f"  {fclass:24} n={len(ds):3} mode={_dominant_mode(ds):.5f} @ "
+                      f"{task_rel.split('/')[-1][:46]}")
+                samples.extend(ds)
+        if len(samples) < 3:
+            print(f"# WARNING: only {len(samples)} settle samples for {fclass!r} — "
+                  f"skipped (stays on top_z)")
+            continue
+        out[fclass] = round(_dominant_mode(samples), 5)
+        top_z = asset_metadata.FIXTURE_GEOMETRY[fclass].get("top_z")
+        drop = (top_z - out[fclass]) * 1000 if top_z is not None else float("nan")
+        print(f"# {fclass}: settle_top_z={out[fclass]:.5f} (top_z={top_z}, "
+              f"{drop:+.1f}mm below edge, n={len(samples)})")
+    return out
+
+
+def _run_distractor_settle_z() -> None:
+    """Measure ``settle_top_z`` for the analytic-path open-frame fixtures and
+    ADDITIVELY merge it into ``data/fixture_geometry.json``.
+
+    Merge discipline (WS-1): a fixture gets a ``settle_top_z`` field ONLY when it
+    diverges from the fixture's ``top_z`` by > ``_POSE_TOLERANCE`` (an open frame).
+    A fixture that settles ≈ ``top_z`` is left byte-identical (no field). The
+    rule-1 fixtures are never scanned, so flat_stove/{white,wooden}_cabinet/
+    microwave rows stay byte-identical. No other field, fixture, or data file is
+    touched. The file is re-dumped in its existing insertion order so untouched
+    rows are byte-for-byte preserved.
+    """
+    settle = measure_distractor_settle_z()
+    fg_path = pathlib.Path("src/libero_infinity/data/fixture_geometry.json")
+    canon = json.loads(fg_path.read_text())
+    fixtures = canon.get("fixtures", {})
+    changed: list[str] = []
+    for fclass, sz in settle.items():
+        row = fixtures.get(fclass)
+        if row is None:
+            continue
+        top_z = row.get("top_z")
+        if top_z is not None and abs(top_z - sz) <= _POSE_TOLERANCE:
+            print(f"# {fclass}: settle_top_z {sz:.5f} ≈ top_z {top_z:.5f} — left byte-identical")
+            continue
+        if row.get("settle_top_z") == sz:
+            continue
+        row["settle_top_z"] = sz
+        changed.append(fclass)
+    if not changed:
+        print("\nNo fixture settle_top_z diverged — fixture_geometry.json untouched.")
+        return
+    meta = canon.get("_meta", {})
+    if "settle_top_z" not in meta.get("description", ""):
+        meta["description"] = (
+            meta.get("description", "").rstrip()
+            + " settle_top_z (open-frame fixtures only) is the settle-measured "
+            "height a FLAT distractor actually rests at on the fixture top — below "
+            "top_z for open frames (rails) — used for the rule-2 analytic on-fixture "
+            "DISTRACTOR z; absent ⇒ falls back to top_z. Generated by "
+            "scripts/measure_spawn_clearances.py --distractor-settle-z."
+        )
+        canon["_meta"] = meta
+    fg_path.write_text(json.dumps(canon, indent=2) + "\n")
+    print(f"\nWrote {fg_path}: added settle_top_z to {changed} "
+          f"(all other rows byte-identical).")
+    for fclass in changed:
+        print(f"  {fclass:24} {fixtures[fclass]}")
+
+
 def _run_support_fixtures_only() -> None:
     """Measure the UNMEASURED corpus support fixtures and ADDITIVELY merge them
     into ``data/fixture_geometry.json``.
@@ -1698,6 +1923,25 @@ if __name__ == "__main__":
             print(f"# topz-worker error {_fclass} @ {_task}: {_exc}")
             _tz = None
         print(f"TOPZ_RESULT {_tz}")
+        raise SystemExit(0)
+
+    if "--settle-z-worker" in sys.argv:
+        # Subprocess worker: print one ``SETTLEZ <fixture> <delta>`` line per valid
+        # on-fixture distractor settle sample, isolated so an ncon-overflow segfault
+        # on one (task, fixture) stays contained.
+        _i = sys.argv.index("--settle-z-worker")
+        _task, _fclass = sys.argv[_i + 1], sys.argv[_i + 2]
+        try:
+            _ds = _settle_z_inscene(_task, _fclass)
+        except Exception as _exc:  # noqa: BLE001 — worker failure reported as no lines
+            print(f"# settle-z-worker error {_fclass} @ {_task}: {_exc}")
+            _ds = []
+        for _d in _ds:
+            print(f"SETTLEZ {_fclass} {_d}")
+        raise SystemExit(0)
+
+    if "--distractor-settle-z" in sys.argv:
+        _run_distractor_settle_z()
         raise SystemExit(0)
 
     if "--support-fixtures-only" in sys.argv:
