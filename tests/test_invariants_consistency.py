@@ -284,6 +284,73 @@ def test_all_corpus_support_fixtures_have_measured_geometry():
     )
 
 
+def test_open_frame_fixtures_detected_and_flat_tops_are_not():
+    """``is_open_frame_fixture`` flags lattice-top fixtures (a flat distractor
+    sinks between the rails / falls through — WS-1 regression) and only those.
+
+    Detection is data-driven: an open-frame fixture carries a ``settle_top_z``
+    that diverges from ``top_z`` beyond the pose tolerance; a flat-topped fixture
+    (cabinet/stove/microwave/caddy) measures ``settle_top_z`` ≈ ``top_z`` (no
+    field) and must NOT be flagged, or its distractors would be needlessly
+    pushed to the table."""
+    from libero_infinity import asset_metadata
+
+    geom = asset_metadata.FIXTURE_GEOMETRY
+    for fclass, g in geom.items():
+        expected = (
+            g.get("settle_top_z") is not None
+            and (float(g["top_z"]) - float(g["settle_top_z"])) > asset_metadata._OPEN_FRAME_SETTLE_DROP
+        )
+        assert asset_metadata.is_open_frame_fixture(fclass) is expected, fclass
+    # The wine_rack regression fixture is open-frame; a flat cabinet top is not.
+    assert asset_metadata.is_open_frame_fixture("wine_rack") is True
+    assert asset_metadata.is_open_frame_fixture("wooden_cabinet") is False
+    assert asset_metadata.is_open_frame_fixture("flat_stove") is False
+    # Unknown / table classes are never open-frame.
+    assert asset_metadata.is_open_frame_fixture(None) is False
+    assert asset_metadata.is_open_frame_fixture("table") is False
+
+
+def test_assignable_fixtures_excludes_open_frame_fixtures():
+    """``_assignable_fixtures`` never offers an open-frame fixture as a distractor
+    support, so a flat distractor is routed to the table / a flat fixture where it
+    settles within pose-tolerance (instead of falling through the lattice)."""
+    from libero_infinity import asset_metadata
+    from libero_infinity.renderer import scenic_renderer
+
+    class _FakeFixture:
+        def __init__(self, name, cls, x, y):
+            self.instance_name = name
+            self.object_class = cls
+            self.init_x = x
+            self.init_y = y
+
+    nodes = {
+        "wine_rack_1": _FakeFixture("wine_rack_1", "wine_rack", 0.1, 0.1),
+        "wooden_cabinet_1": _FakeFixture("wooden_cabinet_1", "wooden_cabinet", -0.1, 0.1),
+    }
+
+    class _FakeGraph:
+        pass
+
+    graph = _FakeGraph()
+    graph.nodes = nodes
+
+    import unittest.mock as _mock
+
+    # No goal fixtures; treat fakes as FixtureNode instances for the isinstance gate.
+    with _mock.patch.object(scenic_renderer, "resolve_goal_regions", lambda g: []), _mock.patch.object(
+        scenic_renderer, "FixtureNode", _FakeFixture
+    ):
+        out = scenic_renderer._assignable_fixtures(
+            plan=None, graph=graph, pool=["cream_cheese", "popcorn"]
+        )
+    names = {f.instance_name for f in out}
+    assert "wine_rack_1" not in names, "open-frame wine_rack must be excluded"
+    assert "wooden_cabinet_1" in names, "flat-top cabinet must remain assignable"
+    assert asset_metadata.is_open_frame_fixture("wine_rack")  # guards the premise
+
+
 def test_measured_fixture_geometry_rows_are_well_formed():
     """Each measured fixture row exposes a sane footprint, height and top_z."""
     from libero_infinity import asset_metadata
