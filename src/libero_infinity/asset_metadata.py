@@ -508,6 +508,51 @@ def fixture_distractor_rest_z_above_table(fixture_class: str | None) -> float:
     return fixture_top_z_above_table(fixture_class)
 
 
+# Minimum ``top_z − settle_top_z`` divergence (m) that marks an OPEN-FRAME
+# fixture — a slatted/lattice top with no flat platform. Equal to the
+# pose-tolerance: a smaller divergence means the top is effectively flat
+# (``settle_top_z`` ≈ ``top_z``) and a flat object rests on it.
+_OPEN_FRAME_SETTLE_DROP: float = 0.005
+
+
+def is_open_frame_fixture(fixture_class: str | None) -> bool:
+    """True iff ``fixture_class`` is an OPEN-FRAME fixture that cannot hold a flat
+    distractor on its top.
+
+    An open-frame fixture (``wine_rack``, ``wooden_two_layer_shelf``) has a
+    lattice / slatted top with **no flat platform**: a flat clutter object placed
+    on it sinks between the rails and keeps falling rather than perching on the
+    highest collision edge — for the wine_rack it falls THROUGH the frame to the
+    table entirely (WS-1 RCA ``robot_distractor_settle.md``; verified: collision
+    geometry is thin vertical panels, and a box injected on top drops ~35 mm in
+    the 50-step settle window and continues to the table over a full settle).
+
+    The original WS-1 fix tried to seat such a distractor at the settle-measured
+    ``settle_top_z`` (below ``top_z``), but that 50-step value is a *mid-fall*
+    artifact, not a stable rest: injecting there merely starts the object lower
+    and it keeps sinking, so the injected target never matches the settled pose.
+    Because no stable on-top rest exists, an open-frame fixture is **not a valid
+    flat-distractor support**; :func:`_assignable_fixtures` excludes it and the
+    distractor is routed to the table or a flat fixture (cabinet/stove/caddy),
+    where it settles within pose-tolerance — matching the pre-fixture (main)
+    table-resting behaviour.
+
+    Detection is data-driven and general: the settle-measurement records a
+    ``settle_top_z`` that diverges from ``top_z`` by more than the pose tolerance
+    **only** for these open-frame tops (a flat top measures ``settle_top_z`` ≈
+    ``top_z`` and carries no field), so any future open-frame fixture is excluded
+    automatically without a hard-coded name.
+    """
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is None:
+        return False
+    top_z = geom.get("top_z")
+    settle = geom.get("settle_top_z")
+    if top_z is None or settle is None:
+        return False
+    return (float(top_z) - float(settle)) > _OPEN_FRAME_SETTLE_DROP
+
+
 def is_fixture_measured(fixture_class: str | None) -> bool:
     """True iff ``fixture_class`` has measured geometry in the data table."""
     return (fixture_class or "") in FIXTURE_GEOMETRY

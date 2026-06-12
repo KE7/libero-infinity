@@ -24,6 +24,7 @@ from libero_infinity.asset_metadata import (
     fixture_footprint,
     fixture_height,
     fixture_offset,
+    is_open_frame_fixture,
     surface_spawn_z,
 )
 from libero_infinity.asset_metadata import (
@@ -1058,9 +1059,12 @@ def _assignable_fixtures(
     """Scene fixtures a distractor may be placed to rest ON.
 
     Excludes (a) goal fixtures — a distractor on the goal fixture would block
-    the task (Fix 1), and (b) fixtures on which NO pool class fits without
-    overhanging (the structural rejection — see :func:`_distractor_fits_fixture`).
-    Sorted by instance name for deterministic round-robin assignment.
+    the task (Fix 1), (b) OPEN-FRAME fixtures whose lattice top cannot hold a flat
+    distractor (it sinks between the rails / falls through — see
+    :func:`asset_metadata.is_open_frame_fixture`; WS-1 regression fix), and (c)
+    fixtures on which NO pool class fits without overhanging (the structural
+    rejection — see :func:`_distractor_fits_fixture`). Sorted by instance name for
+    deterministic round-robin assignment.
     """
     goal_fixtures = {gr.fixture_name for gr in resolve_goal_regions(graph) if gr.fixture_name}
     fit_pool = pool or ["distractor"]
@@ -1071,6 +1075,12 @@ def _assignable_fixtures(
         if node.init_x is None or node.init_y is None:
             continue
         if node.instance_name in goal_fixtures:
+            continue
+        # An open-frame fixture (wine_rack, two-layer shelf) has no flat top: a
+        # flat distractor sinks between the rails / falls through, so the injected
+        # spawn z never matches the settled pose. Not a valid flat-distractor
+        # support — route the distractor to the table / a flat fixture instead.
+        if is_open_frame_fixture(node.object_class):
             continue
         # Assignable iff at least one pool class physically fits the fixture top.
         if not any(_distractor_fits_fixture(c, node.object_class) for c in fit_pool):
