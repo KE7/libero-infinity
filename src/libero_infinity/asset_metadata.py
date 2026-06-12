@@ -286,6 +286,15 @@ def spawn_clearance(
        total for every (class, surface).
     """
     if surface_class is not None:
+        # Cradle seating (angled open-frame fixture, e.g. wine_rack): a flat
+        # distractor seats in the slot at a MEASURED body-centre clearance
+        # ``dz`` above the table — NOT the additive top_z/settle_top_z model,
+        # which does not hold in the inclined cradle. Resolved identically on the
+        # renderer and the simulator so injected z == settled z.
+        if distractor:
+            cr = cradle_rest(surface_class, asset_class)
+            if cr is not None:
+                return max(cr[1], _MIN_CLEARANCE)
         measured = VARIANT_CLEARANCES.get(_variant_key(asset_class, surface_class))
         if measured is not None:
             return max(float(measured), _MIN_CLEARANCE)
@@ -551,6 +560,92 @@ def is_open_frame_fixture(fixture_class: str | None) -> bool:
     if top_z is None or settle is None:
         return False
     return (float(top_z) - float(settle)) > _OPEN_FRAME_SETTLE_DROP
+
+
+# ---------------------------------------------------------------------------
+# Cradle seating — angled open-frame fixtures (wine_rack)
+# ---------------------------------------------------------------------------
+#
+# An open-frame fixture whose top is an ANGLED slotted surface (the wine_rack: a
+# 62°-inclined V-cradle, MJCF ``top_region`` site) cannot hold a flat distractor
+# laid on its bounding top (it falls through — see ``is_open_frame_fixture``),
+# but a FLAT-enough distractor placed IN the cradle slides to the bottom of the
+# slant and comes to a STABLE rest, wedged against the lower rail / stopper (user
+# directive C). That rest is measured per distractor class — drop the class into
+# the cradle and long-settle to a fixed point (injected-vs-settled error 0 mm) —
+# and stored in the fixture's ``cradle`` block:
+#
+#   cradle = {
+#     "tilt_quat_wxyz": [...],   # class-independent rest orientation (the incline)
+#     "x_half": <m>,             # half-range along the cradle's free (x) axis
+#     "rests": { <class>: {"dy": <m>, "dz": <m>} },  # per eligible (flat) class
+#   }
+#
+# ``dy`` is the +y offset (toward the downslope) of the rest from the fixture
+# BODY position; ``dz`` is the resting body-centre clearance above
+# ``TABLE_SURFACE_Z``. Only classes that seat WITHOUT tumbling appear in
+# ``rests`` — tall/cube classes (e.g. alphabet_soup) tip and fall through, so
+# they are absent and fall back to the table. Both the renderer (placement) and
+# the simulator (injection) read this block so the injected pose == the settled
+# pose, keeping the distractor seated ON the rack within pose-tolerance.
+
+
+def cradle_geometry(fixture_class: str | None) -> dict | None:
+    """Return the fixture's measured ``cradle`` block, or ``None`` if it is not an
+    angled-slot (cradle) fixture."""
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is None:
+        return None
+    c = geom.get("cradle")
+    return c if isinstance(c, dict) and c.get("rests") else None
+
+
+def is_cradle_fixture(fixture_class: str | None) -> bool:
+    """True iff ``fixture_class`` is an angled-slot fixture with measured per-class
+    cradle rests (so flat distractors can be SEATED in it rather than excluded)."""
+    return cradle_geometry(fixture_class) is not None
+
+
+def cradle_rest(fixture_class: str | None, asset_class: str | None) -> tuple[float, float] | None:
+    """Return ``(dy, dz)`` cradle rest for ``asset_class`` on ``fixture_class``.
+
+    ``dy`` is the +y offset from the fixture body toward the downslope; ``dz`` is
+    the resting body-centre clearance above ``TABLE_SURFACE_Z``. Returns ``None``
+    when the fixture is not a cradle fixture or the class is not cradle-seatable
+    (too tall/round to seat without tumbling) — the caller then routes the
+    distractor to the table."""
+    c = cradle_geometry(fixture_class)
+    if c is None:
+        return None
+    r = (c.get("rests") or {}).get(asset_class or "")
+    if not isinstance(r, dict) or r.get("dy") is None or r.get("dz") is None:
+        return None
+    return float(r["dy"]), float(r["dz"])
+
+
+def cradle_tilt_quat(fixture_class: str | None) -> tuple[float, float, float, float] | None:
+    """Return the (class-independent) cradle rest orientation as a MuJoCo wxyz
+    quaternion, or ``None`` for a non-cradle fixture."""
+    c = cradle_geometry(fixture_class)
+    if c is None:
+        return None
+    q = c.get("tilt_quat_wxyz")
+    if isinstance(q, (list, tuple)) and len(q) == 4:
+        return tuple(float(x) for x in q)  # type: ignore[return-value]
+    return None
+
+
+def cradle_x_half(fixture_class: str | None) -> float:
+    """Half-range along the cradle's free (x) axis for distractor placement (m)."""
+    c = cradle_geometry(fixture_class)
+    if c is None:
+        return 0.0
+    return max(float(c.get("x_half", 0.0)), 0.0)
+
+
+def is_cradle_seatable(fixture_class: str | None, asset_class: str | None) -> bool:
+    """True iff ``asset_class`` has a measured stable cradle rest on ``fixture_class``."""
+    return cradle_rest(fixture_class, asset_class) is not None
 
 
 def is_fixture_measured(fixture_class: str | None) -> bool:
