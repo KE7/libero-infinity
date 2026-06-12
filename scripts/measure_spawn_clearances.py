@@ -1745,6 +1745,149 @@ def _run_distractor_fixtures_only() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-(distractor, fixture) settle STABILITY (footprint fit is necessary but not
+# sufficient — a tall class on a non-flat fixture top tips/slides).
+# ---------------------------------------------------------------------------
+#
+# ``_distractor_fits_fixture`` only checks a class's base fits the fixture top.
+# But some tops are not a clean flat platform (the flat_stove top is a raised
+# burner GRATE): a TALL class that fits still tips/slides on the grate edges and
+# settles >5 mm from its injected pose — with a HORIZONTAL slide that no spawn-z
+# or rest-orientation removes (WS follow-up RCA: alphabet_soup on flat_stove). A
+# (class, fixture) pair that cannot settle within pose-tolerance is recorded in
+# the fixture's ``unstable_distractors`` and excluded from seating (routed to the
+# table), exactly as the wine_rack cradle lists only non-tumbling classes. This
+# is measured the same way the cradle rests are: drop each FITTING class onto the
+# fixture across representative scenes and 50-step settle, and flag a pair whose
+# pose_err exceeds pose-tolerance on a MAJORITY of seeds.
+_STABILITY_SEEDS = 8
+_STABILITY_FAIL_FRACTION = 0.5  # > this fraction of seeds failing ⇒ unstable
+
+
+def measure_distractor_fixture_stability() -> dict[str, list[str]]:
+    """Return ``{fixture_class: [unstable distractor classes]}``.
+
+    For every corpus support fixture and every pool class whose footprint FITS it
+    (the candidates that ``_distractor_fits_fixture`` would otherwise seat), force
+    that single class onto the fixture across the fixture's representative tasks,
+    reset (inject + 50-step production settle), and record the distractor's
+    pose_err. A pair is UNSTABLE iff more than ``_STABILITY_FAIL_FRACTION`` of its
+    seeds miss the 5 mm pose-tolerance. The renderer's footprint-fit unstable gate
+    is temporarily disabled during measurement so the candidate is actually seated.
+    """
+    import math as _math
+
+    import libero_infinity.asset_registry as _areg
+    import libero_infinity.planner.axes as _axes
+    from libero_infinity import asset_metadata
+    from libero_infinity.asset_registry import DEFAULT_DISTRACTOR_POOL
+    from libero_infinity.compiler import compile_task_to_scenario
+    from libero_infinity.gym_env import make_env
+    from libero_infinity.renderer.scenic_renderer import _distractor_fits_fixture
+    from libero_infinity.task_config import TaskConfig
+    from libero_infinity.validation.sweep import resolve_task_path
+
+    corpus = _corpus_support_fixtures()
+    pool = list(DEFAULT_DISTRACTOR_POOL)
+    out: dict[str, list[str]] = {}
+    orig_pool_fn_a = _areg.get_distractor_pool
+    orig_pool_fn_b = _axes.get_distractor_pool
+    try:
+        for fclass in sorted(corpus):
+            if asset_metadata.is_cradle_fixture(fclass) or asset_metadata.is_open_frame_fixture(
+                fclass
+            ):
+                continue  # cradle / open-frame handled by their own seatability path
+            geom = asset_metadata.FIXTURE_GEOMETRY.get(fclass)
+            if geom is None:
+                continue
+            # Temporarily clear the unstable gate for THIS fixture so candidates seat.
+            saved_unstable = geom.get("unstable_distractors")
+            geom.pop("unstable_distractors", None)
+            try:
+                candidates = [c for c in pool if _distractor_fits_fixture(c, fclass)]
+                for cls in candidates:
+                    _areg.get_distractor_pool = lambda *a, _c=cls, **k: [_c]
+                    _axes.get_distractor_pool = _areg.get_distractor_pool
+                    errs: list[float] = []
+                    for task_rel in corpus[fclass]:
+                        bddl = str(resolve_task_path(task_rel))
+                        for seed in range(_STABILITY_SEEDS):
+                            try:
+                                cfg = TaskConfig.from_bddl(bddl)
+                                random.seed(seed)
+                                scene, _ = compile_task_to_scenario(cfg, "distractor").generate(
+                                    maxIterations=4000
+                                )
+                                env = make_env(scene, bddl_path=bddl)
+                                env.reset()
+                            except Exception as exc:  # noqa: BLE001
+                                print(f"# stability build failed {cls}@{fclass} {task_rel}: {exc}")
+                                continue
+                            active = getattr(env._sim, "_active_distractor_names", set())
+                            for o in scene.objects:
+                                nm = getattr(o, "libero_name", "")
+                                if not nm.startswith("distractor_") or nm not in active:
+                                    continue
+                                if getattr(o, "asset_class", "") != cls:
+                                    continue
+                                if (getattr(o, "support_surface_class", "") or "") != fclass:
+                                    continue
+                                s = tuple(float(c) for c in o.position)
+                                st = env.get_object_state(nm)
+                                if st is None:
+                                    continue
+                                e = st["position"]
+                                errs.append(_math.dist(s, e))
+                            env.close()
+                    if not errs:
+                        continue
+                    n_fail = sum(1 for d in errs if d > _POSE_TOLERANCE)
+                    frac = n_fail / len(errs)
+                    flag = "UNSTABLE" if frac > _STABILITY_FAIL_FRACTION else "ok"
+                    med = sorted(errs)[len(errs) // 2] * 1000
+                    print(
+                        f"  {cls:20}@{fclass:20} n={len(errs):2} fail={n_fail}/{len(errs)} "
+                        f"({frac*100:.0f}%) median={med:.2f}mm  [{flag}]"
+                    )
+                    if frac > _STABILITY_FAIL_FRACTION:
+                        out.setdefault(fclass, []).append(cls)
+            finally:
+                if saved_unstable is not None:
+                    geom["unstable_distractors"] = saved_unstable
+    finally:
+        _areg.get_distractor_pool = orig_pool_fn_a
+        _axes.get_distractor_pool = orig_pool_fn_b
+    return {f: sorted(set(cs)) for f, cs in out.items()}
+
+
+def _run_distractor_fixture_stability() -> None:
+    """Measure per-(class, fixture) settle stability and ADDITIVELY merge the
+    UNSTABLE pairs into ``data/fixture_geometry.json`` as per-fixture
+    ``unstable_distractors`` lists. Touches NO other field or data file; the file
+    is re-dumped in its existing order so untouched rows stay byte-identical."""
+    unstable = measure_distractor_fixture_stability()
+    fg_path = pathlib.Path("src/libero_infinity/data/fixture_geometry.json")
+    canon = json.loads(fg_path.read_text())
+    fixtures = canon.get("fixtures", {})
+    changed: list[str] = []
+    for fclass, classes in unstable.items():
+        row = fixtures.get(fclass)
+        if row is None:
+            continue
+        if row.get("unstable_distractors") != classes:
+            row["unstable_distractors"] = classes
+            changed.append(fclass)
+    if not changed:
+        print("\nNo unstable (class, fixture) pairs changed — fixture_geometry.json untouched.")
+        return
+    fg_path.write_text(json.dumps(canon, indent=2) + "\n")
+    print(f"\nWrote {fg_path}: set unstable_distractors on {changed} (other rows byte-identical).")
+    for fclass in changed:
+        print(f"  {fclass:24} {fixtures[fclass].get('unstable_distractors')}")
+
+
 def measure_distractor_table(
     table_clearances: dict[str, float], *, seeds: int = _DISTRACTOR_FIXTURE_SEEDS
 ) -> dict[str, list[float]]:
@@ -1954,6 +2097,10 @@ if __name__ == "__main__":
 
     if "--distractor-fixtures-only" in sys.argv:
         _run_distractor_fixtures_only()
+        raise SystemExit(0)
+
+    if "--distractor-fixture-stability" in sys.argv:
+        _run_distractor_fixture_stability()
         raise SystemExit(0)
 
     if "--distractor-table-only" in sys.argv:

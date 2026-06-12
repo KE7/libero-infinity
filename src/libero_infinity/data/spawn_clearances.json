@@ -31,6 +31,11 @@
         "old": 0.08672,
         "new": 0.10031,
         "n": 10
+      },
+      "bowl_drainer": {
+        "old": 0.17579,
+        "new": 0.08599,
+        "note": "WS follow-up distractor-settle RCA: bowl_drainer (irregular flat-bottomed dish rack) was injected at the generic x90 'upright' fallback, which tips it onto a rim and slides ~6-9mm during the 50-step settle (pose_err 11.8mm). It is now injected at its stable IDENTITY (base-down) rest (asset_metadata._DISTRACTOR_TABLE_REST_QUAT). The identity rest is xy-INVARIANT: its converged (2000-step) body-origin clearance is 0.08599 above TABLE_Z at every measured table placement, with tip 0deg and dxy 0; injected exactly there the 50-step production settle is a no-op (dxy/dz/d3 = 0.00mm). The old 0.17579 was the x90 settle (and the intermediate 0.1701/0.135 trials were free-fall mid-points from injecting above the true rest). Reproduce: scripts/measure_spawn_clearances.py --distractor-table-only (with the identity rest active)."
       }
     }
   },
@@ -38,7 +43,7 @@
     "akita_black_bowl": 0.10094,
     "alphabet_soup": 0.11815,
     "bbq_sauce": 0.13375,
-    "bowl_drainer": 0.17579,
+    "bowl_drainer": 0.08599,
     "butter": 0.09861,
     "chefmate_8_frypan": 0.10039,
     "chocolate_pudding": 0.10023,
