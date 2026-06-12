@@ -877,13 +877,16 @@ class TestLiberoCorpusAudit:
             assert f'with support_parent_name "{s.fixture_name}"' in code
             # The correlated z for at least one fitting pool class equals
             # surface_spawn_z on the assigned fixture surface (NOT the bare table
-            # z). The correlated sample is a (class, z, planar_half, height)
-            # tuple, so match the (class, z, prefix.
+            # z). The renderer always emits the DISTRACTOR seating z
+            # (``distractor=True``) — identical to the plain z for a flat fixture,
+            # but the measured cradle clearance for an angled-slot fixture
+            # (wine_rack). The correlated sample is a (class, z, planar_half,
+            # height[, y]) tuple, so match the (class, z, prefix.
             cls0 = s.pool[0] if s.pool else plan.distractor_classes[0]
-            z = surface_spawn_z(TABLE_SURFACE_Z, cls0, s.surface_class)
+            z = surface_spawn_z(TABLE_SURFACE_Z, cls0, s.surface_class, distractor=True)
             assert f'("{cls0}", {z:.4f}, ' in code
             # And it differs from the table z for the same class (fixture seats higher).
-            z_table = surface_spawn_z(TABLE_SURFACE_Z, cls0, None)
+            z_table = surface_spawn_z(TABLE_SURFACE_Z, cls0, None, distractor=True)
             assert z > z_table
 
     def test_goal_feasibility_distractor_clears_goal_region(self):
