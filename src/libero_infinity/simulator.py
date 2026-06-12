@@ -56,6 +56,8 @@ from scenic.core.simulators import Simulation, Simulator
 from scenic.core.vectors import Vector
 from scipy.spatial.transform import Rotation as _Rotation
 
+from libero_infinity.asset_metadata import cradle_tilt_quat as _cradle_tilt_quat
+from libero_infinity.asset_metadata import is_cradle_seatable as _is_cradle_seatable
 from libero_infinity.asset_metadata import spawn_clearance as _spawn_clearance
 from libero_infinity.asset_metadata import surface_spawn_z as _shared_surface_spawn_z
 from libero_infinity.asset_registry import get_dimensions
@@ -1361,6 +1363,19 @@ class LIBEROSimulation(Simulation):
             # (scipy scalar-last).  MuJoCo free-joint qpos expects wxyz
             # (scalar-first), so convert: [qx,qy,qz,qw] → [qw,qx,qy,qz].
             quat = np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
+
+        # Angled-slot CRADLE seating (wine_rack): a flat distractor seated in the
+        # slot rests TILTED on the incline. Inject it at the measured cradle tilt
+        # (class-independent, MuJoCo wxyz) so it stays put at the slant-bottom
+        # rest (fixed-point: injected pose == settled pose) instead of toppling
+        # out from an upright start. Only for cradle-seatable distractors; the
+        # renderer placed the matching slant-bottom xy/z, so this completes the
+        # injected==settled pose. Rotation is not scored for distractors.
+        if libero_name.startswith("distractor_"):
+            _ssc = getattr(scenic_obj, "support_surface_class", "") or None
+            _tilt = _cradle_tilt_quat(_ssc) if _ssc else None
+            if _tilt is not None and _is_cradle_seatable(_ssc, asset_class):
+                quat = np.array(_tilt, dtype=float)
 
         pos = pos.copy()
 

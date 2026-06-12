@@ -17,6 +17,8 @@ from libero_infinity.asset_metadata import (
     _FIXTURE_DIMS_FALLBACK,
     PER_ARENA_TABLE_CLASSES,
     arena_surface_z,
+    cradle_rest,
+    cradle_x_half,
     distractor_fit_half,
     distractor_footprint,
     distractor_half_height,
@@ -24,6 +26,8 @@ from libero_infinity.asset_metadata import (
     fixture_footprint,
     fixture_height,
     fixture_offset,
+    is_cradle_fixture,
+    is_cradle_seatable,
     is_open_frame_fixture,
     surface_spawn_z,
 )
@@ -967,12 +971,16 @@ def _fitting_pool(classes: list[str], fixture_class: str | None) -> list[str]:
     """Subset of ``classes`` whose measured footprint fits on ``fixture_class``.
 
     For the workspace table (``fixture_class is None``) every class fits (the
-    table is large). For a fixture, only classes passing
-    :func:`_distractor_fits_fixture` are kept — the oversized-on-undersized
-    rejection that is the structural win.
+    table is large). For an angled-slot CRADLE fixture (wine_rack) only classes
+    with a measured stable cradle rest seat (flat-enough classes; tall/cube
+    classes tumble and fall back to the table). For any other fixture, only
+    classes passing :func:`_distractor_fits_fixture` are kept — the
+    oversized-on-undersized rejection that is the structural win.
     """
     if fixture_class is None:
         return list(classes)
+    if is_cradle_fixture(fixture_class):
+        return [c for c in classes if is_cradle_seatable(fixture_class, c)]
     return [c for c in classes if _distractor_fits_fixture(c, fixture_class)]
 
 
@@ -1051,6 +1059,12 @@ class _DistractorSlot:
     # Classes excluded from this fixture slot because they overhang it (they fall
     # back to the table). Recorded for the per-slot comment + report.
     excluded: tuple[str, ...] = ()
+    # Angled-slot CRADLE slot (wine_rack): the distractor is seated at the
+    # slant-bottom, so its y is the per-class cradle rest (``fixture_y + dy``)
+    # rather than a footprint Range. ``fixture_y`` is the fixture body y in the
+    # Scenic frame; ``cradle`` flags the per-class y/z rest emission.
+    cradle: bool = False
+    fixture_y: float = 0.0
 
 
 def _assignable_fixtures(
@@ -1076,14 +1090,21 @@ def _assignable_fixtures(
             continue
         if node.instance_name in goal_fixtures:
             continue
-        # An open-frame fixture (wine_rack, two-layer shelf) has no flat top: a
-        # flat distractor sinks between the rails / falls through, so the injected
-        # spawn z never matches the settled pose. Not a valid flat-distractor
-        # support — route the distractor to the table / a flat fixture instead.
-        if is_open_frame_fixture(node.object_class):
+        # An open-frame fixture (lattice top) has no flat top: a flat distractor
+        # sinks between the rails / falls through, so a distractor laid on its
+        # bounding top never matches the settled pose. EXCEPTION: an angled-slot
+        # CRADLE fixture (wine_rack) seats flat distractors in its slot at a
+        # measured slant-bottom rest — those stay assignable (eligibility handled
+        # by the cradle-seatable pool below). A non-cradle open frame is excluded
+        # and its distractors fall back to the table / a flat fixture.
+        if is_open_frame_fixture(node.object_class) and not is_cradle_fixture(node.object_class):
             continue
-        # Assignable iff at least one pool class physically fits the fixture top.
-        if not any(_distractor_fits_fixture(c, node.object_class) for c in fit_pool):
+        # Assignable iff at least one pool class can rest on this fixture: a stable
+        # cradle seat for a cradle fixture, else a non-overhanging footprint fit.
+        if is_cradle_fixture(node.object_class):
+            if not any(is_cradle_seatable(node.object_class, c) for c in fit_pool):
+                continue
+        elif not any(_distractor_fits_fixture(c, node.object_class) for c in fit_pool):
             continue
         out.append(node)
     out.sort(key=lambda f: f.instance_name)
@@ -1139,9 +1160,17 @@ def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list
             # non-empty — but guard against an empty pool to keep z-range total.
             if not slot_pool:
                 slot_pool = list(pool)
-            hx, hy = _fixture_placement_half(support.object_class, slot_pool)
-            x_lo, x_hi = float(support.init_x) - hx, float(support.init_x) + hx
-            y_lo, y_hi = float(support.init_y) - hy, float(support.init_y) + hy
+            if is_cradle_fixture(surface_class):
+                # Angled-slot CRADLE (wine_rack): seat along the cradle's free (x)
+                # axis at the slant-bottom; y is the per-class cradle rest (emitted
+                # from the correlated tuple as ``fixture_y + dy``).
+                xh = cradle_x_half(surface_class)
+                x_lo, x_hi = float(support.init_x) - xh, float(support.init_x) + xh
+                y_lo = y_hi = float(support.init_y)
+            else:
+                hx, hy = _fixture_placement_half(support.object_class, slot_pool)
+                x_lo, x_hi = float(support.init_x) - hx, float(support.init_x) + hx
+                y_lo, y_hi = float(support.init_y) - hy, float(support.init_y) + hy
         zs = [surface_spawn_z(arena_z, c, surface_class, distractor=True) for c in slot_pool] or [
             surface_spawn_z(arena_z, "distractor", surface_class, distractor=True)
         ]
@@ -1158,6 +1187,8 @@ def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list
                 z_hi=max(zs),
                 pool=tuple(slot_pool),
                 excluded=excluded,
+                cradle=(support is not None and is_cradle_fixture(surface_class)),
+                fixture_y=float(support.init_y) if support is not None else 0.0,
             )
         )
     return slots
@@ -1186,16 +1217,27 @@ def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
         # filtered out for a fixture; full pool on the table).
         slot_classes = list(slot.pool) if slot.pool else classes
         if slot_classes:
-            # Correlated (class, resolved_spawn_z, planar_half, height) tuples: the
-            # chosen class and its MEASURED seating height + footprint on THIS
+            # Correlated (class, resolved_spawn_z, planar_half, height[, y]) tuples:
+            # the chosen class and its MEASURED seating height + footprint on THIS
             # support are drawn together from one sample (Scenic forbids branching
             # on a random value), so every clearance/declaration sees the real
-            # per-class footprint instead of a uniform 8 cm proxy.
-            pairs = ", ".join(
-                f'("{c}", {surface_spawn_z(arena_z, c, slot.surface_class, distractor=True):.4f}, '
-                f"{distractor_planar_half(c):.4f}, {distractor_footprint(c)[2]:.4f})"
-                for c in slot_classes
-            )
+            # per-class footprint instead of a uniform 8 cm proxy. For an
+            # angled-slot CRADLE slot a 5th element carries the per-class
+            # slant-bottom y (``fixture_y + dy``) so the seat is at the measured
+            # cradle rest, not the footprint centre.
+            sc = slot.surface_class
+
+            def _choice_tuple(c: str, sc: str | None = sc, slot: _DistractorSlot = slot) -> str:
+                z = surface_spawn_z(arena_z, c, sc, distractor=True)
+                r = distractor_planar_half(c)
+                h = distractor_footprint(c)[2]
+                base = f'("{c}", {z:.4f}, {r:.4f}, {h:.4f}'
+                if slot.cradle:
+                    y = slot.fixture_y + cradle_rest(sc, c)[0]
+                    return f"{base}, {y:.4f})"
+                return f"{base})"
+
+            pairs = ", ".join(_choice_tuple(c) for c in slot_classes)
             lines.append(f"_distractor_{i}_choice = Uniform({pairs})")
             # Expose the class STRING in params (the simulator reads
             # ``params['distractor_i_class']`` to patch the BDDL); z / planar-half /
@@ -1207,16 +1249,24 @@ def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             w_expr = f"(2 * _distractor_{i}_r)"
             l_expr = f"(2 * _distractor_{i}_r)"
             h_expr = f"_distractor_{i}_h"
+            y_expr = f"_distractor_{i}_choice[4]" if slot.cradle else None
         else:
             _dz = surface_spawn_z(arena_z, "distractor", slot.surface_class, distractor=True)
             z_expr = f"{_dz:.4f}"
             w_expr = f"{2 * _DEFAULT_DISTRACTOR_R:.4f}"
             l_expr = f"{2 * _DEFAULT_DISTRACTOR_R:.4f}"
             h_expr = f"{_DEFAULT_DISTRACTOR_H:.4f}"
-        pos_spec = (
-            f"at Vector(Range({slot.x_lo:.4f}, {slot.x_hi:.4f}), "
-            f"Range({slot.y_lo:.4f}, {slot.y_hi:.4f}), {z_expr})"
-        )
+            y_expr = None
+        # CRADLE slot: y is the per-class slant-bottom rest (a single correlated
+        # value), x ranges along the cradle's free axis. Otherwise: a footprint
+        # Range on both x and y.
+        if y_expr is not None:
+            pos_spec = f"at Vector(Range({slot.x_lo:.4f}, {slot.x_hi:.4f}), {y_expr}, {z_expr})"
+        else:
+            pos_spec = (
+                f"at Vector(Range({slot.x_lo:.4f}, {slot.x_hi:.4f}), "
+                f"Range({slot.y_lo:.4f}, {slot.y_hi:.4f}), {z_expr})"
+            )
         specifiers = [
             pos_spec,
             f'with libero_name "distractor_{i}"',
