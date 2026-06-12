@@ -322,7 +322,11 @@ def test_cradle_metadata_resolves_wine_rack_seating():
 
     assert am.is_cradle_fixture("wine_rack") is True
     assert am.is_cradle_fixture("wooden_cabinet") is False
-    assert am.is_cradle_fixture("wooden_two_layer_shelf") is False  # open frame, no cradle
+    # WS-2: the two-layer shelf is open-frame (its AABB top is not a naive flat
+    # rest — a flat distractor sinks ~80 mm onto the top plate before resting) but
+    # carries a measured flat-seat cradle block, so flat-enough classes SEAT on the
+    # shelf top instead of falling back to the table.
+    assert am.is_cradle_fixture("wooden_two_layer_shelf") is True
     # A flat class seats (measured rest); a tall cube does not.
     assert am.is_cradle_seatable("wine_rack", "macaroni_and_cheese") is True
     assert am.is_cradle_seatable("wine_rack", "alphabet_soup") is False
@@ -336,9 +340,10 @@ def test_cradle_metadata_resolves_wine_rack_seating():
 
 
 def test_assignable_fixtures_seats_cradle_excludes_plain_open_frame():
-    """``_assignable_fixtures`` keeps an angled-slot CRADLE fixture (wine_rack)
-    assignable so flat distractors seat in its slot, but excludes a plain open-frame
-    fixture with no cradle (its distractors fall back to the table)."""
+    """``_assignable_fixtures`` keeps a CRADLE fixture (wine_rack angled slot, or
+    the WS-2 two-layer-shelf flat-seat) assignable so flat distractors seat on it,
+    but excludes a plain open-frame fixture with no cradle (its distractors fall
+    back to the table)."""
     from libero_infinity import asset_metadata
     from libero_infinity.renderer import scenic_renderer
 
@@ -355,6 +360,11 @@ def test_assignable_fixtures_seats_cradle_excludes_plain_open_frame():
             "wooden_two_layer_shelf_1", "wooden_two_layer_shelf", -0.2, 0.1
         ),
         "wooden_cabinet_1": _FakeFixture("wooden_cabinet_1", "wooden_cabinet", -0.1, 0.1),
+        # Synthetic plain open-frame fixture (no cradle block): a flat distractor
+        # falls through its lattice top, so it must be excluded. Real corpus
+        # open-frame fixtures now all carry cradle blocks (wine_rack, shelf), so
+        # the exclusion path is exercised with a mocked class.
+        "lattice_frame_1": _FakeFixture("lattice_frame_1", "lattice_frame", 0.2, 0.1),
     }
 
     class _FakeGraph:
@@ -365,21 +375,37 @@ def test_assignable_fixtures_seats_cradle_excludes_plain_open_frame():
 
     import unittest.mock as _mock
 
+    _real_open = asset_metadata.is_open_frame_fixture
+    _real_cradle = asset_metadata.is_cradle_fixture
+
+    def _open(cls):
+        return True if cls == "lattice_frame" else _real_open(cls)
+
+    def _cradle(cls):
+        return False if cls == "lattice_frame" else _real_cradle(cls)
+
     # No goal fixtures; treat fakes as FixtureNode instances for the isinstance gate.
     with (
         _mock.patch.object(scenic_renderer, "resolve_goal_regions", lambda g: []),
         _mock.patch.object(scenic_renderer, "FixtureNode", _FakeFixture),
+        _mock.patch.object(scenic_renderer, "is_open_frame_fixture", _open),
+        _mock.patch.object(scenic_renderer, "is_cradle_fixture", _cradle),
     ):
         out = scenic_renderer._assignable_fixtures(
             plan=None, graph=graph, pool=["cream_cheese", "popcorn"]
         )
     names = {f.instance_name for f in out}
     assert "wine_rack_1" in names, "cradle wine_rack must remain assignable (flat distractors seat)"
-    assert "wooden_two_layer_shelf_1" not in names, "plain open-frame shelf must be excluded"
+    assert (
+        "wooden_two_layer_shelf_1" in names
+    ), "WS-2 flat-seat shelf must be assignable (flat distractors seat on the shelf top)"
     assert "wooden_cabinet_1" in names, "flat-top cabinet must remain assignable"
+    assert "lattice_frame_1" not in names, "plain open-frame fixture must be excluded"
     # premise guards
     assert asset_metadata.is_open_frame_fixture("wine_rack")
     assert asset_metadata.is_cradle_fixture("wine_rack")
+    assert asset_metadata.is_open_frame_fixture("wooden_two_layer_shelf")
+    assert asset_metadata.is_cradle_fixture("wooden_two_layer_shelf")
 
 
 def test_measured_fixture_geometry_rows_are_well_formed():
