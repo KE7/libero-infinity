@@ -297,10 +297,12 @@ def test_open_frame_fixtures_detected_and_flat_tops_are_not():
 
     geom = asset_metadata.FIXTURE_GEOMETRY
     for fclass, g in geom.items():
-        expected = (
+        divergent = (
             g.get("settle_top_z") is not None
-            and (float(g["top_z"]) - float(g["settle_top_z"])) > asset_metadata._OPEN_FRAME_SETTLE_DROP
+            and (float(g["top_z"]) - float(g["settle_top_z"]))
+            > asset_metadata._OPEN_FRAME_SETTLE_DROP
         )
+        expected = bool(divergent)
         assert asset_metadata.is_open_frame_fixture(fclass) is expected, fclass
     # The wine_rack regression fixture is open-frame; a flat cabinet top is not.
     assert asset_metadata.is_open_frame_fixture("wine_rack") is True
@@ -339,8 +341,9 @@ def test_assignable_fixtures_excludes_open_frame_fixtures():
     import unittest.mock as _mock
 
     # No goal fixtures; treat fakes as FixtureNode instances for the isinstance gate.
-    with _mock.patch.object(scenic_renderer, "resolve_goal_regions", lambda g: []), _mock.patch.object(
-        scenic_renderer, "FixtureNode", _FakeFixture
+    with (
+        _mock.patch.object(scenic_renderer, "resolve_goal_regions", lambda g: []),
+        _mock.patch.object(scenic_renderer, "FixtureNode", _FakeFixture),
     ):
         out = scenic_renderer._assignable_fixtures(
             plan=None, graph=graph, pool=["cream_cheese", "popcorn"]
