@@ -313,10 +313,32 @@ def test_open_frame_fixtures_detected_and_flat_tops_are_not():
     assert asset_metadata.is_open_frame_fixture("table") is False
 
 
-def test_assignable_fixtures_excludes_open_frame_fixtures():
-    """``_assignable_fixtures`` never offers an open-frame fixture as a distractor
-    support, so a flat distractor is routed to the table / a flat fixture where it
-    settles within pose-tolerance (instead of falling through the lattice)."""
+def test_cradle_metadata_resolves_wine_rack_seating():
+    """The wine_rack is an angled-slot CRADLE fixture: flat classes have a measured
+    per-class stable rest (so they SEAT in the slot), tall/cube classes do not
+    (they fall back to the table), and ``surface_spawn_z`` returns the measured
+    cradle body-centre clearance for a seatable distractor."""
+    from libero_infinity import asset_metadata as am
+
+    assert am.is_cradle_fixture("wine_rack") is True
+    assert am.is_cradle_fixture("wooden_cabinet") is False
+    assert am.is_cradle_fixture("wooden_two_layer_shelf") is False  # open frame, no cradle
+    # A flat class seats (measured rest); a tall cube does not.
+    assert am.is_cradle_seatable("wine_rack", "macaroni_and_cheese") is True
+    assert am.is_cradle_seatable("wine_rack", "alphabet_soup") is False
+    dy, dz = am.cradle_rest("wine_rack", "macaroni_and_cheese")
+    assert 0.0 < dy < 0.2 and 0.15 < dz < 0.30, (dy, dz)
+    tilt = am.cradle_tilt_quat("wine_rack")
+    assert tilt is not None and len(tilt) == 4
+    # surface_spawn_z folds in the measured cradle clearance for a seatable class.
+    z = am.surface_spawn_z(am.TABLE_SURFACE_Z, "macaroni_and_cheese", "wine_rack", distractor=True)
+    assert z == pytest.approx(am.TABLE_SURFACE_Z + dz, abs=1e-6)
+
+
+def test_assignable_fixtures_seats_cradle_excludes_plain_open_frame():
+    """``_assignable_fixtures`` keeps an angled-slot CRADLE fixture (wine_rack)
+    assignable so flat distractors seat in its slot, but excludes a plain open-frame
+    fixture with no cradle (its distractors fall back to the table)."""
     from libero_infinity import asset_metadata
     from libero_infinity.renderer import scenic_renderer
 
@@ -329,6 +351,9 @@ def test_assignable_fixtures_excludes_open_frame_fixtures():
 
     nodes = {
         "wine_rack_1": _FakeFixture("wine_rack_1", "wine_rack", 0.1, 0.1),
+        "wooden_two_layer_shelf_1": _FakeFixture(
+            "wooden_two_layer_shelf_1", "wooden_two_layer_shelf", -0.2, 0.1
+        ),
         "wooden_cabinet_1": _FakeFixture("wooden_cabinet_1", "wooden_cabinet", -0.1, 0.1),
     }
 
@@ -349,9 +374,12 @@ def test_assignable_fixtures_excludes_open_frame_fixtures():
             plan=None, graph=graph, pool=["cream_cheese", "popcorn"]
         )
     names = {f.instance_name for f in out}
-    assert "wine_rack_1" not in names, "open-frame wine_rack must be excluded"
+    assert "wine_rack_1" in names, "cradle wine_rack must remain assignable (flat distractors seat)"
+    assert "wooden_two_layer_shelf_1" not in names, "plain open-frame shelf must be excluded"
     assert "wooden_cabinet_1" in names, "flat-top cabinet must remain assignable"
-    assert asset_metadata.is_open_frame_fixture("wine_rack")  # guards the premise
+    # premise guards
+    assert asset_metadata.is_open_frame_fixture("wine_rack")
+    assert asset_metadata.is_cradle_fixture("wine_rack")
 
 
 def test_measured_fixture_geometry_rows_are_well_formed():
