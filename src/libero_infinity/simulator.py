@@ -57,6 +57,7 @@ from scenic.core.vectors import Vector
 from scipy.spatial.transform import Rotation as _Rotation
 
 from libero_infinity.asset_metadata import cradle_tilt_quat as _cradle_tilt_quat
+from libero_infinity.asset_metadata import distractor_table_rest_quat as _distractor_table_rest_quat
 from libero_infinity.asset_metadata import is_cradle_seatable as _is_cradle_seatable
 from libero_infinity.asset_metadata import spawn_clearance as _spawn_clearance
 from libero_infinity.asset_metadata import surface_spawn_z as _shared_surface_spawn_z
@@ -1376,6 +1377,16 @@ class LIBEROSimulation(Simulation):
             _tilt = _cradle_tilt_quat(_ssc) if _ssc else None
             if _tilt is not None and _is_cradle_seatable(_ssc, asset_class):
                 quat = np.array(_tilt, dtype=float)
+            else:
+                # TABLE distractor (no cradle): an irregular class whose stable
+                # flat rest is NOT the generic x90 upright is injected at its
+                # MEASURED table rest orientation (e.g. bowl_drainer → identity,
+                # base-down) so the 50-step settle leaves it in place instead of
+                # tipping onto a rim and sliding (WS follow-up distractor-settle
+                # RCA). A class with no measured rest keeps the x90 default.
+                _rest = _distractor_table_rest_quat(asset_class)
+                if _rest is not None:
+                    quat = np.array(_rest, dtype=float)
 
         pos = pos.copy()
 

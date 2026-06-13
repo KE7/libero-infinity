@@ -653,6 +653,33 @@ def is_fixture_measured(fixture_class: str | None) -> bool:
     return (fixture_class or "") in FIXTURE_GEOMETRY
 
 
+def is_distractor_fixture_unstable(asset_class: str | None, fixture_class: str | None) -> bool:
+    """True iff distractor ``asset_class`` cannot SETTLE STABLY on ``fixture_class``'s
+    top, so it must NOT be seated there (route it to the table / a flat fixture).
+
+    Footprint fit (:func:`_distractor_fits_fixture`) only checks that a class's
+    base fits within the fixture top — necessary but NOT sufficient. Some fixture
+    tops are not a clean flat platform (the ``flat_stove`` top is a raised burner
+    GRATE), so a TALL class that fits the footprint still tips/slides on the grate
+    edges and settles >5 mm from its injected pose, with a large HORIZONTAL slide
+    no spawn-z or rest-orientation can remove (WS follow-up RCA: ``alphabet_soup``
+    on ``flat_stove`` — 7/10 seeds fail, ~6.9 mm median xy slide — while the SAME
+    class settles within 0.5 mm on the flat table and 0.3 mm on a flat cabinet
+    top). Such a (class, fixture) seating is excluded, exactly as the wine_rack
+    cradle lists only the classes that seat WITHOUT tumbling (``rests``).
+
+    The exclusion is MEASURED per (class, fixture): a fixture's
+    ``unstable_distractors`` list in ``fixture_geometry.json`` (verified by
+    ``scripts/measure_spawn_clearances.py --distractor-fixture-stability``).
+    Absent ⇒ no exclusion, so every fixture with a clean flat top is unchanged.
+    """
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is None:
+        return False
+    unstable = geom.get("unstable_distractors")
+    return bool(unstable) and (asset_class or "") in set(unstable)
+
+
 # ---------------------------------------------------------------------------
 # Distractor footprint geometry — measured per-class settled AABB extents
 # ---------------------------------------------------------------------------
@@ -759,3 +786,47 @@ def distractor_half_height(asset_class: str | None) -> float:
 def is_distractor_measured(asset_class: str | None) -> bool:
     """True iff ``asset_class`` has measured distractor geometry."""
     return (asset_class or "") in DISTRACTOR_GEOMETRY
+
+
+# ---------------------------------------------------------------------------
+# Per-class distractor table REST ORIENTATION
+# ---------------------------------------------------------------------------
+#
+# A table distractor with no Scenic-authored orientation is injected at the
+# generic upright fallback ``DEFAULT_ORIENTATIONS["_default"]`` — a 90°-about-x
+# rotation that stands the typical GoogleScannedObject box upright. That default
+# is correct for the box-like pool classes (alphabet_soup settles 0.5 mm on the
+# table at x90), but WRONG for an irregular class whose stable flat rest is NOT
+# the x90 upright: injected on edge, it tips a few degrees AND slides several mm
+# during the 50-step settle, so the injected pose never equals the settled pose
+# (the pose_tolerance miss). The fix mirrors the cradle ``tilt_quat`` and the
+# pre-existing ``DEFAULT_ORIENTATIONS["simple_rack"] = identity`` precedent:
+# inject such a class at its MEASURED stable table rest orientation so injected
+# pose == settled pose.
+#
+# Measured by sweeping the candidate rest orientations of the class at its real
+# table placement and 50-step settling each (scripts/measure_spawn_clearances.py
+# does not author this; it is a per-asset geometric constant, like a cradle tilt).
+# For ``bowl_drainer`` (a flat-bottomed dish rack, footprint 0.21×0.23, the
+# largest pool class) the identity rest (base flat on the table) settles with
+# dxy ≈ 0 mm and tip ≈ 0° across table placements, whereas the x90 upright tips
+# it onto a rim and slides ~6–9 mm (pose_err 11.8 mm — WS follow-up RCA). The
+# value is a MuJoCo wxyz quaternion; a class absent here keeps the generic x90
+# default unchanged, so every other distractor is byte-identical.
+_DISTRACTOR_TABLE_REST_QUAT: dict[str, tuple[float, float, float, float]] = {
+    "bowl_drainer": (1.0, 0.0, 0.0, 0.0),  # identity — flat base-down dish rack
+}
+
+
+def distractor_table_rest_quat(
+    asset_class: str | None,
+) -> tuple[float, float, float, float] | None:
+    """Measured stable TABLE rest orientation (MuJoCo wxyz) for a distractor class.
+
+    Returns ``None`` for a class that settles stably at the generic upright
+    default (every box-like pool class), so the simulator leaves its injected
+    orientation unchanged. Returns the measured wxyz quaternion for an irregular
+    class whose flat rest differs from the x90 upright (``bowl_drainer``), so the
+    simulator injects it there and the 50-step settle leaves it in place."""
+    q = _DISTRACTOR_TABLE_REST_QUAT.get(asset_class or "")
+    return tuple(float(x) for x in q) if q is not None else None

@@ -28,6 +28,7 @@ from libero_infinity.asset_metadata import (
     fixture_offset,
     is_cradle_fixture,
     is_cradle_seatable,
+    is_distractor_fixture_unstable,
     is_open_frame_fixture,
     surface_spawn_z,
 )
@@ -959,7 +960,16 @@ def _distractor_fits_fixture(asset_class: str, fixture_class: str | None) -> boo
     top (minus an edge margin) must not be seated there — otherwise it overhangs,
     tilts, and settles at an xy-dependent height no single clearance-z can match.
     Such a class falls back to the (large) workspace table instead.
+
+    Footprint fit is necessary but NOT sufficient: a class can fit a fixture top
+    yet still tip/slide on it if the top is not a clean flat platform (the
+    ``flat_stove`` top is a raised burner GRATE). Such measured-unstable (class,
+    fixture) pairs are excluded too (``is_distractor_fixture_unstable`` — WS
+    follow-up distractor-settle RCA), mirroring the wine_rack cradle which lists
+    only classes that seat without tumbling.
     """
+    if is_distractor_fixture_unstable(asset_class, fixture_class):
+        return False
     fw, fl = fixture_footprint(fixture_class)
     r = distractor_fit_half(asset_class)
     hx = fw / 2.0 * _SUPPORT_CENTRAL_FRAC - r - _SUPPORT_EDGE_MARGIN
