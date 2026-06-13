@@ -396,9 +396,8 @@ def test_assignable_fixtures_seats_cradle_excludes_plain_open_frame():
         )
     names = {f.instance_name for f in out}
     assert "wine_rack_1" in names, "cradle wine_rack must remain assignable (flat distractors seat)"
-    assert (
-        "wooden_two_layer_shelf_1" in names
-    ), "WS-2 flat-seat shelf must be assignable (flat distractors seat on the shelf top)"
+    # WS-2 flat-seat shelf: flat distractors seat on the shelf top, so it must be assignable.
+    assert "wooden_two_layer_shelf_1" in names, "WS-2 flat-seat shelf must be assignable"
     assert "wooden_cabinet_1" in names, "flat-top cabinet must remain assignable"
     assert "lattice_frame_1" not in names, "plain open-frame fixture must be excluded"
     # premise guards
