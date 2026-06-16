@@ -29,9 +29,13 @@ import os
 
 from libero_infinity.validation import sweep as sweep_mod
 from libero_infinity.validation.sweep import (
+    DEFAULT_MAX_TASKS_PER_CHILD,
+    ENV_MAX_TASKS_PER_CHILD,
     GATES,
     _run_pool_pass,
     chunk_conditions,
+    main,
+    resolve_max_tasks_per_child,
     run_sweep,
 )
 
@@ -179,3 +183,70 @@ def test_run_sweep_one_fresh_pool_per_chunk(tmp_path, monkeypatch):
         max_tasks_per_child=4,  # chunk_size 8 -> 3 chunks -> 3 fresh pools
     )
     assert len(pools) == 3
+
+
+# ---------------------------------------------------------------------------
+# resolve_max_tasks_per_child — the pass-conditional default (process-per-sample
+# for the ENV pass to retire the EGL/contact-arena ncon=5000 overflow; higher
+# speed default for the pure-Python --scenic-only pass). Tier-1: no sim, no GL.
+# ---------------------------------------------------------------------------
+
+
+def test_env_pass_default_is_process_per_sample():
+    """ENV pass (scenic_only=False) with the flag OMITTED -> 1 (one fresh
+    EGL/MuJoCo process per simulation sample)."""
+    assert ENV_MAX_TASKS_PER_CHILD == 1
+    assert resolve_max_tasks_per_child(None, scenic_only=False) == 1
+
+
+def test_scenic_only_default_is_the_speed_default():
+    """--scenic-only pass with the flag OMITTED keeps the higher speed default
+    (no env / EGL state to accumulate across G0-G3)."""
+    assert resolve_max_tasks_per_child(None, scenic_only=True) == DEFAULT_MAX_TASKS_PER_CHILD
+
+
+def test_explicit_value_overrides_both_passes():
+    """An explicit --max-tasks-per-child always wins, regardless of pass type."""
+    assert resolve_max_tasks_per_child(7, scenic_only=False) == 7
+    assert resolve_max_tasks_per_child(7, scenic_only=True) == 7
+    # Even an explicit value that equals the env default must be honored as a
+    # user choice rather than re-derived from the pass type.
+    assert resolve_max_tasks_per_child(1, scenic_only=True) == 1
+
+
+def _capture_resolved_mtpc(monkeypatch, argv):
+    """Run main() with run_sweep stubbed; return the max_tasks_per_child it was
+    handed. Exercises the full argparse omitted-vs-explicit wiring with no sim."""
+    captured: dict = {}
+
+    def _fake_run_sweep(*_a, **kw):
+        captured["max_tasks_per_child"] = kw["max_tasks_per_child"]
+        return {"total": 0, "counts": {}, "out": str(kw["out_path"]), "pool_restarts": 0}
+
+    monkeypatch.setattr(sweep_mod, "run_sweep", _fake_run_sweep)
+    main(argv)
+    return captured["max_tasks_per_child"]
+
+
+def test_main_wires_conditional_default_when_flag_omitted(monkeypatch, tmp_path):
+    """End-to-end argparse wiring: omitting the flag yields 1 for the ENV pass
+    and DEFAULT_MAX_TASKS_PER_CHILD for --scenic-only."""
+    base = ["--tasks", "t/a.bddl", "--subsets", "1", "--seeds", "1", "--workers", "1"]
+    env_val = _capture_resolved_mtpc(monkeypatch, base + ["--out", str(tmp_path / "env.jsonl")])
+    assert env_val == 1
+
+    scenic_val = _capture_resolved_mtpc(
+        monkeypatch, base + ["--scenic-only", "--out", str(tmp_path / "scenic.jsonl")]
+    )
+    assert scenic_val == DEFAULT_MAX_TASKS_PER_CHILD
+
+
+def test_main_honors_explicit_flag_over_conditional_default(monkeypatch, tmp_path):
+    """An explicit --max-tasks-per-child overrides the conditional default even
+    on the ENV pass."""
+    base = ["--tasks", "t/a.bddl", "--subsets", "1", "--seeds", "1", "--workers", "1"]
+    val = _capture_resolved_mtpc(
+        monkeypatch,
+        base + ["--max-tasks-per-child", "32", "--out", str(tmp_path / "x.jsonl")],
+    )
+    assert val == 32

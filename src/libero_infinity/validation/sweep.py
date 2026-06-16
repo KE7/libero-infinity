@@ -92,6 +92,7 @@ def resolve_max_tasks_per_child(explicit: int | None, *, scenic_only: bool) -> i
         return explicit
     return DEFAULT_MAX_TASKS_PER_CHILD if scenic_only else ENV_MAX_TASKS_PER_CHILD
 
+
 # Canonical 9 perturbation axes (matches the validation plan, not the planner
 # module's extra "sensor_noise" axis which is out of scope for the publication
 # claim).
