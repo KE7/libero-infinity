@@ -20,6 +20,7 @@ from libero_infinity.asset_metadata import (
     cradle_rest,
     cradle_x_half,
     distractor_fit_half,
+    distractor_fixture_seat,
     distractor_footprint,
     distractor_half_height,
     distractor_planar_half,
@@ -28,6 +29,7 @@ from libero_infinity.asset_metadata import (
     fixture_offset,
     is_cradle_fixture,
     is_cradle_seatable,
+    is_distractor_fixture_seated,
     is_distractor_fixture_unstable,
     is_open_frame_fixture,
     surface_spawn_z,
@@ -1075,6 +1077,21 @@ class _DistractorSlot:
     # Scenic frame; ``cradle`` flags the per-class y/z rest emission.
     cradle: bool = False
     fixture_y: float = 0.0
+    # Per-class SEAT slot (flat-top fixture with a measured per-(class, fixture)
+    # distractor seat, e.g. alphabet_soup on flat_stove's burner plate). Unlike a
+    # cradle (which seats EVERY pool class at the slant-bottom), a seated slot
+    # carries a MIXED pool: classes WITH a measured seat are placed at the seat
+    # centre (``fixture_(x|y) + seat.d(x|y)`` ± seat half-range) at the seat rest
+    # z, while classes WITHOUT a seat keep their normal footprint placement
+    # (centre ``fixture_(x|y)`` ± ``place_h(x|y)``) — distribution-IDENTICAL to a
+    # non-seated slot. The per-class centre/half are emitted as correlated choice
+    # elements so each sampled class lands on its own region (the seat fixes both
+    # the off-burner xy mis-placement and the knob-contaminated rest z that made
+    # the tall alphabet_soup can tip on the stove — WS alphabet_soup-stove RCA).
+    seated: bool = False
+    fixture_x: float = 0.0
+    place_hx: float = 0.0
+    place_hy: float = 0.0
 
 
 def _assignable_fixtures(
@@ -1143,6 +1160,7 @@ def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list
     for i in range(n):
         support = supports[i % len(supports)]
         excluded: tuple[str, ...] = ()
+        place_hx = place_hy = 0.0
         if support is None:
             surface_class: str | None = None
             fixture_name: str | None = None
@@ -1181,6 +1199,16 @@ def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list
                 hx, hy = _fixture_placement_half(support.object_class, slot_pool)
                 x_lo, x_hi = float(support.init_x) - hx, float(support.init_x) + hx
                 y_lo, y_hi = float(support.init_y) - hy, float(support.init_y) + hy
+                place_hx, place_hy = hx, hy
+        # A flat-top fixture slot is SEATED when ≥1 of its pool classes has a
+        # measured per-(class, fixture) seat — those classes are emitted at the
+        # seat region (per-class correlated centre/half), the rest keep the
+        # default footprint placement above. Cradle slots never seat (handled).
+        seated = (
+            support is not None
+            and not is_cradle_fixture(surface_class)
+            and any(is_distractor_fixture_seated(surface_class, c) for c in slot_pool)
+        )
         zs = [surface_spawn_z(arena_z, c, surface_class, distractor=True) for c in slot_pool] or [
             surface_spawn_z(arena_z, "distractor", surface_class, distractor=True)
         ]
@@ -1199,6 +1227,10 @@ def _distractor_slots(plan: PerturbationPlan, graph: SemanticSceneGraph) -> list
                 excluded=excluded,
                 cradle=(support is not None and is_cradle_fixture(surface_class)),
                 fixture_y=float(support.init_y) if support is not None else 0.0,
+                seated=seated,
+                fixture_x=float(support.init_x) if support is not None else 0.0,
+                place_hx=place_hx,
+                place_hy=place_hy,
             )
         )
     return slots
@@ -1245,6 +1277,21 @@ def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
                 if slot.cradle:
                     y = slot.fixture_y + cradle_rest(sc, c)[0]
                     return f"{base}, {y:.4f})"
+                if slot.seated:
+                    # Per-class seat: classes WITH a measured seat land at the seat
+                    # centre (``fixture_(x|y) + d(x|y)``) ± the seat half-range;
+                    # the rest keep the footprint centre (``fixture_(x|y)``) ± the
+                    # slot's placement half — so non-seated classes are
+                    # distribution-identical to a non-seated slot.
+                    seat = distractor_fixture_seat(sc, c)
+                    if seat is not None:
+                        xc = slot.fixture_x + seat["dx"]
+                        yc = slot.fixture_y + seat["dy"]
+                        xh, yh = seat["x_half"], seat["y_half"]
+                    else:
+                        xc, yc = slot.fixture_x, slot.fixture_y
+                        xh, yh = slot.place_hx, slot.place_hy
+                    return f"{base}, {xc:.4f}, {yc:.4f}, {xh:.4f}, {yh:.4f})"
                 return f"{base})"
 
             pairs = ", ".join(_choice_tuple(c) for c in slot_classes)
@@ -1267,10 +1314,25 @@ def _render_distractors(plan: PerturbationPlan, graph: SemanticSceneGraph) -> st
             l_expr = f"{2 * _DEFAULT_DISTRACTOR_R:.4f}"
             h_expr = f"{_DEFAULT_DISTRACTOR_H:.4f}"
             y_expr = None
+        # SEATED slot: each class lands on its OWN per-class region — the
+        # correlated tuple carries (xc, yc, xh, yh) at indices [4..7], so the
+        # position is ``centre ± half`` per class. ``c + h*Range(-1,1)`` is
+        # exactly ``Uniform(c-h, c+h)`` (a non-seated class with xc=fixture_x,
+        # xh=place_hx reproduces the default ``Range(x_lo,x_hi)`` distribution),
+        # so only the SEATED class (alphabet_soup on flat_stove) is relocated to
+        # its burner-plate seat; every other class is distribution-identical.
         # CRADLE slot: y is the per-class slant-bottom rest (a single correlated
         # value), x ranges along the cradle's free axis. Otherwise: a footprint
         # Range on both x and y.
-        if y_expr is not None:
+        if slot.seated:
+            cx = f"_distractor_{i}_choice[4]"
+            cy = f"_distractor_{i}_choice[5]"
+            chx = f"_distractor_{i}_choice[6]"
+            chy = f"_distractor_{i}_choice[7]"
+            pos_spec = (
+                f"at Vector({cx} + {chx} * Range(-1, 1), {cy} + {chy} * Range(-1, 1), {z_expr})"
+            )
+        elif y_expr is not None:
             pos_spec = f"at Vector(Range({slot.x_lo:.4f}, {slot.x_hi:.4f}), {y_expr}, {z_expr})"
         else:
             pos_spec = (

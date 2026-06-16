@@ -292,6 +292,12 @@ def spawn_clearance(
         # which does not hold in the inclined cradle. Resolved identically on the
         # renderer and the simulator so injected z == settled z.
         if distractor:
+            # Per-(class, fixture) SEAT: the MEASURED flat-plate rest dz —
+            # supersedes the (body-centred, knob-contaminated) variant clearance,
+            # so injected z == settled z on the relocated seat (flat_stove burner).
+            seat = distractor_fixture_seat(surface_class, asset_class)
+            if seat is not None:
+                return max(seat["dz"], _MIN_CLEARANCE)
             cr = cradle_rest(surface_class, asset_class)
             if cr is not None:
                 return max(cr[1], _MIN_CLEARANCE)
@@ -646,6 +652,77 @@ def cradle_x_half(fixture_class: str | None) -> float:
 def is_cradle_seatable(fixture_class: str | None, asset_class: str | None) -> bool:
     """True iff ``asset_class`` has a measured stable cradle rest on ``fixture_class``."""
     return cradle_rest(fixture_class, asset_class) is not None
+
+
+# ---------------------------------------------------------------------------
+# Per-(class, fixture) distractor SEAT — flat-top fixture, off-centre support
+# ---------------------------------------------------------------------------
+#
+# Some flat-top fixtures present their real support surface OFFSET from the body
+# origin, with non-support clutter (a knob, a lip) intruding into the
+# body-centred placement region. The ``flat_stove`` is the canonical case: its
+# real burner plate is a clean flat collision surface (the ``burnerplate`` visual
+# "grate" mesh is ``contype=0/conaffinity=0`` — NON-colliding), but it sits
+# ``+0.15 m`` in x from the fixture body, while the stove KNOB occupies the
+# body-centred region. A distractor placed at the body centre therefore straddles
+# the knob and the burner-left edge: a TALL class (the alphabet_soup CAN,
+# r≈0.029/h≈0.075) tips off the knob and tumbles OFF the stove (long-settle drift
+# > 800 mm), while shorter classes survive the 50-step gate by luck. PR #32
+# excluded alphabet_soup via ``unstable_distractors``; the SEAT instead relocates
+# it onto the burner plate, where it settles to a true fixed point (injected-vs-
+# settled 0.25 mm at the 50-step AND a >1500-step settle, reproducibly across
+# tasks/seeds — WS alphabet_soup-stove RCA).
+#
+# A seat is stored per (fixture, class) in ``fixture_geometry.json`` under the
+# fixture's ``distractor_seats`` map::
+#
+#   "distractor_seats": {
+#     "<class>": {"dx": <m>, "dy": <m>, "dz": <m>, "x_half": <m>, "y_half": <m>}
+#   }
+#
+# ``dx``/``dy`` offset the seat CENTRE from the fixture BODY toward the support
+# surface; ``dz`` is the resting body-centre clearance above ``TABLE_SURFACE_Z``
+# (the MEASURED flat-plate rest — it SUPERSEDES the stale body-centred variant
+# clearance); ``x_half``/``y_half`` bound the (stable) placement box on the plate.
+# Unlike a cradle (which seats EVERY fitting class), a seat is per-CLASS: only the
+# listed classes relocate; the rest keep the default flat-fixture placement. Both
+# the renderer (placement) and the simulator (z via :func:`spawn_clearance`) read
+# the seat so injected pose == settled pose. Absent ⇒ no seat (every fixture
+# without a ``distractor_seats`` map is byte-identical).
+
+
+def distractor_fixture_seat(
+    fixture_class: str | None, asset_class: str | None
+) -> dict[str, float] | None:
+    """Return the measured per-(class, fixture) distractor SEAT, or ``None``.
+
+    The returned dict has keys ``dx, dy, dz, x_half, y_half`` (all metres, with
+    missing offsets/halves defaulting to 0.0); ``dz`` (the resting body-centre
+    clearance above ``TABLE_SURFACE_Z``) is required. ``None`` when the fixture
+    has no ``distractor_seats`` map or the class is not seated there."""
+    geom = FIXTURE_GEOMETRY.get(fixture_class or "")
+    if geom is None:
+        return None
+    seats = geom.get("distractor_seats")
+    if not isinstance(seats, dict):
+        return None
+    s = seats.get(asset_class or "")
+    if not isinstance(s, dict) or s.get("dz") is None:
+        return None
+    return {
+        "dx": float(s.get("dx", 0.0)),
+        "dy": float(s.get("dy", 0.0)),
+        "dz": float(s["dz"]),
+        "x_half": float(s.get("x_half", 0.0)),
+        "y_half": float(s.get("y_half", 0.0)),
+    }
+
+
+def is_distractor_fixture_seated(fixture_class: str | None, asset_class: str | None) -> bool:
+    """True iff ``asset_class`` has a measured per-(class, fixture) seat on
+    ``fixture_class`` (so it is relocated to the measured support-surface rest
+    rather than placed at the body-centred footprint region)."""
+    return distractor_fixture_seat(fixture_class, asset_class) is not None
 
 
 def is_fixture_measured(fixture_class: str | None) -> bool:
