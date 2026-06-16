@@ -15,9 +15,15 @@
       ],
       "height": 0.07928,
       "top_z": 0.13502,
-      "unstable_distractors": [
-        "alphabet_soup"
-      ]
+      "distractor_seats": {
+        "alphabet_soup": {
+          "dx": 0.15,
+          "dy": 0.0,
+          "dz": 0.1489,
+          "x_half": 0.05,
+          "y_half": 0.05
+        }
+      }
     },
     "microwave": {
       "footprint": [
