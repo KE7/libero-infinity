@@ -51,7 +51,46 @@ from typing import Any
 # accumulation well below the ~6k-conditions-per-worker reached in Stage 3
 # Run 2 (which produced the d.4 4.75 % pool-teardown tail). Override via
 # ``run_sweep(..., max_tasks_per_child=...)`` or ``--max-tasks-per-child``.
+#
+# This is the default ONLY for the --scenic-only pass (G0-G3): those gates are
+# pure-Python BDDL/Scenic work with NO LIBERO env, NO EGL render context, and
+# NO MuJoCo contact arena — there is no GL/sim state to accumulate, so a higher
+# recycle cap is safe and faster.
 DEFAULT_MAX_TASKS_PER_CHILD: int = 64
+
+# Default cap for the ENV pass (scenic_only=False, i.e. G5/G6 create a LIBERO
+# env + EGL render context + step MuJoCo). Set to 1 => PROCESS-PER-SAMPLE: with
+# chunk_size = workers * 1, every worker process is torn down and respawned
+# after exactly ONE condition, guaranteeing a fresh EGL/MuJoCo process per
+# simulation sample.
+#
+# Root cause this retires (validation_run2/rca + PR #18 d.4): EGL render-context
+# state and the MuJoCo contact arena (``ncon``) ACCUMULATE across simulation
+# samples WITHIN a single long-lived worker process and eventually overflow —
+# the recurring ``mjWARN_CONTACTFULL`` / ncon=5000 contact-buffer overflow.
+# A worker that handles only one sample before dying cannot accumulate, so the
+# overflow can no longer occur. This is a clean per-process isolation, NOT a
+# masking of the symptom.
+ENV_MAX_TASKS_PER_CHILD: int = 1
+
+
+def resolve_max_tasks_per_child(explicit: int | None, *, scenic_only: bool) -> int:
+    """Resolve the effective ``--max-tasks-per-child`` for a pass.
+
+    An EXPLICIT user value always wins (argparse passes ``None`` when the flag
+    is omitted). When omitted, the default is CONDITIONAL on the pass type:
+
+    * ENV pass (``scenic_only=False``): :data:`ENV_MAX_TASKS_PER_CHILD` (1) —
+      process-per-sample, one fresh EGL/MuJoCo process per simulation sample, so
+      contact-arena (``ncon``) + render-context state cannot accumulate across
+      samples and overflow.
+    * ``--scenic-only`` pass (``scenic_only=True``):
+      :data:`DEFAULT_MAX_TASKS_PER_CHILD` — pure-Python G0-G3, no GL/sim state
+      to accumulate, so the higher cap is kept for speed.
+    """
+    if explicit is not None:
+        return explicit
+    return DEFAULT_MAX_TASKS_PER_CHILD if scenic_only else ENV_MAX_TASKS_PER_CHILD
 
 # Canonical 9 perturbation axes (matches the validation plan, not the planner
 # module's extra "sensor_noise" axis which is out of scope for the publication
@@ -717,8 +756,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--max-tasks-per-child",
         type=int,
-        default=DEFAULT_MAX_TASKS_PER_CHILD,
-        help="Recycle each worker after this many conditions (fix for d.4 pool-teardown tail)",
+        default=None,
+        help=(
+            "Recycle each worker after this many conditions (fix for d.4 "
+            "pool-teardown tail). If OMITTED, the effective default is "
+            "CONDITIONAL on the pass type: the ENV pass defaults to 1 "
+            "(process-per-sample — one fresh EGL/MuJoCo process per simulation "
+            "sample, retiring the accumulating contact-arena ncon=5000 / EGL "
+            "render-context overflow; see validation_run2/rca + PR #18 d.4), "
+            f"while --scenic-only keeps {DEFAULT_MAX_TASKS_PER_CHILD} for speed "
+            "(G0-G3 are pure-Python, no GL/sim state to accumulate). An "
+            "explicit value here always overrides both."
+        ),
     )
     args = ap.parse_args(argv)
 
@@ -737,6 +786,13 @@ def main(argv: list[str] | None = None) -> int:
     seeds = list(range(args.seeds))
     workers = max(1, min(10, args.workers))
 
+    # Resolve the effective worker-recycle cap. Omitted (None) => conditional
+    # default: ENV pass -> 1 (process-per-sample), --scenic-only -> the higher
+    # speed default. An explicit --max-tasks-per-child always overrides.
+    max_tasks_per_child = resolve_max_tasks_per_child(
+        args.max_tasks_per_child, scenic_only=args.scenic_only
+    )
+
     summary = run_sweep(
         tasks,
         subsets,
@@ -745,7 +801,7 @@ def main(argv: list[str] | None = None) -> int:
         workers=workers,
         scenic_only=args.scenic_only,
         max_iter=args.max_iter,
-        max_tasks_per_child=args.max_tasks_per_child,
+        max_tasks_per_child=max_tasks_per_child,
     )
 
     print(json.dumps(summary, indent=2))
