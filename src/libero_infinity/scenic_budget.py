@@ -31,6 +31,28 @@ DEFAULT_MAX_ITERATIONS: int = 5000
 # allotted budget (early signal that the budget is too tight for the mode/task).
 BUDGET_WARN_FRACTION: float = 0.90
 
+# Axes that actually drive the rejection sampler's iteration count. When the
+# robot / distractor / position axes are active the compiler injects a dense
+# conjunctive clearance require-graph (every robot link/gripper body × every
+# scene object × every distractor slot, plus distractor pairwise non-overlap);
+# this is what collapses the satisfying region and makes the expected number of
+# rejection draws explode. The remaining axes are *geometrically free*:
+# ``object``, ``camera``, ``lighting``, ``background``, ``texture`` and
+# ``sensor_noise`` each cost ~1 iteration because they do not add geometric
+# constraints to the require-graph (calibration: byte-identical ``n_iters`` for
+# subset pairs that differ only in these axes).
+#
+# The budget tier MUST be keyed on this expensive set, not on full preset
+# containment. Gating ``combined``/``full``'s large budget on the full
+# (appearance-inclusive) axis-set under-provisions any subset that carries all
+# the expensive geometric axes but happens to omit a cheap one — e.g.
+# ``position,robot,distractor`` is geometrically as hard as ``combined`` yet,
+# under superset containment, was capped at the 5000 floor. That mis-keying was
+# the root cause of ~36% of the run3 g3 RejectionException failures.
+EXPENSIVE_GEOMETRIC_AXES: frozenset[str] = frozenset(
+    {"position", "robot", "distractor", "articulation"}
+)
+
 _ARTIFACT = pathlib.Path(__file__).parent / "data" / "scenic_iteration_budgets.json"
 
 
@@ -67,12 +89,22 @@ def resolve_iteration_budget(
     - the :data:`DEFAULT_MAX_ITERATIONS` floor (5000);
     - the exact mode-name budget, if the spec names a calibrated mode
       (``"combined"``, ``"full"``, ``"position"``, …);
-    - every calibrated preset whose axis-set is fully contained in the request
-      (so a custom comma-list equal to — or a superset of — a preset inherits
-      that preset's budget). This is also why ``"full"`` ⊇ ``"combined"`` folds
-      in the (empirically larger) ``combined`` budget rather than dropping below
-      it on sampling noise;
+    - every calibrated preset whose **expensive geometric axes** are all present
+      in the request (``preset_axes & EXPENSIVE_GEOMETRIC_AXES <= axes``). The
+      budget is keyed on the axes that actually drive iteration cost
+      (:data:`EXPENSIVE_GEOMETRIC_AXES`), *not* on full preset containment that
+      also demands the geometrically-free appearance axes. A subset that carries
+      all of a preset's expensive axes is geometrically as hard as that preset
+      and inherits its budget even when it omits a cheap axis (e.g.
+      ``"position,robot,distractor"`` inherits ``combined``'s budget). This is
+      also why ``"full"`` ⊇ ``"combined"`` folds in the (empirically larger)
+      ``combined`` budget rather than dropping below it on sampling noise;
     - every measured single-axis budget present in the request.
+
+    The expensive-axis keying is still *monotone in axis-set inclusion* —
+    enlarging a request can only add axes, so the containment test never flips
+    from satisfied to unsatisfied; a strictly larger request never gets a
+    smaller budget.
 
     Args:
         perturbation: The perturbation spec string (axis, preset, or
@@ -102,7 +134,15 @@ def resolve_iteration_budget(
         return max(candidates)
 
     for preset_name, preset_axes in AXIS_PRESETS.items():
-        if preset_name in modes and preset_axes <= axes:
+        if preset_name not in modes:
+            continue
+        # Key the preset's budget on its EXPENSIVE geometric axes only — the
+        # ones that actually inflate the rejection-sampler's iteration count.
+        # Dropping the geometrically-free appearance axes from the containment
+        # test means a subset that is geometrically as hard as the preset gets
+        # its budget even if it omits a cheap axis (run3 g3 resolver-gap fix).
+        required = preset_axes & EXPENSIVE_GEOMETRIC_AXES
+        if required and required <= axes:
             candidates.append(modes[preset_name])
     for axis in axes:
         if axis in modes:

@@ -1497,6 +1497,48 @@ class TestScenicIterationBudget:
         combined_axes = ",".join(sorted(AXIS_PRESETS["combined"]))
         assert resolve_iteration_budget(combined_axes) == resolve_iteration_budget("combined")
 
+    def test_expensive_geometric_subset_inherits_combined_budget(self):
+        # R2 regression: a subset that carries all of ``combined``'s EXPENSIVE
+        # geometric axes (position+robot+distractor) but OMITS one or more
+        # geometrically-free axes (object/camera/lighting/background) is
+        # geometrically as hard as ``combined`` and MUST inherit its large
+        # budget — not be capped at the 5000 floor (the run3 g3 resolver-gap).
+        from libero_infinity.scenic_budget import resolve_iteration_budget
+
+        combined = resolve_iteration_budget("combined")
+        assert combined > 5000  # precondition: combined is calibrated large
+        # All carry {position, robot, distractor} but miss >=1 cheap axis.
+        for subset in (
+            "position,robot,distractor",
+            "position,object,robot,distractor",
+            "position,robot,camera,lighting,distractor,background",  # missing only object
+        ):
+            assert resolve_iteration_budget(subset) == combined, subset
+
+    def test_cheap_subsets_do_not_balloon(self):
+        # R2 must NOT over-provision: subsets lacking the expensive geometric
+        # axes stay at the 5000 floor (no wall-clock balloon, no regression).
+        from libero_infinity.scenic_budget import resolve_iteration_budget
+
+        for subset in (
+            "position",
+            "object,camera,lighting",
+            "object,camera,lighting,background",
+            "camera,lighting,background,texture",
+        ):
+            assert resolve_iteration_budget(subset) == 5000, subset
+
+    def test_expensive_keying_is_monotone(self):
+        # Adding axes can only raise (never lower) the budget — the containment
+        # test never flips from satisfied to unsatisfied.
+        from libero_infinity.scenic_budget import resolve_iteration_budget
+
+        base = "position,robot,distractor"
+        b0 = resolve_iteration_budget(base)
+        b1 = resolve_iteration_budget(base + ",object")
+        b2 = resolve_iteration_budget(base + ",object,camera,lighting,background")
+        assert b0 <= b1 <= b2
+
     def test_warn_emitted_only_near_budget(self, caplog):
         import logging
 

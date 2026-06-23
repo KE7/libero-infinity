@@ -1,0 +1,43 @@
+{
+  "_meta": {
+    "description": "Known robustly-over-constrained (task, mode) cells that fail Scenic rejection sampling even at the 55000 eval ceiling across multiple seeds. Documented as a §6 criterion-6 caveat of the open-ended distribution rather than masked with an ever-larger budget. Source: validation_run3 g3 budget triage (rca/g3_budget_triage.md sec. 5-6).",
+    "eval_ceiling": 55000,
+    "criterion": "6 (hard-to-sample)",
+    "remediation": "documented exemption; NOT a forced pass and NOT a budget bump",
+    "estimated_population": 40,
+    "estimated_population_note": "upper bound; ~8 high-geometric-cardinality cells per task. The bowl_on_stove family is high-variance (straddles the ceiling) and is recovered by the bounded resample-on-RejectionException retry, so true-infeasible count is lower."
+  },
+  "cells": [
+    {
+      "task": "libero_spatial/pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate",
+      "mode": "full",
+      "verdict": "robust_over_constraint",
+      "multiseed": {"0": "FAIL", "1": "FAIL", "2": "FAIL"}
+    },
+    {
+      "task": "libero_90/KITCHEN_SCENE7_open_the_microwave",
+      "mode": "full",
+      "verdict": "robust_over_constraint",
+      "multiseed": {"0": "FAIL", "1": "FAIL", "2": "FAIL"}
+    },
+    {
+      "task": "libero_90/KITCHEN_SCENE7_put_the_white_bowl_on_the_plate",
+      "mode": "full",
+      "verdict": "over_constrained_at_ceiling",
+      "multiseed": {"0": "FAIL"}
+    },
+    {
+      "task": "libero_90/KITCHEN_SCENE7_put_the_white_bowl_to_the_right_of_the_plate",
+      "mode": "full",
+      "verdict": "over_constrained_at_ceiling",
+      "multiseed": {"0": "FAIL"}
+    },
+    {
+      "task": "libero_spatial/pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate",
+      "mode": "full",
+      "verdict": "high_variance_straddles_ceiling",
+      "multiseed": {"0": "FAIL", "1": "PASS@4441", "2": "FAIL"},
+      "note": "recovered by the bounded resample-on-RejectionException retry; not infeasible"
+    }
+  ]
+}
