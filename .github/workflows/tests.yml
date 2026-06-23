@@ -42,6 +42,7 @@ jobs:
           MUJOCO_GL=egl PYTHONPATH=src .venv/bin/python -m pytest \
             tests/test_scenic.py \
             tests/test_perturbation_policy.py \
+            tests/test_sweep_g3_budget.py \
             tests/test_invariants_identity.py \
             tests/test_invariants_affordance.py \
             tests/test_invariants_consistency.py \

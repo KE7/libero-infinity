@@ -18,14 +18,16 @@ Gates:
     G0  BDDL parse                 (TaskConfig.from_bddl)
     G1  Scenic program generation  (compile_task_to_scenic -> str)
     G2  Scenic compile             (compile_task_to_scenario -> Scenario)
-    G3  Scenic sample              (scenario.generate(maxIterations=...))
+    G3  Scenic sample              (scenario.generate; budget via the eval-path
+                                    resolve_iteration_budget(), bounded resample
+                                    retry on RejectionException)
     G5  LIBERO env create + reset  (skipped if --scenic-only)
     G6  render + 5 noop steps      (skipped if --scenic-only)
 
 JSONL row schema (one row per condition):
     task, axis_subset, seed, cardinality,
     g0..g6 ("pass" | "fail" | "skip"),
-    n_iters (int|None),
+    n_iters (int|None), max_iter_resolved (int|None), g3_attempts (int|None),
     error_class, error_msg, error_file_line, traceback,
     duration_s, worker_pid
 """
@@ -72,6 +74,20 @@ DEFAULT_MAX_TASKS_PER_CHILD: int = 64
 # overflow can no longer occur. This is a clean per-process isolation, NOT a
 # masking of the symptom.
 ENV_MAX_TASKS_PER_CHILD: int = 1
+
+# Bounded resample-on-``RejectionException`` retry for the G3 Scenic sampling
+# stage. The per-cell iteration requirement is a heavy-tailed random variable
+# (the rejection sampler carries a stochastic component not fully pinned by
+# ``random.seed``), so a thin tail of high-variance cells fails the unlucky
+# single draw yet samples readily on a fresh one (triage: ``bowl_on_stove``
+# failed seed 0 but sampled in 4,441 iters on seed 1). On a ``RejectionException``
+# we re-draw a couple of times — the SAME resample policy the eval-time
+# ``reset()`` settle-loop already uses — before recording an honest g3 failure.
+# Because the per-condition RNG is seeded ONCE at the top of ``run_condition``,
+# each ``generate()`` call advances the stream and yields a genuinely fresh draw
+# sequence (not a re-run of the same one). This is a BOUNDED retry, never an
+# unbounded loop and never a budget bump.
+G3_RESAMPLE_RETRIES: int = 2
 
 
 def resolve_max_tasks_per_child(explicit: int | None, *, scenic_only: bool) -> int:
@@ -239,9 +255,18 @@ def run_condition(
     seed: int,
     *,
     scenic_only: bool,
-    max_iter: int,
+    max_iter: int | None,
 ) -> dict[str, Any]:
-    """Execute a single (task, axis_subset, seed) condition end-to-end."""
+    """Execute a single (task, axis_subset, seed) condition end-to-end.
+
+    ``max_iter`` is the explicit ``--max-iter`` override (or ``None`` to use the
+    task/mode-adaptive resolver). The G3 sampling budget is resolved through
+    :func:`libero_infinity.scenic_budget.resolve_iteration_budget` — the SAME
+    function the eval/gym path uses — so the sweep and the eval pipeline agree on
+    the budget by construction rather than the sweep validating at a tighter,
+    mode-blind cap (the run3 g3 sweep-cap artifact). An explicit ``max_iter``
+    still wins, for full back-compat.
+    """
 
     t0 = time.monotonic()
     row: dict[str, Any] = {
@@ -256,6 +281,8 @@ def run_condition(
         "g5": "skip" if not scenic_only else "skip",
         "g6": "skip" if not scenic_only else "skip",
         "n_iters": None,
+        "max_iter_resolved": None,
+        "g3_attempts": None,
         "error_class": None,
         "error_msg": None,
         "error_file_line": None,
@@ -276,6 +303,16 @@ def run_condition(
 
     bddl_path = resolve_task_path(task_rel)
     request = ",".join(axis_subset)
+
+    # R1: route the G3 sampling budget through the eval-path resolver so the
+    # sweep validates at the SAME maxIterations the eval/gym pipeline actually
+    # runs. An explicit --max-iter (max_iter is not None) overrides. The baseline
+    # (no-axes) G4 scene is always geometrically trivial → resolves to the floor.
+    from libero_infinity.scenic_budget import resolve_iteration_budget
+
+    g3_budget = resolve_iteration_budget(request, max_iter)
+    baseline_budget = resolve_iteration_budget("", max_iter)
+    row["max_iter_resolved"] = int(g3_budget)
 
     # ---- G0: BDDL parse ------------------------------------------------
     try:
@@ -319,13 +356,34 @@ def run_condition(
         return row
 
     # ---- G3: Scenic sample -------------------------------------------
+    # R3(b): bounded resample-on-RejectionException retry for the heavy-tailed
+    # high-variance cells (mirrors the eval reset() settle-loop resample policy;
+    # see G3_RESAMPLE_RETRIES). Each generate() call advances the per-condition
+    # RNG (seeded once above), so a retry is a genuinely fresh draw — NOT a
+    # re-run of the same sequence, and NOT a budget bump. Only RejectionException
+    # is retried; any other error is recorded immediately (no masking).
+    from scenic.core.distributions import RejectionException
+
     scene = None
-    try:
-        scene, n_iters = scenario.generate(maxIterations=max_iter)
-        row["n_iters"] = int(n_iters)
-        row["g3"] = "pass"
-    except Exception as exc:  # noqa: BLE001
-        _record_failure(row, "g3", exc)
+    last_rejection: Exception | None = None
+    for attempt in range(G3_RESAMPLE_RETRIES + 1):
+        try:
+            scene, n_iters = scenario.generate(maxIterations=g3_budget)
+            row["n_iters"] = int(n_iters)
+            row["g3_attempts"] = attempt + 1
+            row["g3"] = "pass"
+            break
+        except RejectionException as exc:
+            last_rejection = exc
+            continue
+        except Exception as exc:  # noqa: BLE001 — non-rejection error: record, no retry
+            row["g3_attempts"] = attempt + 1
+            _record_failure(row, "g3", exc)
+            row["duration_s"] = time.monotonic() - t0
+            return row
+    if scene is None:
+        row["g3_attempts"] = G3_RESAMPLE_RETRIES + 1
+        _record_failure(row, "g3", last_rejection)
         row["duration_s"] = time.monotonic() - t0
         return row
 
@@ -335,7 +393,7 @@ def run_condition(
     # in ``g4_identity_error`` (with traceback) but do not gate the rest of
     # the pipeline — they're a separate publication-grade assertion family.
     try:
-        baseline = _get_baseline_scene(cfg, str(bddl_path), max_iter)
+        baseline = _get_baseline_scene(cfg, str(bddl_path), baseline_budget)
         from libero_infinity.validation.invariants import g4_identity_hook
 
         row["g4_identity"] = g4_identity_hook(baseline, scene, axis_subset)
@@ -580,7 +638,7 @@ def run_sweep(
     out_path: pathlib.Path,
     workers: int,
     scenic_only: bool,
-    max_iter: int,
+    max_iter: int | None,
     max_tasks_per_child: int = DEFAULT_MAX_TASKS_PER_CHILD,
     max_pool_restarts: int = 4,
 ) -> dict[str, Any]:
@@ -632,7 +690,8 @@ def run_sweep(
     print(
         f"[sweep] {total} conditions  "
         f"({len(tasks)} tasks x {len(subsets)} subsets x {len(seeds)} seeds)  "
-        f"workers={workers}  scenic_only={scenic_only}  max_iter={max_iter}  "
+        f"workers={workers}  scenic_only={scenic_only}  "
+        f"max_iter={max_iter if max_iter is not None else 'resolver(auto)'}  "
         f"max_tasks_per_child={max_tasks_per_child}",
         file=sys.stderr,
         flush=True,
@@ -746,7 +805,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--out", required=True, help="Output JSONL path")
     ap.add_argument(
-        "--max-iter", type=int, default=2000, help="Scenic scenario.generate maxIterations"
+        "--max-iter",
+        type=int,
+        default=None,
+        help=(
+            "Explicit Scenic scenario.generate maxIterations override. If OMITTED "
+            "(default), the budget is resolved PER (task, axis-subset) via the "
+            "eval-path resolve_iteration_budget() — the SAME task/mode-adaptive "
+            "budget the eval/gym pipeline runs (5000 floor; combined/full and any "
+            "subset carrying the expensive geometric axes get up to 55000) — so "
+            "the sweep and eval agree by construction. An explicit value here "
+            "applies a flat cap to every condition (back-compat / debugging)."
+        ),
     )
     ap.add_argument(
         "--subset-seed",
