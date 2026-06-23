@@ -171,3 +171,67 @@ def test_smoke_task_classes_have_measured_clearances() -> None:
             if cls and not asset_metadata.is_measured(cls):
                 missing.add(cls)
     assert not missing, f"SMOKE_TASKS classes lack measured clearances: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# 4. ``floor`` arena (libero_object suite) — Regime A of the g4 pose-drift RCA.
+#    The kitchen per-class clearance does NOT transfer to the floor arena (the
+#    suite authors several classes in a different rest orientation), so ``floor``
+#    must be threaded as a per-arena table class with its OWN measured
+#    ``<class>|floor`` clearances. See rca/g4_task_pose_drift.md (Regime A).
+# ---------------------------------------------------------------------------
+
+
+def test_floor_arena_is_threaded_as_per_arena_table_class() -> None:
+    """The libero_object ``floor`` arena must be threaded so the renderer resolves
+    the measured ``<class>|floor`` clearance instead of the (non-transferring)
+    canonical kitchen clearance + arena shift."""
+    from libero_infinity.asset_metadata import PER_ARENA_TABLE_CLASSES
+
+    assert "floor" in PER_ARENA_TABLE_CLASSES
+
+
+def test_floor_arena_task_object_classes_have_measured_floor_clearance() -> None:
+    """Every task-object class of the 10 libero_object basket scenes (and the
+    object-axis variants the renderer can emit) must have a measured
+    ``<class>|floor`` clearance, so the object-axis subsets resolve the suite's
+    settled z rather than the kitchen-frame fallback that fails pose_tolerance."""
+    from libero_infinity.asset_metadata import VARIANT_CLEARANCES
+
+    # Canonical task-object classes carried by the basket scenes.
+    floor_classes = {
+        "bbq_sauce",
+        "basket",
+        "chocolate_pudding",
+        "ketchup",
+        "salad_dressing",
+        "alphabet_soup",
+        "cream_cheese",
+        "milk",
+        "tomato_sauce",
+        "butter",
+        "orange_juice",
+    }
+    missing = {c for c in floor_classes if f"{c}|floor" not in VARIANT_CLEARANCES}
+    assert not missing, f"floor arena classes lack measured |floor clearance: {missing}"
+
+
+def test_floor_arena_resolved_z_in_suite_band() -> None:
+    """``surface_spawn_z(arena_surface_z('floor'), class, 'floor')`` must land in
+    the libero_object suite's settled band (objects rest just above the ~0 frame,
+    a few cm to ~0.13 m). A kitchen-frame fallback would land ~0.9 m too high."""
+    from libero_infinity.asset_metadata import (
+        VARIANT_CLEARANCES,
+        arena_surface_z,
+        surface_spawn_z,
+    )
+
+    surf = arena_surface_z("floor")
+    for key in VARIANT_CLEARANCES:
+        if not key.endswith("|floor"):
+            continue
+        cls = key.split("|", 1)[0]
+        z = surface_spawn_z(surf, cls, "floor")
+        # Suite objects settle between ~-0.02 m (flat boxes) and ~0.15 m (tall
+        # bottles) in the floor world frame; well clear of the ~0.9 m kitchen z.
+        assert -0.05 <= z <= 0.20, f"{cls}|floor resolved z {z:.4f} outside suite band"
