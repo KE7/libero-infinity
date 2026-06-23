@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import re
 from typing import Any
 
 import numpy as np
@@ -98,6 +99,71 @@ MAX_SETTLE_XY_DRIFT = 0.20  # max allowed xy drift from the Scenic-sampled posit
 MAX_SETTLE_Z_DROP = 0.08  # max allowed z drop (objects falling through fixtures)
 MAX_SETTLE_ROT_DRIFT = np.deg2rad(35.0)  # max rotation from default LIBERO pose (35° ≈ 0.61 rad)
 MIN_SETTLED_Z = TABLE_Z - 0.05  # min z after settling; below this = fallen off the table
+
+
+def _is_workspace_surface_body(body_name: str) -> bool:
+    """True if ``body_name`` is the scene's workspace support surface.
+
+    A table-spawned object (task object or distractor) resting on the
+    workspace surface is in *expected* persistent contact with it under
+    gravity — that contact must not be flagged as a bad-placement overlap by
+    ``_validate_settled_positions``.
+
+    LIBERO names every workspace surface consistently: the robosuite default
+    arena body is ``table``; suite arenas use ``<room>_table`` (``kitchen_table``,
+    ``living_room_table``, ``study_table``, ``main_table``); floor-based scenes
+    use ``floor``. The previous check only matched ``table``/``table*`` and so
+    silently failed for every multi-word table name (e.g. ``study_table``),
+    which made distractors that legitimately rest on the STUDY-scene table read
+    as overlaps and exhausted the reset retries (run3 g5 RCA). Matching the
+    naming convention covers all suites without hardcoding a per-scene list.
+    """
+    name = body_name.lower()
+    return name == "table" or name.startswith("table") or name.endswith("table") or "floor" in name
+
+
+# Regex matching robosuite's compiled ``<size .../>`` element. robosuite's
+# base.xml hardcodes ``<size nconmax="5000" njmax="5000"/>``, which caps the
+# MuJoCo contact (``nconmax``) and constraint (``njmax``) arenas at 5000. A
+# single dense scene that momentarily exceeds that cap triggers MuJoCo's
+# ``Too many contacts (ncon = 5000)`` warning and SILENTLY TRUNCATES the
+# excess contacts — the dropped contacts mean missing constraint forces, i.e.
+# corrupted physics for that step (penetration / ejection). This is distinct
+# from the cross-sample accumulation overflow that PR #33 addressed via
+# process-per-sample; this is the single-dense-scene mode.
+_SIZE_ELEM_RE = re.compile(r"<size\b[^>]*/?>")
+_NCONMAX_RE = re.compile(r'\bnconmax\s*=\s*"[^"]*"')
+_NJMAX_RE = re.compile(r'\bnjmax\s*=\s*"[^"]*"')
+
+
+def _autosize_contact_arena(xml: str) -> str:
+    """MJCF processor: let MuJoCo size the contact/constraint arena dynamically.
+
+    Rewrites any explicit ``nconmax`` / ``njmax`` on the model's ``<size>``
+    element to ``-1`` — MuJoCo's documented sentinel for *automatic* arena
+    sizing (the engine grows the contact/constraint buffers from the arena
+    memory pool as the scene requires, rather than capping at a fixed count).
+    This is the principled, scene-complexity-adaptive replacement for the
+    hardcoded 5000 cap: no magic constant, the ceiling scales to whatever the
+    scene actually produces.
+
+    Verified physics-invariant for normal scenes: for any scene whose contact
+    count never reached the old cap, the contacts detected and solved are
+    bit-identical (the buffer ceiling is the only thing that changes). The
+    behaviour differs ONLY for scenes that previously overflowed, where the
+    formerly-truncated contacts are now retained — the intended correctness
+    fix. Installed via robosuite's ``set_xml_processor`` hook so it runs inside
+    every ``_initialize_sim`` rebuild, with no edits to vendored assets.
+    """
+
+    def _rewrite_size(m: "re.Match[str]") -> str:
+        elem = m.group(0)
+        elem = _NCONMAX_RE.sub('nconmax="-1"', elem)
+        elem = _NJMAX_RE.sub('njmax="-1"', elem)
+        return elem
+
+    return _SIZE_ELEM_RE.sub(_rewrite_size, xml)
+
 
 # ---------------------------------------------------------------------------
 # Canonical upright orientations per asset class (robosuite (x,y,z,w) format)
@@ -884,6 +950,17 @@ class LIBEROSimulation(Simulation):
 
         log.debug("LIBEROSimulation.setup: creating env from %s", effective_bddl)
         self.libero_env = OffScreenRenderEnv(**env_cfg)
+        # Auto-size the MuJoCo contact/constraint arena before the sim is
+        # (re)built. robosuite's base.xml hardcodes nconmax/njmax=5000; a single
+        # dense scene that exceeds that cap truncates contacts and corrupts the
+        # step's physics (+ emits the ``ncon = 5000`` warning spam seen in the
+        # run3 sweep). The processor runs inside ``_initialize_sim`` on the
+        # hard-reset rebuild below, so the model we actually use has a dynamic
+        # arena. See ``_autosize_contact_arena``.
+        try:
+            self.libero_env.env.set_xml_processor(_autosize_contact_arena)
+        except AttributeError:  # pragma: no cover — older robosuite without the hook
+            log.warning("robosuite env has no set_xml_processor; contact arena stays capped")
         self._last_obs = self.libero_env.reset()
 
         # Snapshot canonical model arrays before any perturbation runs so the
@@ -939,6 +1016,23 @@ class LIBEROSimulation(Simulation):
         self._canonical_rot = dict(default_rot)
         root_surface_z = _infer_root_surface_z(self.scene.objects, default_pose)
         contained_object_names = _bddl_contained_object_names(effective_bddl)
+
+        # Restore the canonical XML-loaded model state ONCE, before any
+        # perturbation writes (robot, object/fixture injection, articulation,
+        # camera/lighting/texture/background). This gives the additive (`+=`)
+        # and multiplicative (`*=`) env-perturbation passes a clean baseline
+        # while — critically — running BEFORE the fixture-injection body_pos
+        # writes below. A jointless fixture (e.g. ``desk_caddy_1``,
+        # ``wooden_two_layer_shelf_1``) can only be relocated by writing
+        # ``sim.model.body_pos`` directly (see ``_inject_object_pose``
+        # fallback). The previous ordering restored the baseline *after* the
+        # injection loop, which reverted those fixture writes to the XML
+        # default — the fixture then "drifted" the full sample-vs-default
+        # distance (~0.20 m) and the settle validator rejected every retry
+        # (g5 STUDY_SCENE reset failures, run3). Restoring first preserves the
+        # injection: the env-perturbation passes only touch cam_pos / light_*
+        # / mat_texid, never body_pos, so they cannot clobber it.
+        self._restore_model_baseline()
         self._apply_robot_perturbation()
 
         # ── inject Scenic-sampled positions ───────────────────────────────
@@ -1033,10 +1127,11 @@ class LIBEROSimulation(Simulation):
         self._apply_articulation_perturbation()
 
         # ── apply environment perturbations from Scenic params ──────────
-        # Restore the canonical XML-loaded model state before each apply pass
-        # so additive (`+=`) and multiplicative (`*=`) writes inside the
-        # _apply_* helpers never accumulate across reuse of the env.
-        self._restore_model_baseline()
+        # The canonical baseline was restored above (before injection) so the
+        # additive (`+=`) / multiplicative (`*=`) writes inside the _apply_*
+        # helpers still start from canonical cam_pos / light_* / mat_texid.
+        # We must NOT restore again here: that would revert the fixture
+        # body_pos injection performed in the loop above (g5 STUDY_SCENE RCA).
         self._apply_camera_perturbation()
         self._apply_lighting_perturbation()
         self._apply_texture_perturbation()
@@ -1640,7 +1735,7 @@ class LIBEROSimulation(Simulation):
                 continue
 
             other_body = body_b if owner_a is not None else body_a
-            if other_body == "table" or other_body.startswith("table"):
+            if _is_workspace_surface_body(other_body):
                 continue
             if any(other_body.startswith(prefix) for prefix in movable_names):
                 continue
