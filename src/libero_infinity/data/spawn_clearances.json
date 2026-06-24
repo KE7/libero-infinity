@@ -21,6 +21,15 @@
       "wine_bottle": 7
     },
     "n_distractor_table_rows": 6,
+    "g4_reference_corrections": {
+      "cookies": {
+        "old": 0.12098,
+        "new": 0.1003,
+        "n": 12,
+        "spread_mm": 0.0,
+        "note": "RCA g4_remaining_arenas.md (bucket B): the libero_spatial cookie box rests FLAT on the workspace table and settles deterministically at body-origin clearance 0.1003 above TABLE_Z (n=12, 0.0mm spread, production env path; scripts/measure_g4_residuals.py). The stale 0.12098 was ~20.7mm too high, so the cookie box AND any bowl stacked on it failed g4 pose_tolerance on z. The cookie box is NOT among the 191,285 passing keys (it currently fails everywhere it is table-resting), and the bowl-on-cookies stack REQUIRES this correction for consistency (its emitted z = cookies_z + stack_offset). Distractor cookies is scored separately and was already mis-injected (it settles flat at ~0.02), so this is not a regression."
+      }
+    },
     "distractor_table_corrections": {
       "butter": {
         "old": 0.08738,
@@ -47,7 +56,7 @@
     "butter": 0.09861,
     "chefmate_8_frypan": 0.10039,
     "chocolate_pudding": 0.10023,
-    "cookies": 0.12098,
+    "cookies": 0.1003,
     "cream_cheese": 0.10031,
     "desk_caddy": 0.26659,
     "glazed_rim_porcelain_ramekin": 0.10043,

@@ -1,0 +1,12 @@
+{
+  "_meta": {
+    "description": "Per-(child_class|parent_class) settled body-origin stack offset in metres: child_settled_origin_z - parent_settled_origin_z, for a movable child stacked on a movable parent. Measured by scripts/measure_g4_residuals.py through the production env path. The renderer emits this as the relative-z offset for a movable->movable stack so scenic_z == settled_z (RCA g4_task_pose_drift.md Regime B). Purely additive: an absent pair keeps the legacy 0.0 offset.",
+    "table_z": 0.82,
+    "n_rows": 2,
+    "provenance": "Measured child_settled_origin_z - parent_settled_origin_z, production env path, 0.0mm spread across seeds/subsets (scripts/measure_g4_residuals.py). RCA g4_remaining_arenas.md bucket D."
+  },
+  "stack_offsets": {
+    "akita_black_bowl|cookies": 0.1535,
+    "akita_black_bowl|glazed_rim_porcelain_ramekin": 0.1457
+  }
+}

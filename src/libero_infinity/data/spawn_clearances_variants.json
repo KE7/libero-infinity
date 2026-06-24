@@ -53,7 +53,7 @@
         "method": "derived(rest+table)"
       }
     },
-    "n_arena_table_rows": 15
+    "n_arena_table_rows": 23
   },
   "clearances": {
     "akita_black_bowl|kitchen_table": 0.10094,
@@ -69,6 +69,7 @@
     "basket|living_room_table": 0.10131,
     "bbq_sauce|floor": 0.17981,
     "bbq_sauce|kitchen_table": 0.13375,
+    "bbq_sauce|living_room_table": 0.17314,
     "bowl_drainer|flat_stove": 0.23908,
     "bowl_drainer|microwave": 0.39101,
     "bowl_drainer|white_cabinet": 0.41234,
@@ -80,6 +81,7 @@
     "butter|table": 0.08738,
     "butter|wooden_cabinet": 0.32697,
     "chefmate_8_frypan|kitchen_table": 0.10039,
+    "chefmate_8_frypan|living_room_table": 0.10462,
     "chefmate_8_frypan|table": 0.10039,
     "chocolate_pudding|flat_stove": 0.15795,
     "chocolate_pudding|floor": 0.1276,
@@ -102,6 +104,7 @@
     "cream_cheese|wooden_cabinet": 0.3274,
     "desk_caddy|wooden_cabinet": 0.41148,
     "glazed_rim_porcelain_ramekin|kitchen_table": 0.10043,
+    "glazed_rim_porcelain_ramekin|living_room_table": 0.10609,
     "glazed_rim_porcelain_ramekin|table": 0.10043,
     "ketchup|floor": 0.24352,
     "ketchup|kitchen_table": 0.1522,
@@ -111,6 +114,7 @@
     "macaroni_and_cheese|flat_stove": 0.19303,
     "macaroni_and_cheese|floor": 0.1925,
     "macaroni_and_cheese|kitchen_table": 0.13737,
+    "macaroni_and_cheese|living_room_table": 0.19521,
     "macaroni_and_cheese|table": 0.13737,
     "macaroni_and_cheese|wooden_cabinet": 0.36601,
     "milk|floor": 0.23396,
@@ -134,14 +138,17 @@
     "red_coffee_mug|living_room_table": 0.10807,
     "salad_dressing|floor": 0.24461,
     "salad_dressing|kitchen_table": 0.15248,
+    "salad_dressing|living_room_table": 0.14971,
     "tomato_sauce|floor": 0.15338,
     "tomato_sauce|kitchen_table": 0.11625,
     "tomato_sauce|living_room_table": 0.14516,
     "white_bowl|kitchen_table": 0.10162,
+    "white_bowl|living_room_table": 0.10549,
     "white_bowl|table": 0.10162,
     "white_yellow_mug|kitchen_table": 0.10017,
     "white_yellow_mug|living_room_table": 0.10622,
     "wine_bottle|floor": 0.11153,
+    "wine_bottle|living_room_table": 0.10434,
     "wooden_tray|floor": 0.11362,
     "wooden_tray|kitchen_table": 0.10059,
     "wooden_tray|living_room_table": 0.10661
