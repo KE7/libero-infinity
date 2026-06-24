@@ -1440,16 +1440,51 @@ _ARENA_TABLE_MEASURE_TASKS: dict[str, list[str]] = {
         "libero_90/LIVING_ROOM_SCENE5_put_the_yellow_and_white_mug_on_the_right_plate.bddl",
         "libero_90/LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate.bddl",
     ],
+    # The libero_object suite arena (workspace class ``floor``, table top
+    # ~0.935 m below the kitchen reference). The 10 "pick up X and place it in
+    # the basket" scenes carry the full set of task-object classes AND, under the
+    # ``object`` axis, their OOD variant pools — so a position+object sweep
+    # measures every (class, floor) and (variant, floor) clearance the renderer
+    # must emit. Rest z is fully deterministic here (RCA Regime A; STEP 0).
+    "floor": [
+        "libero_object/pick_up_the_alphabet_soup_and_place_it_in_the_basket.bddl",
+        "libero_object/pick_up_the_bbq_sauce_and_place_it_in_the_basket.bddl",
+        "libero_object/pick_up_the_butter_and_place_it_in_the_basket.bddl",
+        "libero_object/pick_up_the_chocolate_pudding_and_place_it_in_the_basket.bddl",
+        "libero_object/pick_up_the_cream_cheese_and_place_it_in_the_basket.bddl",
+        "libero_object/pick_up_the_ketchup_and_place_it_in_the_basket.bddl",
+        "libero_object/pick_up_the_milk_and_place_it_in_the_basket.bddl",
+        "libero_object/pick_up_the_orange_juice_and_place_it_in_the_basket.bddl",
+        "libero_object/pick_up_the_salad_dressing_and_place_it_in_the_basket.bddl",
+        "libero_object/pick_up_the_tomato_sauce_and_place_it_in_the_basket.bddl",
+    ],
 }
+
+# Per-arena perturbation subsets to sweep. Reference behaviour (living-room) is
+# ``position`` only and stays byte-identical. The ``floor`` arena additionally
+# sweeps ``object`` so each OOD variant's settled (variant, floor) clearance is
+# captured for the object-axis subsets (which the chooser emits as the variant's
+# own z). Both subsets only move/relabel the SAME table-resting movables.
+_ARENA_TABLE_MEASURE_SUBSETS: dict[str, tuple[str, ...]] = {
+    "floor": ("position", "object"),
+}
+_DEFAULT_ARENA_SUBSETS: tuple[str, ...] = ("position",)
 
 # Settled-clearance plausibility band for an arena table (m, relative to the
 # arena's ``arena_surface_z``). Wider than the kitchen band because LIBERO seats
 # some tall objects elevated/metastable on the lower tables (ketchup ≈ 0.28).
 _ARENA_CLEARANCE_BAND = (0.0, 0.45)
 _ARENA_TABLE_SEEDS = (0, 1, 2)
+# The ``object`` axis draws a variant per seed, so the floor sweep needs enough
+# seeds for every pool member (incl. the rarer basket variant white_storage_box)
+# to be instantiated and settled at least once. Dominant-mode aggregation makes
+# extra seeds harmless for the already-covered canonical classes.
+_ARENA_TABLE_SEEDS_BY_ARENA: dict[str, tuple[int, ...]] = {
+    "floor": tuple(range(12)),
+}
 
 
-def measure_arena_tables() -> dict[str, float]:
+def measure_arena_tables(only_arena: str | None = None) -> dict[str, float]:
     """Measure per-(class, arena-table) settled clearance for NON-reference arenas.
 
     For each arena task, generate a ``position`` scene, reset the real LIBERO env
@@ -1481,49 +1516,64 @@ def measure_arena_tables() -> dict[str, float]:
     avail = set(discover_all_tasks())
     samples: dict[str, list[float]] = {}
     lo, hi = _ARENA_CLEARANCE_BAND
-    for arena_table, tasks in _ARENA_TABLE_MEASURE_TASKS.items():
+    arenas = _ARENA_TABLE_MEASURE_TASKS.items()
+    if only_arena is not None:
+        arenas = [(only_arena, _ARENA_TABLE_MEASURE_TASKS[only_arena])]
+    for arena_table, tasks in arenas:
         surf_z = arena_surface_z(arena_table)
+        subsets = _ARENA_TABLE_MEASURE_SUBSETS.get(arena_table, _DEFAULT_ARENA_SUBSETS)
+        seeds = _ARENA_TABLE_SEEDS_BY_ARENA.get(arena_table, _ARENA_TABLE_SEEDS)
         for task_rel in tasks:
             if task_rel not in avail:
                 print(f"# SKIP (not found): {task_rel}")
                 continue
             bddl = str(resolve_task_path(task_rel))
-            for seed in _ARENA_TABLE_SEEDS:
-                try:
-                    cfg = TaskConfig.from_bddl(bddl)
-                    random.seed(seed)
-                    scenario = compile_task_to_scenario(cfg, "position")
-                    scene, _ = scenario.generate(maxIterations=20000)
-                    env = make_env(scene, bddl_path=bddl)
-                    env.reset()
-                except Exception as exc:  # noqa: BLE001 — measurement noise, recorded
-                    print(f"# build failed {task_rel} [seed {seed}]: {exc}")
-                    continue
-                for o in _iter_scene_objects(scene):
-                    if is_scene_fixture(o) or not getattr(o, "graspable", True):
+            for subset in subsets:
+                for seed in seeds:
+                    try:
+                        cfg = TaskConfig.from_bddl(bddl)
+                        random.seed(seed)
+                        scenario = compile_task_to_scenario(cfg, subset)
+                        scene, _ = scenario.generate(maxIterations=20000)
+                        env = make_env(scene, bddl_path=bddl)
+                        env.reset()
+                    except Exception as exc:  # noqa: BLE001 — measurement noise, recorded
+                        print(f"# build failed {task_rel} [{subset} seed {seed}]: {exc}")
                         continue
-                    # Skip contained / fixture-supported children — their z
-                    # derives from a support relation, not the arena table.
-                    sp = getattr(o, "support_parent_name", "")
-                    if sp and "table" not in sp.lower():
-                        continue
-                    nm = resolve_object_name(o) or "?"
-                    cls = getattr(o, "asset_class", None)
-                    if not cls:
-                        continue
-                    st = env.get_object_state(nm)
-                    if st is None:
-                        continue
-                    clearance = float(st["position"][2]) - surf_z
-                    if not (lo <= clearance <= hi):
-                        continue
-                    samples.setdefault(f"{cls}|{arena_table}", []).append(round(clearance, 5))
-                env.close()
+                    # Score the scene the env ACTUALLY realized (a settle-reject
+                    # retry may have resampled), so the measured clearance matches
+                    # the pose pose_tolerance scores.
+                    eval_scene = getattr(env, "realized_scene", None) or scene
+                    for o in _iter_scene_objects(eval_scene):
+                        if is_scene_fixture(o) or not getattr(o, "graspable", True):
+                            continue
+                        # Skip contained / fixture-supported children — their z
+                        # derives from a support relation, not the arena table.
+                        # (The arena workspace itself — ``table``/``floor`` — is a
+                        # valid table-rest support, not a fixture stack.)
+                        sp = getattr(o, "support_parent_name", "")
+                        if sp and not any(s in sp.lower() for s in ("table", "floor")):
+                            continue
+                        nm = resolve_object_name(o) or "?"
+                        cls = getattr(o, "asset_class", None)
+                        if not cls:
+                            continue
+                        st = env.get_object_state(nm)
+                        if st is None:
+                            continue
+                        clearance = float(st["position"][2]) - surf_z
+                        if not (lo <= clearance <= hi):
+                            continue
+                        samples.setdefault(f"{cls}|{arena_table}", []).append(round(clearance, 5))
+                    env.close()
 
     rows = {k: round(_dominant_mode(v), 5) for k, v in sorted(samples.items())}
     print(f"\n# arena-table clearance rows ({len(rows)}):")
     for k, v in rows.items():
-        print(f"  {k:44} {v:.4f}  (n={len(samples[k])})")
+        vs = samples[k]
+        spread_mm = (max(vs) - min(vs)) * 1000.0
+        flag = "" if spread_mm <= _POSE_TOLERANCE * 1000.0 else "  <-- NON-DETERMINISTIC (>tol)"
+        print(f"  {k:44} {v:.4f}  (n={len(vs)}, spread={spread_mm:.2f}mm){flag}")
     return rows
 
 
@@ -1555,11 +1605,13 @@ def _merge_arena_table_rows(variants_path: pathlib.Path, rows: dict[str, float])
     return changed
 
 
-def _run_arena_tables_only() -> None:
+def _run_arena_tables_only(only_arena: str | None = None) -> None:
     """Measure ONLY per-(class, arena-table) clearances for non-reference arenas
     and corrective-merge them into ``spawn_clearances_variants.json``. Touches no
-    other data file and no reference-arena rows."""
-    rows = measure_arena_tables()
+    other data file and no reference-arena rows. ``only_arena`` restricts the
+    sweep to a single arena (e.g. ``floor``) so the other arenas' validated rows
+    stay byte-identical."""
+    rows = measure_arena_tables(only_arena=only_arena)
     vdest = pathlib.Path("src/libero_infinity/data/spawn_clearances_variants.json")
     _merge_arena_table_rows(vdest, rows)
 
@@ -2112,7 +2164,11 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     if "--arena-tables-only" in sys.argv:
-        _run_arena_tables_only()
+        _only_arena = None
+        for _a in sys.argv:
+            if _a.startswith("--arena="):
+                _only_arena = _a.split("=", 1)[1]
+        _run_arena_tables_only(only_arena=_only_arena)
         raise SystemExit(0)
 
     out = measure()

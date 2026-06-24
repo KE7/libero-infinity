@@ -220,7 +220,17 @@ _REFERENCE_ARENA_TABLE_TOP_Z: float = _LIBERO_ARENA_TABLE_TOP_Z["kitchen_table"]
 # shift can predict. Reference arenas (kitchen / default ``table``) and the study
 # table reproduce their settled z via ``arena_surface_z`` + the canonical
 # per-class clearance, so they are NOT threaded and stay byte-identical.
-PER_ARENA_TABLE_CLASSES: frozenset[str] = frozenset({"living_room_table", "coffee_table"})
+#
+# ``floor`` (the libero_object suite arena) is also threaded: its table top is
+# ~0.935 m below the kitchen reference, and — like the living-room table — the
+# canonical kitchen clearance does NOT transfer because the libero_object suite
+# authors several classes (ketchup, salad_dressing, milk, orange_juice, …) in a
+# DIFFERENT rest orientation than the kitchen, so the same class settles at a
+# different body-origin clearance. The per-(class, floor) settled clearance is
+# fully deterministic (0.00 mm spread across seeds; measured by
+# ``measure_arena_tables``), so emitting it reproduces the suite's settled z and
+# closes the G4 ``pose_tolerance`` z mismatch (RCA g4_task_pose_drift.md, Regime A).
+PER_ARENA_TABLE_CLASSES: frozenset[str] = frozenset({"living_room_table", "coffee_table", "floor"})
 
 
 def arena_surface_z(workspace_class: str | None) -> float:
