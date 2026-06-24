@@ -1467,6 +1467,16 @@ _ARENA_TABLE_MEASURE_TASKS: dict[str, list[str]] = {
 # own z). Both subsets only move/relabel the SAME table-resting movables.
 _ARENA_TABLE_MEASURE_SUBSETS: dict[str, tuple[str, ...]] = {
     "floor": ("position", "object"),
+    # living_room: the canonical (class, living_room_table) rows were measured
+    # ``position``-only, so the OOD-variant pool members the ``object`` axis
+    # substitutes onto the living-room task objects (e.g. bbq_sauce,
+    # macaroni_and_cheese, salad_dressing) were never measured — they fell back
+    # to the canonical per-class clearance, which is wrong on the ~0.49 m-lower
+    # living-room table (RCA g4_task_pose_drift.md §8). Sweeping ``object`` here
+    # captures each (variant, living_room_table) clearance the chooser emits for
+    # the object-axis subsets. Both subsets only move/relabel the SAME
+    # table-resting movables, so the existing canonical rows stay byte-identical.
+    "living_room_table": ("position", "object"),
 }
 _DEFAULT_ARENA_SUBSETS: tuple[str, ...] = ("position",)
 
@@ -1481,6 +1491,13 @@ _ARENA_TABLE_SEEDS = (0, 1, 2)
 # extra seeds harmless for the already-covered canonical classes.
 _ARENA_TABLE_SEEDS_BY_ARENA: dict[str, tuple[int, ...]] = {
     "floor": tuple(range(12)),
+    # The ``object`` axis draws one variant per seed, so the living-room sweep
+    # needs enough seeds for every pool member substituted onto the living-room
+    # task objects (bbq_sauce / macaroni_and_cheese / salad_dressing, …) to be
+    # instantiated and settled at least once. Dominant-mode aggregation makes the
+    # extra seeds harmless for the already-covered canonical classes (their rows
+    # stay byte-identical under the corrective merge).
+    "living_room_table": tuple(range(12)),
 }
 
 

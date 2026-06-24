@@ -32,6 +32,7 @@ from libero_infinity.asset_metadata import (
     is_distractor_fixture_seated,
     is_distractor_fixture_unstable,
     is_open_frame_fixture,
+    stack_offset_z,
     surface_spawn_z,
 )
 from libero_infinity.asset_metadata import (
@@ -568,6 +569,16 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
     lines = ["# Object declarations"]
     arena_z = _arena_surface_z(graph)
 
+    # Declared support/containment relations, keyed by child instance name, so a
+    # true movable→movable stack (bowl on cookies/ramekin/another bowl) can emit
+    # the MEASURED settled stack offset as its relative-z offset instead of the
+    # legacy 0.0 (RCA g4_task_pose_drift.md Regime B). Only genuine movable stacks
+    # (``not support_is_fixture`` and ``kind != "inside"``) qualify — fixture
+    # exterior supports and drawer/cabinet containment keep the 0.0 offset.
+    _rel_by_child: dict[str, _SupportRelation] = {}
+    for _rel in _collect_support_relations(plan, graph):
+        _rel_by_child.setdefault(_rel.child_name, _rel)
+
     # Asset variant sampling (object axis)
     seen_instances: set[str] = set()
     asset_var_map: dict[str, str] = {}  # instance_name -> scenic chooser var name
@@ -699,12 +710,30 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
             x_hi = pos_plan.x_envelope.hi
             y_lo = pos_plan.y_envelope.lo
             y_hi = pos_plan.y_envelope.hi
-            # Relative placement inherits z from the support (offset 0.0): a
-            # supported/contained child's z derives from its support relation,
-            # not the table surface, so the resolved spawn z does not apply here.
+            # Relative placement tracks the support's xy. For z: a TRUE
+            # movable→movable stack (bowl on cookies/ramekin/another bowl) settles
+            # at a MEASURED, deterministic height above the support's body origin
+            # (``_restack_supported_children`` lifts it to ``parent_top +
+            # clearance``); the renderer emits that measured offset so scenic_z ==
+            # settled_z (RCA Regime B). A drawer/cabinet containment, a
+            # fixture-exterior support, or an unmeasured pair keeps the legacy
+            # ``0.0`` offset (the child's z then derives from its support relation
+            # / LIBERO default), so every non-stack relative placement is
+            # byte-identical.
+            # Default literal ``0.0`` (byte-identical to the legacy emission) is
+            # kept for every non-stack / unmeasured relative placement; only a
+            # measured movable→movable stack pair substitutes its measured offset.
+            _z_off_expr = "0.0"
+            _rel = _rel_by_child.get(obj_name)
+            if _rel is not None and not _rel.support_is_fixture and _rel.kind != "inside":
+                _support_node = graph.get_node(pos_plan.support_name)
+                _parent_class = getattr(_support_node, "object_class", None)
+                _measured = stack_offset_z(obj_class, _parent_class)
+                if _measured is not None:
+                    _z_off_expr = f"{_measured:.4f}"
             pos_spec = (
                 f"at {support_var} offset by Vector(Range({x_lo:.4f}, {x_hi:.4f}), "
-                f"Range({y_lo:.4f}, {y_hi:.4f}), 0.0)"
+                f"Range({y_lo:.4f}, {y_hi:.4f}), {_z_off_expr})"
             )
         elif node.init_x is not None and node.init_y is not None:
             pos_spec = f"at Vector({node.init_x:.4f}, {node.init_y:.4f}, {spawn_z_expr})"

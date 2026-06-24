@@ -363,6 +363,54 @@ def is_measured(asset_class: str, surface_class: str | None = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Object-on-object stack offset (true movable→movable stacks)
+# ---------------------------------------------------------------------------
+#
+# A movable child stacked on a movable parent (a bowl on a cookies box / ramekin
+# / another bowl) is rendered ``at <parent> offset by Vector(.., .., dz)``. The
+# simulator settles the child and then ``_restack_supported_children`` lifts it
+# so its body origin sits at ``parent_AABB_top + spawn_clearance(child, parent)``
+# — a deterministic height ABOVE the parent's body origin. The renderer formerly
+# emitted ``dz = 0.0`` (the child inherited the parent's body-origin z), so its
+# pre-physics scenic z sat ~130–150 mm BELOW the settled pose and G4
+# ``pose_tolerance`` failed on z (RCA g4_task_pose_drift.md Regime B; the small
+# true-stack tail). This table stores the MEASURED settled offset
+# ``child_settled_origin_z − parent_settled_origin_z`` per ``"<child>|<parent>"``
+# pair (``scripts/measure_g4_residuals.py``); the renderer emits it as the
+# relative-z offset so the emitted scenic z equals the settled pose. It is a
+# RENDERER-prediction change only — the simulator already restacks to this height
+# independently (it preserves the LIBERO default z then lifts), so the physics
+# and every non-stacked object are byte-identical. A pair absent here keeps the
+# legacy ``0.0`` offset (no behaviour change), so the table is purely additive.
+def _load_stack_offsets() -> dict[str, float]:
+    try:
+        raw = pkgutil.get_data("libero_infinity", "data/stack_offsets.json")
+    except FileNotFoundError:
+        return {}
+    if raw is None:
+        return {}
+    data = json.loads(raw)
+    return {str(k): float(v) for k, v in data.get("stack_offsets", {}).items()}
+
+
+STACK_OFFSETS: dict[str, float] = _load_stack_offsets()
+
+
+def stack_offset_z(child_class: str | None, parent_class: str | None) -> float | None:
+    """Measured settled body-origin offset (m) of movable ``child_class`` stacked on
+    movable ``parent_class``: ``child_settled_z − parent_settled_z``.
+
+    Returns ``None`` when the pair is unmeasured (the renderer then keeps the
+    legacy ``0.0`` relative-z offset, so behaviour is unchanged). This is the
+    SAME deterministic height the simulator's ``_restack_supported_children``
+    lifts the child to, so emitting it makes the renderer's pre-physics scenic z
+    equal the settled MuJoCo pose for a true object-on-object stack."""
+    if not child_class or not parent_class:
+        return None
+    return STACK_OFFSETS.get(_variant_key(child_class, parent_class))
+
+
+# ---------------------------------------------------------------------------
 # Fixture geometry — measured footprints and top-surface heights
 # ---------------------------------------------------------------------------
 #
