@@ -10,11 +10,17 @@
       "support_rests": {
         "on_surface|closed": {
           "akita_black_bowl": 0.0784
+        },
+        "inside|open": {
+          "akita_black_bowl": 0.3064
         }
       },
       "measured": {
         "on_surface|closed": {
           "akita_black_bowl": {"n": 12, "rest_z_mean": 0.8984, "spread_mm": 0.0, "stable": "12/12"}
+        },
+        "inside|open": {
+          "akita_black_bowl": {"n": 6, "rest_z_mean": 1.1264, "spread_mm": 0.0, "stable": "6/6"}
         }
       }
     }

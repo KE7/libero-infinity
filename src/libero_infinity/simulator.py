@@ -1107,7 +1107,22 @@ class LIBEROSimulation(Simulation):
                 getattr(obj, "cabinet_drawer_state", "") or None,
                 getattr(obj, "asset_class", "_default"),
             )
-            if _hf_z is not None:
+            # CONTAINMENT z is authored, not surface-computed: a bowl placed IN an
+            # open cabinet drawer rests on the drawer floor at a rim-metastable
+            # height. Injecting AT that measured rest lands the bowl on the inner
+            # knife-edge and it slips ~15 mm off (or, a few mm lower, drops to a
+            # second ~1.06 rest) — see rca/g4_cabinet_heightfield.md §5.2. The
+            # LIBERO default pose injects the bowl from ABOVE the rim, the ONLY
+            # reliable path to the true deterministic rest (1.1264, cross-seed
+            # spread 0 mm). So for CONTAINED objects we keep the authored default-z
+            # even when a support heightfield exists; the renderer emits that SAME
+            # measured rest as its relative z-offset, so scenic_z == settled_z. The
+            # heightfield still drives every ON_SURFACE placement (e.g. the shipped
+            # closed-drawer top_side rest) unchanged.
+            _use_default_for_contained = (
+                preserve_default_z and is_contained and libero_name in default_pose
+            )
+            if _hf_z is not None and not _use_default_for_contained:
                 pos[2] = _hf_z
                 table_spawned_names.add(libero_name)
             elif (

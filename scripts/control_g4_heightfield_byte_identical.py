@@ -98,18 +98,25 @@ def main():
                     if la == lh:
                         continue
                     diffs += 1
-                    # A legal diff is a wooden_cabinet placement gaining the
-                    # closed on_surface heightfield (its z drops to 0.898 and it
-                    # gains the two relation/state specifiers). Keyed on the
-                    # cabinet surface class + the new specifiers so it matches BOTH
-                    # the position-literal line (asset_class "akita_black_bowl")
+                    # A legal diff is a wooden_cabinet placement gaining a COVERED
+                    # heightfield tuple: either the closed on_surface top_side rest
+                    # (z drops to 0.898) or the OPEN in-drawer rest (the relative
+                    # z-offset becomes 0.3064 so the in-drawer bowl seats at 1.126 —
+                    # RCA §5.2 FIX2). Both gain the relation/state specifiers. Keyed
+                    # on the cabinet surface class + the new specifiers so it matches
+                    # BOTH the position-literal line (asset_class "akita_black_bowl")
                     # and the object-axis line (asset_class _chosen_X[0], z
                     # _chosen_X[1]). ANY differing line WITHOUT the cabinet surface
                     # class is a real regression (no non-cabinet object may change).
-                    legal = (
-                        'support_surface_class "wooden_cabinet"' in la
-                        and 'support_relation_kind "on_surface"' in la
-                        and 'cabinet_drawer_state "closed"' in la
+                    legal = 'support_surface_class "wooden_cabinet"' in la and (
+                        (
+                            'support_relation_kind "on_surface"' in la
+                            and 'cabinet_drawer_state "closed"' in la
+                        )
+                        or (
+                            'support_relation_kind "inside"' in la
+                            and 'cabinet_drawer_state "open"' in la
+                        )
                     )
                     tag = "LEGAL(cabinet)" if legal else "ILLEGAL-REGRESSION"
                     if not legal:

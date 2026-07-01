@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from libero_infinity.asset_metadata import (
     _FIXTURE_DIMS_FALLBACK,
     PER_ARENA_TABLE_CLASSES,
+    TABLE_SURFACE_Z,
     arena_surface_z,
     cradle_rest,
     cradle_x_half,
@@ -825,6 +826,34 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
                 _measured = stack_offset_z(obj_class, _parent_class)
                 if _measured is not None:
                     _z_off_expr = f"{_measured:.4f}"
+            elif _rel is not None and _rel.support_is_fixture and _rel.kind == "inside":
+                # Fixture CONTAINMENT (e.g. a bowl IN an open cabinet drawer).
+                # The object is emitted relative to the fixture body, which the
+                # renderer declares at the scenic ``TABLE_Z`` constant, and the
+                # relative path historically defaulted the z-offset to ``0.0`` —
+                # so the object's scenic z (== TABLE_Z) sat ~0.31 m BELOW its
+                # deterministic MuJoCo rest on the drawer floor and pose_tolerance
+                # failed on the z-frame mismatch (RCA g4_cabinet_heightfield.md
+                # §5.2). When the support heightfield covers this
+                # (fixture, relation=inside, drawer_state, class) tuple, emit the
+                # measured rest as the relative z-offset ``rest_z − TABLE_Z`` so
+                # the emitted scenic z equals the settled pose. Gated on the
+                # heightfield returning a value for the CANONICAL class, so every
+                # uncovered fixture-containment (other drawers, microwaves, …)
+                # keeps the byte-identical ``0.0`` offset — the same no-regression
+                # guarantee the absolute path already has.
+                _rest_in = heightfield_spawn_z(
+                    arena_z, surface_class, relation_kind, drawer_state, obj_class
+                )
+                if _rest_in is not None:
+                    if object_axis_variants and scenic_class:
+                        # object axis active: the (class, z) chooser already
+                        # carries each sampled variant's resolved absolute rest as
+                        # element [1]; the relative offset is that rest minus the
+                        # fixture's TABLE_Z, so the chosen variant seats correctly.
+                        _z_off_expr = f"({scenic_class}[1] - {TABLE_SURFACE_Z:.4f})"
+                    else:
+                        _z_off_expr = f"{_rest_in - TABLE_SURFACE_Z:.4f}"
             pos_spec = (
                 f"at {support_var} offset by Vector(Range({x_lo:.4f}, {x_hi:.4f}), "
                 f"Range({y_lo:.4f}, {y_hi:.4f}), {_z_off_expr})"
