@@ -53,9 +53,34 @@
         "method": "derived(rest+table)"
       }
     },
-    "n_arena_table_rows": 23
+    "n_arena_table_rows": 23,
+    "fixture_top_fixedpoint_rows": {
+      "description": "Task-object-on-fixture-EXTERIOR-top rows measured by an ITERATED FIXED-POINT (converged-rest) settle (scripts/measure_g4_fixture_fixedpoint.py), RCA g4_remaining_arenas.md §3b closure. These task objects are placed at their BDDL region xy on a fixture top whose analytic AABB top_z (highest geom) sits far ABOVE the real rest face; the object is injected too high and falls ~48-49mm per 50-step settle, so NO single analytic clearance is a fixed point of the validation settle. The fixed point z* satisfies settle50(inject at z*) == z*; it is found by iterating z_{n+1}=settle50(z_n) from the analytic z until |Δz|<1mm. clearance = z* - TABLE_Z (arena_z==TABLE_Z==0.82 for the kitchen/spatial reference arenas these fixtures occupy). Both objects fall STRAIGHT DOWN (xy drift <0.15mm — no roll-off) to a deterministic rest (spread ≤1.5mm across 6 seeds × all init tasks/instances). Purely additive: rule 1 of asset_metadata.spawn_clearance now supersedes the rule-2 analytic for these two pairs only; every other pair is byte-identical.",
+      "white_bowl|microwave": {
+        "value": 0.0794,
+        "z_star": 0.8994,
+        "analytic_z": 1.20962,
+        "gap_mm": 310.2,
+        "n": 18,
+        "spread_mm": 0.0,
+        "method": "iterated-fixed-point",
+        "tasks": 3
+      },
+      "akita_black_bowl|flat_stove": {
+        "value": 0.0784,
+        "z_star": 0.8984,
+        "analytic_z": 1.05596,
+        "gap_mm": 157.5,
+        "n": 18,
+        "spread_mm": 1.5,
+        "method": "iterated-fixed-point",
+        "tasks": 3
+      },
+      "FLAGGED_akita_black_bowl|wooden_cabinet": "NON-CONVERGENT: the wooden_cabinet top has a NON-UNIFORM collision surface — a solid edge region where akita_black_bowl rests at z*≈1.126 (clear 0.306) and visual-gap regions where it falls through to z*≈0.898 (clear 0.078). The top_drawer-task placement is genuinely metastable across seeds (0.898↔1.119, spread 221mm). No single scalar clearance is a fixed point across the sampled xy region; forcing the dominant 0.078 would inject the solid-region bowl INSIDE the cabinet body (contact-explosion regression risk). Per the no-force guard this pair is FLAGGED, not recorded — it needs an xy-aware rest surface (out of scope for scalar Option-2)."
+    }
   },
   "clearances": {
+    "akita_black_bowl|flat_stove": 0.0784,
     "akita_black_bowl|kitchen_table": 0.10094,
     "akita_black_bowl|living_room_table": 0.1048,
     "akita_black_bowl|table": 0.10094,
@@ -144,6 +169,7 @@
     "tomato_sauce|living_room_table": 0.14516,
     "white_bowl|kitchen_table": 0.10162,
     "white_bowl|living_room_table": 0.10549,
+    "white_bowl|microwave": 0.0794,
     "white_bowl|table": 0.10162,
     "white_yellow_mug|kitchen_table": 0.10017,
     "white_yellow_mug|living_room_table": 0.10622,
