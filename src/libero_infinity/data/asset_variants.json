@@ -204,7 +204,7 @@
   },
   "dimensions": {
     "_comment": "Approximate bounding box [width, length, height] in metres for clearance calculations",
-    "akita_black_bowl": [0.10, 0.10, 0.06],
+    "akita_black_bowl": [0.107, 0.107, 0.06],
     "white_bowl": [0.10, 0.10, 0.06],
     "plate": [0.20, 0.20, 0.02],
     "glazed_rim_porcelain_ramekin": [0.08, 0.08, 0.05],

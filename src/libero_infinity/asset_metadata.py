@@ -355,6 +355,145 @@ def surface_spawn_z(
     return float(surface_z) + spawn_clearance(asset_class, surface_class, distractor=distractor)
 
 
+# ---------------------------------------------------------------------------
+# XY / drawer-state-aware support-surface heightfield  (g4 §6 cabinet residual)
+# ---------------------------------------------------------------------------
+#
+# A scalar per-``<class>|<surface>`` clearance assumes ONE settled rest per
+# (movable, support) pair. That breaks for the ``wooden_cabinet`` top, whose
+# realized support is NOT a single scalar (RCA g4_fixed_point_settle.md §2):
+#
+#   * The BDDL ``top_side`` region lands ~0.2–0.35 m in +y OFF the cabinet's
+#     collision-less body, so a bowl placed ``On`` it FALLS to a low rest (the
+#     table-level ~0.898, clearance ≈ 0.078 above the arena surface) — NOT the
+#     ~1.229 analytic on-fixture-top z the scalar table emits.
+#   * A bowl placed ``In`` the top drawer (``top_region``) when the drawer is
+#     OPEN rests on the drawer floor at ~1.126 (clearance ≈ 0.306).
+#
+# So the SAME ``akita_black_bowl|wooden_cabinet`` scalar key is genuinely
+# tri-modal across the tasks that share it (0.898 / 0.917 / 1.126, span 228 mm);
+# no single clearance is a fixed point of the validation settle. The principled
+# closure (the funded §2d-option-1 architecture change) is a MEASURED per-fixture
+# support-surface table keyed additionally by the placement RELATION
+# (``on_surface`` vs ``inside``) and the fixture's DRAWER STATE (``open`` /
+# ``closed``) — both known at emission time (the BDDL ``:init`` articulation
+# predicate and the support-edge label). The renderer and the simulator resolve
+# the SAME measured rest through :func:`heightfield_spawn_z`, so the emitted
+# spawn z equals the settled MuJoCo pose and ``pose_tolerance`` passes WITHOUT
+# any gate change.
+#
+# The rest is stored (in ``data/fixture_heightfields.json``) as a per-(relation,
+# state, class) CLEARANCE above the arena table surface (``rest_z − arena_z``,
+# the SAME frame the scalar clearances use), measured by SETTLE-FROM-ABOVE only
+# (``scripts/measure_g4_cabinet_heightfield.py``) — never iterate-from-analytic,
+# which TUNNELS the bowl through the cabinet's thin top panel and reports a
+# spurious rest (RCA §1). Only DETERMINISTIC + STABLE (cross-seed spread < 5 mm,
+# 50-step-settle-from-rest holds < 5 mm) modes are recorded; genuinely metastable
+# placements (a bowl balanced on the open-drawer knife-edge) are deliberately
+# ABSENT and fall through to the unchanged scalar path (byte-identical), so this
+# table is purely ADDITIVE: a (fixture, relation, state, class) with no entry
+# behaves EXACTLY as today.
+
+
+def _load_fixture_heightfields() -> dict[str, dict]:
+    try:
+        raw = pkgutil.get_data("libero_infinity", "data/fixture_heightfields.json")
+    except FileNotFoundError:
+        return {}
+    if raw is None:
+        return {}
+    data = json.loads(raw)
+    out: dict[str, dict] = {}
+    for k, v in data.get("fixtures", {}).items():
+        if isinstance(v, dict):
+            out[str(k)] = v
+    return out
+
+
+FIXTURE_HEIGHTFIELDS: dict[str, dict] = _load_fixture_heightfields()
+
+# Relation labels the heightfield is keyed by — MUST match the renderer's
+# ``_SupportRelation.kind`` vocabulary and the simulator's containment flag.
+_HEIGHTFIELD_RELATIONS: frozenset[str] = frozenset({"on_surface", "inside"})
+_HEIGHTFIELD_STATES: frozenset[str] = frozenset({"open", "closed"})
+
+
+def _heightfield_key(relation_kind: str, drawer_state: str) -> str:
+    return f"{relation_kind}|{drawer_state}"
+
+
+def normalize_drawer_state(state_kind: str | None) -> str | None:
+    """Map a raw articulation ``state_kind`` (``Open``/``Close``/``open``/…) to the
+    heightfield's ``open``/``closed`` vocabulary. Returns ``None`` for a fixture
+    with no articulation (so the heightfield is never consulted for it)."""
+    if not state_kind:
+        return None
+    s = state_kind.strip().lower()
+    if s in ("open",):
+        return "open"
+    if s in ("close", "closed"):
+        return "closed"
+    return None
+
+
+def has_fixture_heightfield(fixture_class: str | None) -> bool:
+    """True iff ``fixture_class`` carries a measured support-surface heightfield."""
+    geom = FIXTURE_HEIGHTFIELDS.get(fixture_class or "")
+    return bool(geom and isinstance(geom.get("support_rests"), dict))
+
+
+def fixture_support_clearance(
+    fixture_class: str | None,
+    relation_kind: str | None,
+    drawer_state: str | None,
+    asset_class: str | None,
+) -> float | None:
+    """Measured rest clearance (m, above the arena surface) for ``asset_class``
+    placed via ``relation_kind`` on ``fixture_class`` in ``drawer_state``.
+
+    Returns ``None`` — the byte-identical fall-through — whenever the fixture has
+    no heightfield, the relation/state is unknown or not one of the measured
+    keys, or the specific ``asset_class`` was not measured for that (relation,
+    state). The caller then keeps the existing scalar :func:`surface_spawn_z`.
+    """
+    if not relation_kind or not drawer_state or not asset_class:
+        return None
+    geom = FIXTURE_HEIGHTFIELDS.get(fixture_class or "")
+    if not geom:
+        return None
+    rests = geom.get("support_rests")
+    if not isinstance(rests, dict):
+        return None
+    per_class = rests.get(_heightfield_key(relation_kind, drawer_state))
+    if not isinstance(per_class, dict):
+        return None
+    val = per_class.get(asset_class)
+    if val is None:
+        return None
+    return max(float(val), _MIN_CLEARANCE)
+
+
+def heightfield_spawn_z(
+    surface_z: float,
+    fixture_class: str | None,
+    relation_kind: str | None,
+    drawer_state: str | None,
+    asset_class: str | None,
+) -> float | None:
+    """XY/drawer-state-aware spawn z, or ``None`` to defer to :func:`surface_spawn_z`.
+
+    ``surface_z`` is the arena table-surface constant (``arena_surface_z``); the
+    measured clearance folds in the full gap to the object's true settled rest on
+    THIS fixture in THIS drawer state, so ``surface_z + clearance`` equals the
+    settled MuJoCo pose. ``None`` (no measured entry) means the object is resolved
+    by the unchanged scalar path — the hard no-regression guarantee for every
+    fixture/relation/state/class the heightfield does not cover."""
+    clearance = fixture_support_clearance(fixture_class, relation_kind, drawer_state, asset_class)
+    if clearance is None:
+        return None
+    return float(surface_z) + clearance
+
+
 def is_measured(asset_class: str, surface_class: str | None = None) -> bool:
     """True iff ``asset_class`` (on ``surface_class``) has a measured clearance."""
     if surface_class is not None and _variant_key(asset_class, surface_class) in VARIANT_CLEARANCES:
