@@ -1150,8 +1150,67 @@ class LIBEROSimulation(Simulation):
             # Run settling steps so objects come to rest on the table surface
             # before the episode begins.  Re-zero velocities afterwards so
             # the policy starts from a quiescent state.
-            for _ in range(50):
+            # Resolve body ids for the injected objects once, so we can measure
+            # a CONVERGENCE signal over the last few settle steps below.
+            _settle_bids: dict[str, int] = {}
+            for _vname in injected_targets:
+                for _cand in (_vname, _vname + "_main"):
+                    try:
+                        _settle_bids[_vname] = mjmodel.body(_cand).id
+                        break
+                    except Exception:  # noqa: BLE001 — body named either way
+                        continue
+
+            # Instantaneous end-of-settle velocity is a POOR "at rest" signal on
+            # this path: a resting object in steady contact reads a large, frame-
+            # dependent spatial velocity (measured: clean strict-passing cans read
+            # ~0.8 m/s while their NET displacement is ~0). A short-window
+            # displacement has the same problem — a persistent contact vibration
+            # floor (~9 mm over 5 steps for tall/large objects) swamps genuine net
+            # motion. So we measure the NET DRIFT of the VIBRATION-AVERAGED
+            # position over the settle tail: the mean body position over the first
+            # half of the last ``_CONV_WINDOW`` steps vs the mean over the second
+            # half. A converged object (a true fixed point) has ~0 net drift even
+            # while vibrating; one still mid-settle (a transient that has not
+            # reached its rest) drifts. Angular drift uses the orientation at each
+            # half's midpoint. Captured WITHIN the existing 50 steps — no extra
+            # dynamics — so the settled pose the rest of setup() scores is
+            # byte-identical to before. The G4 pose_tolerance alt-rest path reads
+            # these via ``get_object_state`` to require an object be genuinely
+            # converged before admitting a non-exact-pose settle as a valid
+            # alternate rest (see invariants/consistency.py).
+            _CONV_WINDOW = 10
+            _pos_hist: dict[str, list[np.ndarray]] = {n: [] for n in _settle_bids}
+            _quat_hist: dict[str, list[np.ndarray]] = {n: [] for n in _settle_bids}
+            for _step in range(50):
+                if _step >= 50 - _CONV_WINDOW:
+                    for _vname, _bid in _settle_bids.items():
+                        _pos_hist[_vname].append(np.array(mjdata.xpos[_bid], dtype=float))
+                        _quat_hist[_vname].append(np.array(mjdata.xquat[_bid], dtype=float))
                 mujoco.mj_step(mjmodel, mjdata)
+
+            _half = _CONV_WINDOW // 2
+            self._settle_convergence: dict[str, tuple[float, float]] = {}
+            for _vname in _settle_bids:
+                _ph = _pos_hist[_vname]
+                _qh = _quat_hist[_vname]
+                if len(_ph) < _CONV_WINDOW:
+                    continue
+                try:
+                    _mean1 = np.mean(np.stack(_ph[:_half]), axis=0)
+                    _mean2 = np.mean(np.stack(_ph[_half:]), axis=0)
+                    _lin = float(np.linalg.norm(_mean2 - _mean1))  # net drift (m)
+                    # Angular net drift: orientation at each half's midpoint.
+                    _qa = _qh[_half // 2]
+                    _qb = _qh[_half + _half // 2]
+                    _dot = float(np.clip(abs(np.dot(_qa, _qb)), -1.0, 1.0))
+                    _ang = float(2.0 * np.degrees(np.arccos(_dot)))  # net drift (deg)
+                    self._settle_convergence[_vname] = (_lin, _ang)
+                except Exception:  # noqa: BLE001 — never let telemetry break setup
+                    continue
+
+            # Re-zero velocities afterwards so the policy starts from a quiescent
+            # state.
             mjdata.qvel[:] = 0
             mujoco.mj_forward(mjmodel, mjdata)
             # Restrict the re-stack lift to genuine stack relationships
