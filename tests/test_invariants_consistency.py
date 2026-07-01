@@ -152,6 +152,218 @@ def test_assert_consistency_detects_class_mismatch():
 
 
 # ---------------------------------------------------------------------------
+# Alt-rest acceptance (valid alternate physical rest) — the g4 scoring change
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ObjExt:
+    """Scene object double carrying the LIBEROObject bbox extents the alt-rest
+    path reads (width/length/height in metres)."""
+
+    name: str
+    object_class: str
+    position: tuple[float, float, float]
+    orientation: tuple[float, float, float, float] | None
+    width: float
+    length: float
+    height: float
+
+
+def _quat_about_x(deg: float) -> tuple[float, float, float, float]:
+    half = math.radians(deg) / 2.0
+    return (math.cos(half), math.sin(half), 0.0, 0.0)
+
+
+# Canonical tall-can-like object: emitted upright at z=0.10, 6x6x12 cm.
+def _tall_obj(pos=(0.0, 0.0, 0.10), ori=None):
+    return _ObjExt(
+        "soup_1",
+        "alphabet_soup",
+        position=pos,
+        orientation=ori if ori is not None else _quat_about_z(0.0),
+        width=0.06,
+        length=0.06,
+        height=0.12,
+    )
+
+
+def _rest_state(pos, ori=None, *, lin=1e-4, ang=1e-2, cls="alphabet_soup"):
+    """Env state double. ``lin``/``ang`` are the end-of-settle convergence
+    displacements (m over window / deg over window) — small ⇒ converged."""
+    st = {
+        "position": pos,
+        "orientation": ori if ori is not None else _quat_about_z(0.0),
+        "class": cls,
+        "settle_conv_lin": lin,
+        "settle_conv_ang": ang,
+    }
+    return st
+
+
+def test_altrest_accepts_valid_alternate_rest():
+    """A converged, upright, on-support, in-footprint settle that MISSES the
+    strict 5mm gate (12mm xy slide) is admitted as a valid alternate rest."""
+    o = _tall_obj()
+    st = _rest_state((0.012, 0.0, 0.10))  # 12mm slide > 5mm strict, dz 0
+    r = assert_pose_tolerance(o, st)
+    assert r.passed is True
+    assert r.payload["strict_pass"] is False
+    assert r.payload["alt_rest_pass"] is True
+    assert r.payload["accept_mode"] == "alt_rest"
+    assert r.payload["position_error"] > 5e-3
+
+
+def test_altrest_rejects_fall_through():
+    """Object dropped far below its emitted z (fell through / off support)."""
+    o = _tall_obj()
+    st = _rest_state((0.0, 0.0, 0.10 - 0.05))  # dz 50mm > 0.25*0.12=30mm
+    r = assert_pose_tolerance(o, st)
+    assert r.passed is False
+    assert r.payload["alt_rest_reject_reason"] == "off_support"
+
+
+def test_altrest_rejects_out_of_region():
+    """Horizontal drift beyond the object's own footprint (left its region)."""
+    o = _tall_obj()
+    st = _rest_state((0.04, 0.0, 0.10))  # 40mm > min(0.03, 0.05)=30mm bound
+    r = assert_pose_tolerance(o, st)
+    assert r.passed is False
+    assert r.payload["alt_rest_reject_reason"] == "out_of_region"
+
+
+def test_altrest_rejects_tipped():
+    """A 30deg tip is not upright — rejected even though at rest & in place."""
+    o = _tall_obj()
+    st = _rest_state((0.0, 0.0, 0.10), ori=_quat_about_x(30.0))
+    r = assert_pose_tolerance(o, st)
+    assert r.passed is False
+    assert r.payload["alt_rest_reject_reason"] == "tipped"
+
+
+def test_altrest_rejects_not_converged():
+    """A small valid slide but large end-of-settle displacement (still moving
+    when the settle stopped ⇒ not a fixed point)."""
+    o = _tall_obj()
+    st = _rest_state((0.012, 0.0, 0.10), lin=0.5, ang=5.0)
+    r = assert_pose_tolerance(o, st)
+    assert r.passed is False
+    assert r.payload["alt_rest_reject_reason"] == "not_converged"
+
+
+def test_altrest_declines_without_convergence_signal():
+    """No convergence telemetry ⇒ cannot confirm at-rest ⇒ decline (strict
+    only). Keeps the gate fail-safe on envs that don't expose the signal."""
+    o = _tall_obj()
+    st = {
+        "position": (0.012, 0.0, 0.10),
+        "orientation": _quat_about_z(0.0),
+        "class": "alphabet_soup",
+    }
+    r = assert_pose_tolerance(o, st)
+    assert r.passed is False
+    assert r.payload["alt_rest_reject_reason"] == "no_convergence_signal"
+
+
+def test_altrest_declines_without_extents():
+    """Object whose class is not in the registry AND has no bbox attrs ⇒ no
+    on-support/in-region bound ⇒ decline to the strict gate."""
+    o = _Obj(
+        "soup_1",
+        "not_a_real_asset_class_zzz",
+        position=(0, 0, 0.10),
+        orientation=_quat_about_z(0.0),
+    )
+    st = _rest_state((0.012, 0.0, 0.10))
+    r = assert_pose_tolerance(o, st)
+    assert r.passed is False
+    assert r.payload["alt_rest_reject_reason"] == "no_extents"
+
+
+def test_altrest_is_net_add_strict_still_passes():
+    """Enabling alt-rest never flips a strict-passing object — accept_mode strict."""
+    o = _tall_obj()
+    st = _rest_state((0.001, 0.0, 0.10))  # 1mm, within strict
+    r = assert_pose_tolerance(o, st, accept_alt_rest=True)
+    assert r.passed is True
+    assert r.payload["accept_mode"] == "strict"
+    assert r.payload["strict_pass"] is True
+
+
+def test_accept_alt_rest_false_recovers_legacy_strict():
+    """accept_alt_rest=False reproduces the exact legacy strict-only gate: a
+    valid alternate rest that misses 5mm FAILS (used by the A/B OLD arm)."""
+    o = _tall_obj()
+    st = _rest_state((0.012, 0.0, 0.10))
+    r_old = assert_pose_tolerance(o, st, accept_alt_rest=False)
+    r_new = assert_pose_tolerance(o, st, accept_alt_rest=True)
+    assert r_old.passed is False  # OLD: strict only
+    assert r_new.passed is True  # NEW: admitted as alt-rest
+    assert r_old.payload["alt_rest_pass"] is False
+
+
+def test_altrest_wrong_support_climb_rejected():
+    """A large upward z jump (climbed onto a neighbour) is off-support too."""
+    o = _tall_obj()
+    st = _rest_state((0.0, 0.0, 0.10 + 0.05))  # +50mm > 30mm band
+    r = assert_pose_tolerance(o, st)
+    assert r.passed is False
+    assert r.payload["alt_rest_reject_reason"] == "off_support"
+
+
+def test_altrest_upright_uses_canonical_when_scenic_orientation_missing():
+    """Real LIBEROObjects expose a non-coercible Scenic orientation (scenic-side
+    rot is None), so the alt-rest UPRIGHT check must use env-settled-vs-canonical.
+    A 30° tip from canonical is rejected even with the Scenic orientation absent."""
+    o = _ObjExt(
+        "soup_1",
+        "alphabet_soup",
+        position=(0, 0, 0.10),
+        orientation=None,
+        width=0.06,
+        length=0.06,
+        height=0.12,
+    )
+    st = {
+        "position": (0.012, 0.0, 0.10),  # in-region slide ⇒ strict fails on pos
+        "orientation": _quat_about_x(30.0),  # settled 30° from canonical
+        "canonical_orientation": _quat_about_z(0.0),  # canonical upright
+        "class": "alphabet_soup",
+        "settle_conv_lin": 1e-4,
+        "settle_conv_ang": 1e-2,
+    }
+    r = assert_pose_tolerance(o, st)
+    assert r.passed is False
+    assert r.payload["alt_rest_reject_reason"] == "tipped"
+    assert r.payload["upright_error_deg"] == pytest.approx(30.0, abs=1e-3)
+
+
+def test_altrest_accepts_via_canonical_upright_with_no_scenic_orientation():
+    """The mirror case: Scenic orientation absent, env settled == canonical
+    (upright), converged, in-region ⇒ admitted as a valid alternate rest."""
+    o = _ObjExt(
+        "soup_1",
+        "alphabet_soup",
+        position=(0, 0, 0.10),
+        orientation=None,
+        width=0.06,
+        length=0.06,
+        height=0.12,
+    )
+    st = {
+        "position": (0.012, 0.0, 0.10),
+        "orientation": _quat_about_z(0.0),
+        "canonical_orientation": _quat_about_z(0.0),
+        "class": "alphabet_soup",
+        "settle_conv_lin": 1e-4,
+        "settle_conv_ang": 1e-2,
+    }
+    r = assert_pose_tolerance(o, st)
+    assert r.passed is True
+    assert r.payload["accept_mode"] == "alt_rest"
+
+
+# ---------------------------------------------------------------------------
 # LIBEROScenicEnv.get_object_state — RCA Finding 3 env-side accessor
 # ---------------------------------------------------------------------------
 

@@ -406,7 +406,47 @@ class LIBEROScenicEnv(gym.Env):
             return None
         cls_map = getattr(self, "_effective_obj_classes", {}) or {}
         cls = cls_map.get(name)
-        return {"position": position, "orientation": orientation, "class": cls}
+        state: dict[str, Any] = {
+            "position": position,
+            "orientation": orientation,
+            "class": cls,
+        }
+        # End-of-settle CONVERGENCE signal captured by the simulator over the
+        # last few steps of its settle (linear displacement in metres, angular
+        # in degrees). This is the genuine "did the object converge to a fixed
+        # point?" signal the G4 pose_tolerance alt-rest path needs — a live qvel
+        # read after reset is vacuously ~0 (velocities are zeroed), and the
+        # instantaneous end-of-settle spatial velocity is a frame-dependent
+        # artifact for a body in steady contact. Absent for objects that never
+        # went through the settle path (no injection); the scorer then declines
+        # the alt-rest path and falls back to the strict gate (fail-safe).
+        settle_conv = getattr(self._sim, "_settle_convergence", None) or {}
+        sc = settle_conv.get(name)
+        if sc is not None:
+            state["settle_conv_lin"] = float(sc[0])
+            state["settle_conv_ang"] = float(sc[1])
+        # Canonical (as-placed) orientation, so the alt-rest path can measure
+        # "upright" as env-settled vs canonical — the Scenic object's own
+        # orientation attribute does not coerce to a quaternion for real
+        # LIBEROObjects, so the strict scenic-vs-env rotation term is vacuous
+        # there and cannot be relied on to detect a tip. ``_canonical_rot`` is
+        # stored xyzw (scipy convention); expose it as wxyz (MuJoCo convention,
+        # what ``_coerce_quat`` expects). Skip the 3x3-matrix fallback form.
+        canon = getattr(self._sim, "_canonical_rot", None) or {}
+        cq = canon.get(name)
+        if cq is not None:
+            try:
+                cq = list(cq)
+                if len(cq) == 4:  # xyzw → wxyz
+                    state["canonical_orientation"] = (
+                        float(cq[3]),
+                        float(cq[0]),
+                        float(cq[1]),
+                        float(cq[2]),
+                    )
+            except (TypeError, ValueError):
+                pass
+        return state
 
     def render(self, mode: str = "rgb_array") -> np.ndarray | None:
         """Return the current agentview image.
