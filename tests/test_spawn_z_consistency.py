@@ -292,12 +292,38 @@ def test_living_room_rows_resolve_in_table_band() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_fixture_task_residual_not_force_fitted() -> None:
-    """The non-convergent task-object-on-fixture pairs must NOT carry an invented
-    clearance row (they are flagged residuals, not forced)."""
-    from libero_infinity.asset_metadata import VARIANT_CLEARANCES
+def test_fixture_task_residual_fixed_point_measured_or_flagged() -> None:
+    """Task-object-on-fixture-EXTERIOR-top pairs: the ones with a genuine ITERATED
+    FIXED-POINT (converged, deterministic) rest carry their MEASURED clearance;
+    the genuinely non-convergent one stays FLAGGED (no invented row).
 
-    assert "white_bowl|microwave" not in VARIANT_CLEARANCES
+    The analytic on-fixture spawn z uses the fixture AABB top (highest geom), which
+    over-estimates the real rest face, so the object falls ~48-64 mm per 50-step
+    settle. ``scripts/measure_g4_fixture_fixedpoint.py`` iterates the settle map to
+    its fixed point z*; clearance = z* - TABLE_SURFACE_Z. white_bowl|microwave and
+    akita_black_bowl|flat_stove converge deterministically (spread <=1.5 mm across
+    6 seeds × all init tasks) → recorded. akita_black_bowl|wooden_cabinet is bimodal
+    (a solid top-edge region rests ~1.126, visual-gap regions fall to ~0.898, and
+    one placement is metastable across seeds) → no single fixed point → FLAGGED, per
+    the no-force guard.
+    """
+    from libero_infinity.asset_metadata import TABLE_SURFACE_Z, VARIANT_CLEARANCES
+
+    # Measured, deterministic fixed points — recorded so scenic_z == settled z*.
+    measured = {
+        "white_bowl|microwave": 0.8994,  # z*
+        "akita_black_bowl|flat_stove": 0.8984,  # z*
+    }
+    for key, z_star in measured.items():
+        assert key in VARIANT_CLEARANCES, f"{key} fixed-point row missing"
+        clear = VARIANT_CLEARANCES[key]
+        expect = z_star - TABLE_SURFACE_Z
+        # The stored clearance must equal the measured fixed-point clearance (not an
+        # invented value): within the 5 mm pose gate of z* - TABLE_Z.
+        assert abs(clear - expect) <= 0.005, f"{key}={clear:.4f} not the measured {expect:.4f}"
+
+    # Genuinely non-convergent (xy-dependent bimodal) — must stay flagged, no row.
+    assert "akita_black_bowl|wooden_cabinet" not in VARIANT_CLEARANCES
 
 
 # ---------------------------------------------------------------------------
