@@ -140,6 +140,18 @@ class LIBEROObject(Object):
         workspace table. The simulator passes it to ``surface_spawn_z`` so the
         renderer's emitted spawn z and the simulator's settle z resolve the
         SAME per-(variant, surface) clearance (Fix 3 / Finding A).
+
+    support_relation_kind : str
+        Declared support-relation kind ("on_surface" / "inside"); emitted ONLY
+        for a fixture carrying a measured support heightfield. With
+        ``cabinet_drawer_state`` it lets the simulator resolve the SAME
+        ``heightfield_spawn_z`` the renderer emitted (g4 §6 cabinet residual).
+        Empty string ⇒ no heightfield (scalar path).
+
+    cabinet_drawer_state : str
+        Normalized articulation state ("open" / "closed") of the object's
+        support fixture at init; the second key of the support heightfield.
+        Empty string ⇒ non-articulated support (scalar path).
     """
 
     libero_name: ""
@@ -149,6 +161,8 @@ class LIBEROObject(Object):
     preserve_default_z: True
     support_parent_name: ""
     support_surface_class: ""
+    support_relation_kind: ""
+    cabinet_drawer_state: ""
     width: 0.08
     length: 0.08
     height: 0.06

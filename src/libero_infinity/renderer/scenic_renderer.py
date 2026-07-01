@@ -27,11 +27,13 @@ from libero_infinity.asset_metadata import (
     fixture_footprint,
     fixture_height,
     fixture_offset,
+    heightfield_spawn_z,
     is_cradle_fixture,
     is_cradle_seatable,
     is_distractor_fixture_seated,
     is_distractor_fixture_unstable,
     is_open_frame_fixture,
+    normalize_drawer_state,
     stack_offset_z,
     surface_spawn_z,
 )
@@ -539,12 +541,78 @@ def _arena_surface_z(graph: SemanticSceneGraph) -> float:
     return arena_surface_z(_workspace_class(graph))
 
 
+def _support_relation_kind(
+    obj_name: str, relations_by_child: dict[str, "_SupportRelation"]
+) -> str | None:
+    """The declared support-relation kind (``on_surface`` / ``inside`` / …) of
+    ``obj_name``, or ``None`` when it has no declared support. Used to key the
+    per-fixture support heightfield (a bowl ON the cabinet top vs IN its drawer
+    settle at different heights)."""
+    rel = relations_by_child.get(obj_name)
+    return rel.kind if rel is not None else None
+
+
+def _support_fixture_name(
+    obj_name: str,
+    plan: PerturbationPlan,
+    relations_by_child: dict[str, "_SupportRelation"],
+) -> str | None:
+    """The instance name of the fixture ``obj_name`` rests on / inside, resolved
+    subset-independently. Prefers the declared support relation's ``support_name``
+    (present for any active axis) and falls back to the position plan's
+    ``support_name`` — so the drawer-state lookup works even when the position
+    axis is inactive (object-only subset carries no position plan)."""
+    rel = relations_by_child.get(obj_name)
+    if rel is not None and rel.support_name:
+        return rel.support_name
+    pp = plan.position_plans.get(obj_name)
+    if pp is not None and pp.support_name:
+        return pp.support_name
+    return None
+
+
+def _fixture_drawer_state(plan: PerturbationPlan, support_name: str | None) -> str | None:
+    """Normalized ``open``/``closed`` articulation state of the fixture ``support_name``
+    (from the plan's articulation baseline / init predicate), or ``None`` for a
+    non-articulated support. This is known at CODEGEN — the BDDL ``:init`` asserts
+    it — so a drawer-state-aware spawn z is emittable without any runtime state."""
+    if not support_name:
+        return None
+    art = plan.articulation_plans.get(support_name)
+    if art is None:
+        return None
+    return normalize_drawer_state(getattr(art, "state_kind", None))
+
+
+def _resolved_spawn_z(
+    surface_z: float,
+    asset_class: str,
+    surface_class: str | None,
+    relation_kind: str | None,
+    drawer_state: str | None,
+) -> float:
+    """Resolved spawn z for ``asset_class``: the measured support HEIGHTFIELD rest
+    when the fixture/relation/state/class was measured, else the unchanged scalar
+    :func:`surface_spawn_z`.
+
+    The heightfield lookup returns ``None`` for every placement it does not cover
+    (any non-heightfield fixture, unmeasured relation/state/class), so this is
+    BYTE-IDENTICAL to ``surface_spawn_z`` everywhere except the measured cabinet
+    modes — the hard no-regression guarantee."""
+    hz = heightfield_spawn_z(surface_z, surface_class, relation_kind, drawer_state, asset_class)
+    if hz is not None:
+        return hz
+    return surface_spawn_z(surface_z, asset_class, surface_class)
+
+
 def _spawn_z_expr(
     obj_class: str,
     surface_class: str | None,
     scenic_class: str | None,
     variants: list[str] | None,
     surface_z: float,
+    relation_kind: str | None = None,
+    drawer_state: str | None = None,
 ) -> str:
     """Return a Scenic expression string for an object's resolved spawn z.
 
@@ -562,7 +630,9 @@ def _spawn_z_expr(
         # value (allowed by Scenic), unlike an `if`/`==` branch (forbidden).
         del obj_class, surface_class  # folded into the pair at chooser build time
         return f"{scenic_class}[1]"
-    return f"{surface_spawn_z(surface_z, obj_class, surface_class):.4f}"
+    return (
+        f"{_resolved_spawn_z(surface_z, obj_class, surface_class, relation_kind, drawer_state):.4f}"
+    )
 
 
 def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
@@ -610,8 +680,18 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
             seen_instances.add(inst)
             var_name = f"_chosen_{_sanitize(inst)}"
             surface_class = _resolve_surface_class(node, plan, graph)
+            # Drawer-state / relation for the per-variant support heightfield: each
+            # sampled variant carries ITS measured cabinet rest (falls off the
+            # collision-less top to the table, or seats in the open drawer), so the
+            # (class, z) pair stays correct under the object axis. Unmeasured
+            # (fixture, relation, state, variant) tuples fall back to the scalar
+            # ``surface_spawn_z`` — byte-identical.
+            _support = _support_fixture_name(inst, plan, _rel_by_child)
+            _relk = _support_relation_kind(inst, _rel_by_child)
+            _dstate = _fixture_drawer_state(plan, _support)
             pairs = ", ".join(
-                f'("{v}", {surface_spawn_z(arena_z, v, surface_class):.4f})' for v in variants
+                f'("{v}", {_resolved_spawn_z(arena_z, v, surface_class, _relk, _dstate):.4f})'
+                for v in variants
             )
             lines.append(f"{var_name} = Uniform({pairs})")
             asset_var_map[inst] = var_name
@@ -691,8 +771,22 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         object_axis_variants = (
             plan.object_substitutions.get(obj_name) if "object" in plan.active_axes else None
         )
+        # Support-relation kind (on_surface / inside) and the support fixture's
+        # drawer state (open / closed) — the two extra keys the cabinet support
+        # heightfield needs. Both are known at codegen (support edge + BDDL :init
+        # articulation), and both default to ``None`` (no heightfield → scalar
+        # path) for every non-cabinet placement.
+        _support_name = _support_fixture_name(obj_name, plan, _rel_by_child)
+        relation_kind = _support_relation_kind(obj_name, _rel_by_child)
+        drawer_state = _fixture_drawer_state(plan, _support_name)
         spawn_z_expr = _spawn_z_expr(
-            obj_class, surface_class, scenic_class, object_axis_variants, arena_z
+            obj_class,
+            surface_class,
+            scenic_class,
+            object_axis_variants,
+            arena_z,
+            relation_kind,
+            drawer_state,
         )
 
         if pos_plan is not None and not pos_plan.use_relative_positioning:
@@ -776,6 +870,22 @@ def _render_objects(plan: PerturbationPlan, graph: SemanticSceneGraph) -> str:
         # (Fix 3 / Finding A). Empty/None means the default workspace table.
         if surface_class:
             specifiers.append(f'with support_surface_class "{surface_class}"')
+        # Support-relation kind + drawer state — emitted ONLY when this exact
+        # (fixture, relation, state, class) tuple has a MEASURED heightfield rest,
+        # so the SIMULATOR resolves the object's settle z through the SAME
+        # ``heightfield_spawn_z`` the renderer used above (renderer↔simulator
+        # lockstep). Gated on the resolver returning a value (not merely on the
+        # fixture having SOME heightfield) so an UNCOVERED cabinet placement (e.g.
+        # an open-drawer bowl with no measured rest) emits ZERO extra specifiers
+        # and stays byte-identical — the hard no-regression guarantee. Under the
+        # object axis the gate uses the canonical class; the simulator re-resolves
+        # per actually-sampled variant, so an uncovered variant still falls through.
+        if (
+            heightfield_spawn_z(arena_z, surface_class, relation_kind, drawer_state, obj_class)
+            is not None
+        ):
+            specifiers.append(f'with support_relation_kind "{relation_kind}"')
+            specifiers.append(f'with cabinet_drawer_state "{drawer_state}"')
 
         lines.append(f"{var_name} = new LIBEROObject " + ", ".join(specifiers))
 

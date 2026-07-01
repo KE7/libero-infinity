@@ -1,0 +1,22 @@
+{
+  "_meta": {
+    "description": "Measured per-fixture support-surface HEIGHTFIELD rests (g4 §6 cabinet residual, RCA g4_fixed_point_settle.md §2d option 1). A scalar `<class>|<surface>` clearance assumes ONE settled rest per (movable, support) pair; that breaks for the wooden_cabinet top, whose realized support is genuinely xy/drawer-state dependent: the BDDL `top_side` region lands ~0.2-0.35 m in +y OFF the cabinet's collision-less body, so a bowl placed On it FALLS to a low table-level rest (~0.898, clearance ~0.078), while a bowl placed In the top drawer when the drawer is OPEN rests on the drawer floor (~1.126, clearance ~0.306). The SAME akita_black_bowl|wooden_cabinet scalar key is therefore tri-modal (0.898/0.917/1.126, span 228 mm) across the tasks that share it and no single scalar is a fixed point of the 50-step validation settle. This table resolves it by keying additionally on the placement RELATION (on_surface vs inside) and the fixture DRAWER STATE (open/closed), both known at emission time (support edge + BDDL :init articulation predicate). Values are the rest CLEARANCE above the arena table surface (rest_z - arena_z), the SAME frame the scalar clearances use, so heightfield_spawn_z(arena_z, ...) = arena_z + clearance reproduces the settled MuJoCo pose and pose_tolerance passes WITHOUT any gate change. Measured by SETTLE-FROM-ABOVE only (scripts/measure_g4_cabinet_heightfield.py) - never iterate-from-analytic, which TUNNELS the bowl through the cabinet's thin top panel and reports a spurious rest (RCA §1). Only DETERMINISTIC + STABLE modes are recorded (cross-seed rest spread < 5 mm AND a 50-step-settle-from-rest holds < 5 mm in z and xy); genuinely metastable placements (e.g. a bowl balanced on the OPEN-drawer knife-edge: akita_black_bowl on_surface|open is bimodal 0.898/1.12 with 6/16 samples rolling off with >130 mm dz / >200 mm xy drift) are deliberately ABSENT and fall through to the unchanged scalar path (byte-identical). ADDITIVE: any (fixture, relation, state, class) with no entry behaves EXACTLY as today. Regenerate with scripts/measure_g4_cabinet_heightfield.py; the `measured` block records provenance (n, mean rest z, cross-seed spread mm, stable count).",
+    "arena_surface_z_reference": 0.82,
+    "relation_keys": ["on_surface", "inside"],
+    "state_keys": ["open", "closed"]
+  },
+  "fixtures": {
+    "wooden_cabinet": {
+      "support_rests": {
+        "on_surface|closed": {
+          "akita_black_bowl": 0.0784
+        }
+      },
+      "measured": {
+        "on_surface|closed": {
+          "akita_black_bowl": {"n": 12, "rest_z_mean": 0.8984, "spread_mm": 0.0, "stable": "12/12"}
+        }
+      }
+    }
+  }
+}

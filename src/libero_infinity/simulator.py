@@ -59,6 +59,7 @@ from scipy.spatial.transform import Rotation as _Rotation
 
 from libero_infinity.asset_metadata import cradle_tilt_quat as _cradle_tilt_quat
 from libero_infinity.asset_metadata import distractor_table_rest_quat as _distractor_table_rest_quat
+from libero_infinity.asset_metadata import heightfield_spawn_z as _heightfield_spawn_z
 from libero_infinity.asset_metadata import is_cradle_seatable as _is_cradle_seatable
 from libero_infinity.asset_metadata import spawn_clearance as _spawn_clearance
 from libero_infinity.asset_metadata import surface_spawn_z as _shared_surface_spawn_z
@@ -1092,7 +1093,24 @@ class LIBEROSimulation(Simulation):
             # table-surface z when their XY position is being perturbed to the
             # table area. Contained objects and supported children are the
             # exceptions: both derive their z from an authored support relation.
-            if (
+            # XY / drawer-state-aware support heightfield (g4 §6 cabinet residual).
+            # Resolved FIRST, from the renderer-emitted relation/state specifiers,
+            # so a MEASURED cabinet rest supersedes BOTH the LIBERO default-z
+            # (contained / in-drawer bowls) and the scalar surface_spawn_z. The
+            # renderer emitted the SAME value via ``heightfield_spawn_z``, so
+            # injected z == emitted z == settled pose. Returns None (byte-identical
+            # fall-through) for every non-heightfield object.
+            _hf_z = _heightfield_spawn_z(
+                root_surface_z,
+                getattr(obj, "support_surface_class", "") or None,
+                getattr(obj, "support_relation_kind", "") or None,
+                getattr(obj, "cabinet_drawer_state", "") or None,
+                getattr(obj, "asset_class", "_default"),
+            )
+            if _hf_z is not None:
+                pos[2] = _hf_z
+                table_spawned_names.add(libero_name)
+            elif (
                 preserve_default_z
                 and libero_name in default_pose
                 and (
